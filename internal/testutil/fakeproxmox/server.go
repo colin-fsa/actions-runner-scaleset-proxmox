@@ -411,8 +411,35 @@ func (s *Server) handleNodeStatus(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("node '%s' does not exist", node))
 		return
 	}
+	s.store.mu.Lock()
+	total := s.nodeCapacityLocked(node).MemoryBytes
+	// Free is what the node's running guests have not taken from the physical
+	// envelope. Foreign running guests thus tighten free automatically — the
+	// realistic input the host_available mode plans against.
+	used := uint64(0)
+	for _, v := range s.store.vms {
+		if v.Node == node && !v.Template && v.Running {
+			used += guestMemoryBytes(v)
+		}
+	}
+	s.store.mu.Unlock()
+	var free uint64
+	if used >= total {
+		free = 0
+	} else {
+		free = total - used
+	}
+	if free > total {
+		free = total
+	}
 	writeData(w, map[string]any{
 		"uptime": 12345,
+		"memory": map[string]any{
+			"free":  free,
+			"total": total,
+			"used":  total - free,
+		},
+		"swap": map[string]any{"free": 0, "total": 0, "used": 0},
 	})
 }
 

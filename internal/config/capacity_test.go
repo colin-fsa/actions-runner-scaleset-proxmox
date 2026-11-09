@@ -90,6 +90,19 @@ func TestCapacity_Defaults(t *testing.T) {
 	require.Equal(t, 15*time.Second, cfg.Pool.Capacity.RefreshInterval.D())
 	require.Equal(t, 2048, cfg.Pool.Capacity.ReserveMemoryMB,
 		"a bare `capacity: {enabled: true}` must still withhold host headroom")
+	require.Equal(t, config.MemoryModeAllocated, cfg.Pool.Capacity.MemoryMode,
+		"admission must default to the historical allocated-memory policy")
+}
+
+// TestCapacity_MemoryMode pins the closed enum: the operator can opt in
+// to planning against the host's live free RAM, and the overcommit factor
+// scales how much of a reservation is withheld there.
+func TestCapacity_MemoryMode(t *testing.T) {
+	cfg, err := config.Parse(capacityCfg("10",
+		capacityOn+"\n    memory_mode: host_available\n    memory_overcommit: 0.5", "2", "4096"))
+	require.NoError(t, err)
+	require.Equal(t, config.MemoryModeHostAvailable, cfg.Pool.Capacity.MemoryMode)
+	require.InDelta(t, 0.5, cfg.Pool.Capacity.MemoryOvercommit, 1e-9)
 }
 
 // TestCapacity_ExplicitReserveIsNotOverridden guards the default from
@@ -202,10 +215,22 @@ func TestCapacity_RejectsOutOfRangeKnobs(t *testing.T) {
 		"negative reserve":           capacityOn + "\n    reserve_memory_mb: -1",
 		"absurd overcommit":          capacityOn + "\n    cpu_overcommit_ratio: 999",
 		"zero refresh interval":      capacityOn + "\n    refresh_interval: 0s",
+		"memory overcommit above 1":  capacityOn + "\n    memory_mode: host_available\n    memory_overcommit: 1.5",
+		"unknown memory mode":        capacityOn + "\n    memory_mode: oversubscribed",
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := config.Parse(capacityCfg("10", extra, "2", "4096"))
 			require.Error(t, err)
 		})
 	}
+}
+
+// TestCapacity_UnknownMemoryModeNamesTheField: the closed-enum refusal
+// must point the operator at the exact key so a typo is fixable in one
+// read of the error.
+func TestCapacity_UnknownMemoryModeNamesTheField(t *testing.T) {
+	_, err := config.Parse(capacityCfg("10", capacityOn+"\n    memory_mode: oversubscribed", "2", "4096"))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "pool.capacity.memory_mode")
+	require.Contains(t, err.Error(), `"oversubscribed"`)
 }

@@ -558,11 +558,13 @@ func buildCapacityAccountant(cfg *config.Config, prov provisioner.Provisioner, l
 		return nil, nil //nolint:nilnil // nil accountant IS the disabled state; an error would be wrong
 	}
 	acct, err := nodecap.New(prov.Client(), nodecap.Options{
-		Nodes:           affinityNodeUniverse(cfg),
-		Refresh:         cc.RefreshInterval.D(),
-		ReserveBytes:    uint64(max(cc.ReserveMemoryMB, 0)) * 1024 * 1024,
-		ReserveFraction: cc.ReserveMemoryFraction,
-		CPUOvercommit:   cc.CPUOvercommitRatio,
+		Nodes:            affinityNodeUniverse(cfg),
+		Refresh:          cc.RefreshInterval.D(),
+		ReserveBytes:     uint64(max(cc.ReserveMemoryMB, 0)) * 1024 * 1024,
+		ReserveFraction:  cc.ReserveMemoryFraction,
+		CPUOvercommit:    cc.CPUOvercommitRatio,
+		MemoryMode:       cc.MemoryMode,
+		MemoryOvercommit: cc.MemoryOvercommit,
 		// The in-flight clone grace already means "how long before we
 		// assume a clone that never came back is gone"; a reservation
 		// outliving its clone is the same question, so it reuses the
