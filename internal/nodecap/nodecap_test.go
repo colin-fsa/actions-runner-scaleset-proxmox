@@ -109,7 +109,7 @@ func (rs *resourceServer) setNodeStatus(node string, free, total uint64) {
 		rs.nodeStatus = map[string]map[string]any{}
 	}
 	rs.nodeStatus[node] = map[string]any{
-		"memory": map[string]any{"free": free, "total": total},
+		"memory": map[string]any{"free": free, "total": total, "used": total - free},
 	}
 }
 
@@ -890,4 +890,48 @@ func TestAllocatedModeDoesNotReadNodeStatus(t *testing.T) {
 	require.Equal(t, uint64(32*gib), states["pve1"].AvailableBytes)
 	require.Equal(t, int64(1), rs.calls.Load(),
 		"allocated mode reads /cluster/resources only — one call, no /status")
+}
+
+// Proxmox reports unused RAM separately from memory available after reclaiming
+// cache. Admission must use the latter without losing reservation accounting.
+func TestHostModeAvailableMemoryFields(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name      string
+		memory    map[string]any
+		available uint64
+		pressured bool
+	}{
+		{"available preferred", map[string]any{"total": 64 * gib, "used": 24 * gib, "free": 2 * gib, "available": 40 * gib}, 36 * gib, false},
+		{"older API total minus used", map[string]any{"total": 64 * gib, "used": 24 * gib, "free": 2 * gib}, 36 * gib, false},
+		{"explicit zero available", map[string]any{"total": 64 * gib, "used": 24 * gib, "available": 0}, 0, false},
+		{"missing usage", map[string]any{"total": 64 * gib, "free": 2 * gib}, 0, true},
+		{"missing total", map[string]any{"available": 40 * gib}, 0, true},
+		{"used exceeds total", map[string]any{"total": 64 * gib, "used": 65 * gib}, 0, true},
+		{"available exceeds total", map[string]any{"total": 64 * gib, "available": 65 * gib}, 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			rs := newResourceServer(t, []map[string]any{nodeRow("pve1", 64*gib, 16)})
+			rs.nodeStatus = map[string]map[string]any{"pve1": {"memory": tc.memory}}
+			a := newAccountant(t, rs, func(o *Options) { o.MemoryMode = MemoryModeHostAvailable; o.ReserveBytes = 4 * gib })
+			states, err := a.Snapshot(context.Background())
+			require.NoError(t, err)
+			require.Equal(t, tc.available, states["pve1"].AvailableBytes)
+			require.Equal(t, tc.pressured, states["pve1"].MemoryPressured)
+			if tc.available == 0 {
+				_, ok, err := a.Reserve(context.Background(), "pve1", Shape{MemoryBytes: 4 * gib})
+				require.NoError(t, err)
+				require.False(t, ok)
+			}
+			if tc.available > 0 {
+				_, ok, err := a.Reserve(context.Background(), "pve1", Shape{MemoryBytes: 4 * gib})
+				require.NoError(t, err)
+				require.True(t, ok, "cache-backed available memory must admit the Windows worker")
+				states, err = a.Snapshot(context.Background())
+				require.NoError(t, err)
+				require.Equal(t, tc.available-4*gib, states["pve1"].AvailableBytes)
+			}
+		})
+	}
 }

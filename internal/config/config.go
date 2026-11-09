@@ -578,10 +578,11 @@ const (
 const (
 	// MemoryModeAllocated is the default: a node's usable memory is its
 	// physical RAM minus a host reserve minus the ALLOCATED memory of every
-	// guest that holds it. It does not consult the node's live free RAM.
+	// guest that holds it. It does not consult the node's live available RAM.
 	MemoryModeAllocated = "allocated"
 
-	// MemoryModeHostAvailable admits against the node's actually-free RAM
+	// MemoryModeHostAvailable admits against the node's available RAM,
+	// including reclaimable cache,
 	// (from the per-node status endpoint) instead of the guests' allocated
 	// memory, so admission reflects the RAM a host can genuinely hand to a
 	// new guest. It fails closed when a node's reading is missing or stale.
@@ -715,14 +716,14 @@ type CapacityConfig struct {
 
 	// MemoryMode selects how a node's usable memory is derived. "allocated"
 	// (the default) bounds admitted RAM by the guests' ALLOCATED memory;
-	// "host_available" admits against the node's actually-free RAM instead,
+	// "host_available" admits against available RAM including reclaimable cache,
 	// and fails closed when that reading is missing or stale. See the
 	// MemoryMode* constants.
 	MemoryMode string `yaml:"memory_mode"`
 
 	// MemoryOvercommit scales how much of a reservation's RAM is withheld
 	// in host_available mode. 1.0 (the default) admits a clone only when
-	// free RAM covers its full request plus the host reserve; a value below
+	// available RAM covers its full request plus the host reserve; a value below
 	// 1.0 lets the box be oversubscribed. Ignored in the allocated mode.
 	MemoryOvercommit float64 `yaml:"memory_overcommit" validate:"gte=0,lte=1"`
 }

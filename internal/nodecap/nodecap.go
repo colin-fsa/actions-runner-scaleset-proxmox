@@ -127,7 +127,7 @@ type Options struct {
 	// zero value is MemoryModeAllocated (the default, and the historical
 	// behaviour): admitted RAM is bounded by the sum of the guests' ALLOCATED
 	// memory. MemoryModeHostAvailable instead admits against the node's
-	// actually-free RAM, as reported by /nodes/{node}/status — the number a
+	// available RAM, as reported by /nodes/{node}/status — the number a
 	// host can genuinely hand to a new guest — which also fails closed when
 	// that reading is missing or stale. See MemoryMode.
 	MemoryMode string
@@ -174,10 +174,10 @@ const (
 	// MemoryModeAllocated is the default and the historical behaviour: a
 	// node's usable memory is total RAM minus the host reserve minus the
 	// ALLOCATED memory of every guest that holds it. It does not consult
-	// the node's live free RAM.
+	// the node's live available RAM.
 	MemoryModeAllocated = "allocated"
 
-	// MemoryModeHostAvailable admits against the node's actually-free RAM
+	// MemoryModeHostAvailable admits against the node's available RAM
 	// (from /nodes/{node}/status) rather than the sum of the guests' allocated
 	// memory. Because a host's free number is the only figure that already
 	// folds in host overhead (PVE, ZFS ARC, qemu) and the in-flight startup
@@ -291,7 +291,7 @@ type snapshot struct {
 	guestVCPU map[int]int
 	// guestPowered maps VMID to whether the guest is powered on (its status
 	// is anything other than stopped). host_available mode consults this:
-	// a node's live free RAM reflects only powered-on guests, so a
+	// a node's live available RAM reflects only powered-on guests, so a
 	// reservation's RAM counts as "already in free" only once its guest is
 	// powered on, not the moment its configured memory is raised.
 	guestPowered map[int]bool
@@ -306,13 +306,13 @@ type nodeTotals struct {
 	// rather than O(guests) per node.
 	guestMem  uint64
 	guestVCPU int
-	// memFree is the node's live free RAM, read from /nodes/{node}/status
+	// memAvailable is the node's live available RAM, read from /nodes/{node}/status
 	// during fetch in host_available mode. memMissing is true when that
 	// reading could not be taken (the API call failed or the node vanished)
 	// and admission for the node must fail closed. Both are inert in the
 	// allocated mode, which never consults the live reading.
-	memFree    uint64
-	memMissing bool
+	memAvailable uint64
+	memMissing   bool
 }
 
 // reservation is one outstanding claim.
@@ -528,7 +528,7 @@ func (a *Accountant) stateLocked(snap *snapshot, node string) NodeState {
 	var committed, available uint64
 
 	if a.isHostMode() {
-		// Fail closed: a node whose live free-RAM reading is missing, or a
+		// Fail closed: a node whose live available-memory reading is missing, or a
 		// snapshot too old to trust, has no usable number to admit against.
 		// Memory is not overcommittable, so guessing the other way would
 		// silently oversubscribe the box.
@@ -541,13 +541,13 @@ func (a *Accountant) stateLocked(snap *snapshot, node string) NodeState {
 				MemoryPressured: true,
 			}
 		}
-		// The node's free RAM already reflects every running guest (they are
+		// The node's available RAM already reflects every running guest (they are
 		// physically consuming it), so the guest sum is NOT added as a base —
 		// it would count them twice. Only in-flight reservations, whose RAM a
 		// fresh measurement has not absorbed yet, are withheld on top.
 		holds, credit := a.holdsAndCreditsLocked(snap, node)
-		committed = saturatingSub(totals.memBytes, totals.memFree)
-		usable := saturatingSub(totals.memFree, reserve)
+		committed = saturatingSub(totals.memBytes, totals.memAvailable)
+		usable := saturatingSub(totals.memAvailable, reserve)
 		if usable > holds {
 			available = usable - holds
 		}
@@ -613,7 +613,7 @@ func (a *Accountant) holdsAndCreditsLocked(snap *snapshot, node string) (holds, 
 			observed = snap.guestMem[r.vmid]
 			if a.isHostMode() && !snap.guestPowered[r.vmid] {
 				// A powered-off guest's configured RAM is not in the node's
-				// live free-RAM reading, so treat the reservation as fully
+				// live available-memory reading, so treat the reservation as fully
 				// withheld until its guest powers on and the fresh reading
 				// absorbs it.
 				observed = 0
@@ -638,7 +638,7 @@ func (a *Accountant) holdsAndCreditsLocked(snap *snapshot, node string) (holds, 
 	return holds, credit
 }
 
-// isHostMode reports whether the accountant plans against live free RAM
+// isHostMode reports whether the accountant plans against live available RAM
 // rather than the guests' allocated memory.
 func (a *Accountant) isHostMode() bool {
 	return a.opts.MemoryMode == MemoryModeHostAvailable
@@ -745,7 +745,7 @@ func (a *Accountant) reserveFor(total uint64) uint64 {
 // configured size — at that point the guest row carries the allocation
 // and keeping the reservation would double-count it. In host_available
 // mode it also has to be powered on first, because the guest's RAM only
-// reaches the node's live free-RAM reading when it is running. Expiry is
+// reaches the node's live available-memory reading when it is running. Expiry is
 // the leak guard for clones that never got that far.
 func (a *Accountant) sweepLocked(snap *snapshot) {
 	now := time.Now()
@@ -759,7 +759,7 @@ func (a *Accountant) sweepLocked(snap *snapshot) {
 		}
 		retired := r.vmid != 0 && snap.guestMem[r.vmid] >= r.shape.MemoryBytes
 		if a.isHostMode() {
-			// In host mode the node's live free-RAM reading absorbs a
+			// In host mode the node's live available-memory reading absorbs a
 			// reservation's RAM only once its guest is actually powered on.
 			// A powered-off guest's configured RAM never reached that reading,
 			// so retiring now would stop withholding RAM the host is not yet
@@ -892,11 +892,11 @@ func (a *Accountant) fetch(ctx context.Context) (*snapshot, error) {
 		totals.guestMem = guestSums[node].guestMem
 		totals.guestVCPU = guestSums[node].guestVCPU
 		if hostMode {
-			// Admission plans against the node's live free RAM, which only the
+			// Admission plans against the node's live available RAM, which only the
 			// per-node status endpoint reports. A failed reading marks the node
 			// as missing so stateLocked fails closed rather than admit blind.
-			free, ok := a.nodeFreeMemory(ctx, node)
-			totals.memFree = free
+			free, ok := a.nodeAvailableMemory(ctx, node)
+			totals.memAvailable = free
 			totals.memMissing = !ok
 		}
 		snap.nodes[node] = totals
@@ -904,18 +904,16 @@ func (a *Accountant) fetch(ctx context.Context) (*snapshot, error) {
 	return snap, nil
 }
 
-// nodeFreeMemory reads a single node's live free RAM from
-// GET /nodes/{node}/status. The second return is false when the reading
-// could not be taken (the API errored), in which case the caller must treat
-// the node as missing rather than planning on a zero that means "unknown".
-func (a *Accountant) nodeFreeMemory(ctx context.Context, node string) (uint64, bool) {
-	// A small local struct with explicit wire tags is used rather than
-	// proxmox.Node so the decode depends only on the documented /status
-	// keys and nothing else about that type.
+// nodeAvailableMemory reads usable host memory, including reclaimable cache, from
+// GET /nodes/{node}/status. Older Proxmox versions omit memory.available but
+// report memory.used excluding reclaimable cache, so total-used is equivalent.
+// Missing or inconsistent readings fail closed; explicit zero stays zero.
+func (a *Accountant) nodeAvailableMemory(ctx context.Context, node string) (uint64, bool) {
 	var st struct {
 		Memory struct {
-			Free  uint64 `json:"free"`
-			Total uint64 `json:"total"`
+			Available *uint64 `json:"available"`
+			Used      *uint64 `json:"used"`
+			Total     uint64  `json:"total"`
 		} `json:"memory"`
 	}
 	if err := a.cli.Get(ctx, "/nodes/"+node+"/status", &st); err != nil {
@@ -923,7 +921,16 @@ func (a *Accountant) nodeFreeMemory(ctx context.Context, node string) (uint64, b
 			"node", node, "err", err)
 		return 0, false
 	}
-	return st.Memory.Free, true
+	if st.Memory.Total == 0 {
+		return 0, false
+	}
+	if st.Memory.Available != nil {
+		return *st.Memory.Available, *st.Memory.Available <= st.Memory.Total
+	}
+	if st.Memory.Used == nil || *st.Memory.Used > st.Memory.Total {
+		return 0, false
+	}
+	return st.Memory.Total - *st.Memory.Used, true
 }
 
 // addClamped adds a signed delta to an unsigned base, flooring at 0.

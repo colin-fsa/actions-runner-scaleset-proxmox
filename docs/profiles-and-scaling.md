@@ -140,11 +140,13 @@ RAM is what you want to count, but it cannot see the RAM the host holds outside
 the guests, and it reads a number that is a step behind a guest that has been
 cloned but not yet booted.
 
-Set `memory_mode: host_available` to plan against the node's **live free RAM**
-instead — the `free` figure from the node's `GET /nodes/{node}/status`
-endpoint, refreshed on the same cadence. That is the real number: it already
-subtracts the host's own overhead and, once a guest is actually running,
-reflects the RAM it physically consumes rather than what its config declares.
+Set `memory_mode: host_available` to plan against the node's **available RAM**,
+including reclaimable cache. It uses `memory.available` from
+`GET /nodes/{node}/status`; on older Proxmox versions without that field it
+uses `memory.total - memory.used`, matching Proxmox's reported memory usage.
+It does not use `memory.free`, which excludes reclaimable cache and can refuse
+clones even when the host has ample available memory. Readings refresh on the
+same cadence as resource accounting.
 
 ```yaml
 pool:
@@ -154,13 +156,13 @@ pool:
     memory_overcommit: 1.0
 ```
 
-In this mode a clone is admitted only when the node's free RAM covers its
+In this mode a clone is admitted only when the node's available RAM covers its
 request scaled by `memory_overcommit` (default `1.0`, i.e. its full RAM), net
 of the host reserve. A value below `1.0` lets the pool oversubscribe the host —
-for example `0.7` admits a 4 GiB guest against 2.8 GiB of free RAM. `0` means
+for example `0.7` admits a 4 GiB guest against 2.8 GiB of available RAM. `0` means
 `1.0`, and the knob is ignored in `allocated` mode.
 
-Because free RAM is measured rather than inferred, `host_available` **fails
+Because available RAM is measured rather than inferred, `host_available` **fails
 closed**: a node whose `status` reading cannot be taken, or whose snapshot has
 gone stale (reads failing long enough that the last good reading is older than
 twice the refresh interval), reports zero available memory and pauses
