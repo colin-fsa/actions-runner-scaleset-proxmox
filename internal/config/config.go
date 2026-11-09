@@ -574,6 +574,22 @@ const (
 	RecycleModeSnapshotRollback = "snapshot_rollback"
 )
 
+// Memory modes accepted by pool.capacity.memory_mode. See
+// CapacityConfig.MemoryMode.
+const (
+	// MemoryModeAllocated is the default: a node's usable memory is its
+	// physical RAM minus a host reserve minus the ALLOCATED memory of every
+	// guest that holds it. It does not consult the node's live available RAM.
+	MemoryModeAllocated = "allocated"
+
+	// MemoryModeHostAvailable admits against the node's available RAM,
+	// including reclaimable cache,
+	// (from the per-node status endpoint) instead of the guests' allocated
+	// memory, so admission reflects the RAM a host can genuinely hand to a
+	// new guest. It fails closed when a node's reading is missing or stale.
+	MemoryModeHostAvailable = "host_available"
+)
+
 // PoolConfig configures pool sizes and timing.
 //
 // Pool-level HotSize / WarmSize / BootMaxAttempts / VMMaxAge are
@@ -687,6 +703,11 @@ type CapacityConfig struct {
 	// typically idle on CPU while waiting on I/O. 1.0 would refuse to
 	// overcommit cores at all.
 	CPUOvercommitRatio float64 `yaml:"cpu_overcommit_ratio" validate:"gte=0,lte=64"`
+	// CPUMode selects allocated vCPUs (default) or measured host_usage.
+	CPUMode string `yaml:"cpu_mode"`
+	// CPUUsageLimit is the maximum forecast host utilization in host_usage mode.
+	// Defaults to 0.8; cpu_overcommit_ratio is ignored in this mode.
+	CPUUsageLimit float64 `yaml:"cpu_usage_limit" validate:"gt=0,lte=1"`
 
 	// EvictIdleForDemand lets a queued job reclaim capacity from an
 	// idle pool VM. When a job's clone cannot be admitted anywhere and
@@ -698,6 +719,19 @@ type CapacityConfig struct {
 	// for the queued job's ability to run at all, and that is the
 	// operator's call. Eviction is scoped to one scale set's own VMs.
 	EvictIdleForDemand bool `yaml:"evict_idle_for_demand"`
+
+	// MemoryMode selects how a node's usable memory is derived. "allocated"
+	// (the default) bounds admitted RAM by the guests' ALLOCATED memory;
+	// "host_available" admits against available RAM including reclaimable cache,
+	// and fails closed when that reading is missing or stale. See the
+	// MemoryMode* constants.
+	MemoryMode string `yaml:"memory_mode"`
+
+	// MemoryOvercommit scales how much of a reservation's RAM is withheld
+	// in host_available mode. 1.0 (the default) admits a clone only when
+	// available RAM covers its full request plus the host reserve; a value below
+	// 1.0 lets the box be oversubscribed. Ignored in the allocated mode.
+	MemoryOvercommit float64 `yaml:"memory_overcommit" validate:"gte=0,lte=1"`
 }
 
 // ProfileConfig defines a runner profile — a named bundle of hardware
@@ -1362,12 +1396,21 @@ func (c *Config) applyPoolDefaults() {
 	c.applyCapacityDefaults()
 }
 
-// applyCapacityDefaults fills the capacity-admission knobs. Only the
-// duration and the host reserve get defaults — Enabled,
+// applyCapacityDefaults fills the capacity-admission knobs. The duration,
+// the host reserve, and the memory mode get defaults; Enabled,
 // CPUOvercommitRatio and EvictIdleForDemand are deliberately
 // zero-valued so the feature and each of its escalations stay opt-in.
 func (c *Config) applyCapacityDefaults() {
+	if c.Pool.Capacity.CPUMode == "" {
+		c.Pool.Capacity.CPUMode = "allocated"
+	}
+	if c.Pool.Capacity.CPUUsageLimit == 0 {
+		c.Pool.Capacity.CPUUsageLimit = 0.8
+	}
 	c.Pool.Capacity.RefreshInterval.setDefault(15 * time.Second)
+	if c.Pool.Capacity.MemoryMode == "" {
+		c.Pool.Capacity.MemoryMode = MemoryModeAllocated
+	}
 	if c.Pool.Capacity.ReserveMemoryMB == 0 && c.Pool.Capacity.ReserveMemoryFraction == 0 {
 		// Planning a node to 100% of its physical RAM is never right:
 		// PVE, ZFS ARC and qemu's per-VM overhead all live outside the
@@ -1644,6 +1687,20 @@ func (c *Config) resolvePool() error {
 	}
 	if c.Pool.Capacity.Enabled && c.Pool.Capacity.RefreshInterval.D() <= 0 {
 		return errors.New("pool.capacity.refresh_interval must be positive")
+	}
+	switch c.Pool.Capacity.CPUMode {
+	case "allocated", "host_usage":
+	default:
+		return fmt.Errorf("pool.capacity.cpu_mode: unknown value %q (expected allocated or host_usage)", c.Pool.Capacity.CPUMode)
+	}
+	// MemoryMode is a closed enum; ApplyDefaults substituted the
+	// "allocated" default for the unset case, so anything else here is
+	// an operator typo.
+	switch c.Pool.Capacity.MemoryMode {
+	case MemoryModeAllocated, MemoryModeHostAvailable:
+	default:
+		return fmt.Errorf("pool.capacity.memory_mode: unknown value %q (expected %q or %q)",
+			c.Pool.Capacity.MemoryMode, MemoryModeAllocated, MemoryModeHostAvailable)
 	}
 	// GitHub reconciler grace knobs must be strictly positive. Like the
 	// pool durations above, ApplyDefaults substituted defaults for unset
@@ -2342,8 +2399,8 @@ func (c *Config) validateProfileFootprint(si int, ssName string, pi int, p Profi
 		return fmt.Errorf("scalesets[%d] %q.profiles[%d] %q: memory_mb must be > 0 when pool.capacity.enabled (admission cannot size a clone that inherits the template's memory)",
 			si, ssName, pi, p.Name)
 	}
-	if c.Pool.Capacity.CPUOvercommitRatio > 0 && p.CPUCores <= 0 {
-		return fmt.Errorf("scalesets[%d] %q.profiles[%d] %q: cpu must be > 0 when pool.capacity.cpu_overcommit_ratio is set (admission cannot size a clone that inherits the template's cpu count)",
+	if (c.Pool.Capacity.CPUOvercommitRatio > 0 || c.Pool.Capacity.CPUMode == "host_usage") && p.CPUCores <= 0 {
+		return fmt.Errorf("scalesets[%d] %q.profiles[%d] %q: cpu must be > 0 when CPU capacity admission is enabled (admission cannot size a clone that inherits the template's cpu count)",
 			si, ssName, pi, p.Name)
 	}
 	return nil

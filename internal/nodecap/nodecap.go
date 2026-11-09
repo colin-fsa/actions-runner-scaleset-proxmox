@@ -36,6 +36,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"slices"
 	"sync"
 	"time"
@@ -64,12 +65,21 @@ type NodeState struct {
 	CommittedBytes uint64 // guest allocations + outstanding reservations
 	AvailableBytes uint64
 
-	// CPUGated reports whether cpu_overcommit_ratio is configured. When
+	// MemoryPressured reports, in host_available mode, that the node is
+	// withholding admission because it has no usable free-RAM reading:
+	// the node's /status reading is missing from the snapshot, or the
+	// snapshot is stale. It is the fail-closed signal an operator alerts
+	// on; in the allocated mode (the default) it is always false.
+	MemoryPressured bool
+
+	// CPUGated reports whether either CPU admission mode is enabled. When
 	// false, CPU is never a reason to refuse a clone and the three
 	// fields below are informational only.
 	CPUGated bool
-	// LimitVCPU is the admission ceiling — physical cores x
-	// cpu_overcommit_ratio — and AvailableVCPU is what is left of it.
+	// LimitVCPU is the admission ceiling: logical CPUs times either the
+	// allocated overcommit ratio or the host usage limit. AvailableVCPU is
+	// the remaining headroom. In usage mode CommittedVCPU is measured CPU
+	// equivalents plus pending launches, rather than allocated vCPUs.
 	// Both are zero when CPUGated is false. (LimitVCPU is deliberately
 	// not the raw core count: a consumer comparing a Shape against it
 	// must see the same ceiling admission applies.)
@@ -116,6 +126,27 @@ type Options struct {
 	// overcommittable, memory is not, so the default is permissive.
 	CPUOvercommit float64
 
+	// CPUMode defaults to allocated. host_usage uses measured host CPU with
+	// CPUUsageLimit (0..1), reserving each pending clone at its full vCPU size.
+	CPUMode       string
+	CPUUsageLimit float64
+
+	// MemoryMode selects how a node's usable memory is derived. The
+	// zero value is MemoryModeAllocated (the default, and the historical
+	// behaviour): admitted RAM is bounded by the sum of the guests' ALLOCATED
+	// memory. MemoryModeHostAvailable instead admits against the node's
+	// available RAM, as reported by /nodes/{node}/status — the number a
+	// host can genuinely hand to a new guest — which also fails closed when
+	// that reading is missing or stale. See MemoryMode.
+	MemoryMode string
+
+	// MemoryOvercommit scales how much of a reservation's RAM is withheld
+	// from the node's free pool in MemoryModeHostAvailable. 1.0 (the
+	// default) admits a clone only when free RAM covers its full request
+	// plus the host reserve; a value below 1.0 lets the box be oversubscribed.
+	// Ignored in the allocated mode, where memory is gated hard.
+	MemoryOvercommit float64
+
 	// ReservationTTL bounds how long a single reservation may survive
 	// without retiring. It is a leak guard for a clone that hangs or
 	// dies past the pool's panic recovery, not a normal expiry path.
@@ -145,6 +176,29 @@ type VMIDRange struct {
 	Min int
 	Max int
 }
+
+// CPU admission modes accepted by Options.CPUMode.
+const (
+	CPUModeAllocated = "allocated"
+	CPUModeHostUsage = "host_usage"
+)
+
+// Memory modes accepted by Options.MemoryMode. See Options.MemoryMode.
+const (
+	// MemoryModeAllocated is the default and the historical behaviour: a
+	// node's usable memory is total RAM minus the host reserve minus the
+	// ALLOCATED memory of every guest that holds it. It does not consult
+	// the node's live available RAM.
+	MemoryModeAllocated = "allocated"
+
+	// MemoryModeHostAvailable admits against the node's available RAM
+	// (from /nodes/{node}/status) rather than the sum of the guests' allocated
+	// memory. Because a host's free number is the only figure that already
+	// folds in host overhead (PVE, ZFS ARC, qemu) and the in-flight startup
+	// gap, it is the right input for "can this box hand a new guest its RAM".
+	// It fails closed when a node's reading is missing or stale.
+	MemoryModeHostAvailable = "host_available"
+)
 
 // guestStopped is the /cluster/resources status of a powered-off guest.
 // Anything else — running, paused, or a status this version of PVE
@@ -232,6 +286,10 @@ type Accountant struct {
 	// res holds every outstanding reservation, keyed by a monotonic id.
 	res     map[uint64]*reservation
 	nextRes uint64
+	// now is the clock used for reservation expiry and snapshot
+	// staleness. Indirect so a test can age a snapshot without sleeping;
+	// New pins it to time.Now.
+	now func() time.Time
 }
 
 // snapshot is one immutable read of /cluster/resources.
@@ -245,7 +303,13 @@ type snapshot struct {
 	// a live allocation.
 	guestMem  map[int]uint64
 	guestVCPU map[int]int
-	takenAt   time.Time
+	// guestPowered maps VMID to whether the guest is powered on (its status
+	// is anything other than stopped). host_available mode consults this:
+	// a node's live available RAM reflects only powered-on guests, so a
+	// reservation's RAM counts as "already in free" only once its guest is
+	// powered on, not the moment its configured memory is raised.
+	guestPowered map[int]bool
+	takenAt      time.Time
 }
 
 type nodeTotals struct {
@@ -256,6 +320,15 @@ type nodeTotals struct {
 	// rather than O(guests) per node.
 	guestMem  uint64
 	guestVCPU int
+	// memAvailable is the node's live available RAM, read from /nodes/{node}/status
+	// during fetch in host_available mode. memMissing is true when that
+	// reading could not be taken (the API call failed or the node vanished)
+	// and admission for the node must fail closed. Both are inert in the
+	// allocated mode, which never consults the live reading.
+	memAvailable uint64
+	memMissing   bool
+	cpuUsage     float64
+	cpuMissing   bool
 }
 
 // reservation is one outstanding claim.
@@ -311,6 +384,7 @@ func New(cli *proxmox.Client, opts Options) (*Accountant, error) {
 		cli:  cli,
 		opts: opts,
 		log:  opts.Log,
+		now:  time.Now,
 		cache: ttlcache.New[string, *snapshot](
 			ttlcache.WithTTL[string, *snapshot](opts.Refresh),
 			ttlcache.WithDisableTouchOnHit[string, *snapshot](),
@@ -414,13 +488,22 @@ func (a *Accountant) fitsLocked(snap *snapshot, node string, shape Shape, extraF
 		credit += snap.guestMem[vmid]
 	}
 	avail := st.AvailableBytes + credit
-	if shape.MemoryBytes > avail {
+	// In host_available mode the clone is admitted only when the node's
+	// free RAM covers its request scaled by the overcommit factor (1.0 by
+	// default = full RAM); the allocated mode gates on the full request.
+	need := shape.MemoryBytes
+	if a.isHostMode() {
+		need = uint64(float64(shape.MemoryBytes) * a.memOvercommit())
+	}
+	if need > avail {
 		return false
 	}
-	if a.opts.CPUOvercommit > 0 {
+	if a.cpuGated() {
 		vcpuCredit := 0
 		for _, vmid := range extraFreeing {
-			vcpuCredit += snap.guestVCPU[vmid]
+			if !a.cpuUsageMode() {
+				vcpuCredit += snap.guestVCPU[vmid]
+			}
 		}
 		if st.CommittedVCPU-vcpuCredit+shape.VCPUs > a.vcpuLimit(totals.vcpus) {
 			return false
@@ -432,53 +515,107 @@ func (a *Accountant) fitsLocked(snap *snapshot, node string, shape Shape, extraF
 // stateLocked evaluates the ledger for one node. Caller must hold a.mu.
 func (a *Accountant) stateLocked(snap *snapshot, node string) NodeState {
 	totals := snap.nodes[node]
-	committed := totals.guestMem
+	reserve := a.reserveFor(totals.memBytes)
 	committedVCPU := totals.guestVCPU
+	if a.cpuUsageMode() {
+		committedVCPU = int(math.Ceil(totals.cpuUsage * float64(totals.vcpus)))
+		if totals.cpuMissing || a.stale(snap) {
+			committedVCPU = a.vcpuLimit(totals.vcpus) + 1
+		}
+	}
 
-	// Reservation terms. Signed arithmetic: the freeing credits can in
-	// principle exceed the pending claims, and unsigned wraparound there
-	// would report a wildly empty node.
-	delta := int64(0)
+	// CPU reservations withhold launch footprints until observation. Usage
+	// mode does not credit allocated vCPUs for prospective evictions.
+	// Signed: a freeing credit can exceed the pending claims, and unsigned
+	// wraparound there would report a wildly empty node.
 	deltaVCPU := 0
 	for _, r := range a.res {
 		if r.node != node {
 			continue
 		}
-		observed := uint64(0)
 		observedVCPU := 0
-		if r.vmid != 0 {
-			observed = snap.guestMem[r.vmid]
+		if r.vmid != 0 && (!a.cpuUsageMode() || snap.guestPowered[r.vmid]) {
 			observedVCPU = snap.guestVCPU[r.vmid]
-		}
-		if r.shape.MemoryBytes > observed {
-			//nolint:gosec // G115: a guest's configured memory is bounded by physical RAM, many orders of magnitude below 2^63 bytes (8 EiB).
-			delta += int64(r.shape.MemoryBytes - observed)
 		}
 		if r.shape.VCPUs > observedVCPU {
 			deltaVCPU += r.shape.VCPUs - observedVCPU
 		}
 		for _, v := range r.freeing {
-			//nolint:gosec // G115: as above — guest memory is bounded by physical RAM.
-			delta -= int64(snap.guestMem[v])
-			deltaVCPU -= snap.guestVCPU[v]
+			if !a.cpuUsageMode() {
+				deltaVCPU -= snap.guestVCPU[v]
+			}
 		}
 	}
-	committed = addClamped(committed, delta)
 	committedVCPU += deltaVCPU
 	if committedVCPU < 0 {
 		committedVCPU = 0
 	}
 
-	reserve := a.reserveFor(totals.memBytes)
+	var committed, available uint64
+
+	if a.isHostMode() {
+		// Fail closed: a node whose live available-memory reading is missing, or a
+		// snapshot too old to trust, has no usable number to admit against.
+		// Memory is not overcommittable, so guessing the other way would
+		// silently oversubscribe the box.
+		if totals.memMissing || a.stale(snap) {
+			return NodeState{
+				TotalBytes:      totals.memBytes,
+				ReserveBytes:    reserve,
+				CPUGated:        a.cpuGated(),
+				CommittedVCPU:   committedVCPU,
+				MemoryPressured: true,
+			}
+		}
+		// The node's available RAM already reflects every running guest (they are
+		// physically consuming it), so the guest sum is NOT added as a base —
+		// it would count them twice. Only in-flight reservations, whose RAM a
+		// fresh measurement has not absorbed yet, are withheld on top.
+		holds, credit := a.holdsAndCreditsLocked(snap, node)
+		committed = saturatingSub(totals.memBytes, totals.memAvailable)
+		usable := saturatingSub(totals.memAvailable, reserve)
+		if usable > holds {
+			available = usable - holds
+		}
+		if credit > 0 {
+			available += credit
+		}
+	} else {
+		// Allocated mode: the base is the sum of the guests' ALLOCATED memory
+		// (the historical behaviour), and each reservation withholds the
+		// shortfall between its full shape and what its VM row has absorbed.
+		committed = totals.guestMem
+		delta := int64(0)
+		for _, r := range a.res {
+			if r.node != node {
+				continue
+			}
+			observed := uint64(0)
+			if r.vmid != 0 {
+				observed = snap.guestMem[r.vmid]
+			}
+			if r.shape.MemoryBytes > observed {
+				//nolint:gosec // G115: a guest's configured memory is bounded by physical RAM, many orders of magnitude below 2^63 bytes (8 EiB).
+				delta += int64(r.shape.MemoryBytes - observed)
+			}
+			for _, v := range r.freeing {
+				//nolint:gosec // G115: as above — guest memory is bounded by physical RAM.
+				delta -= int64(snap.guestMem[v])
+			}
+		}
+		committed = addClamped(committed, delta)
+		if usable := saturatingSub(totals.memBytes, reserve); usable > committed {
+			available = usable - committed
+		}
+	}
+
 	st := NodeState{
 		TotalBytes:     totals.memBytes,
 		ReserveBytes:   reserve,
 		CommittedBytes: committed,
-		CPUGated:       a.opts.CPUOvercommit > 0,
+		AvailableBytes: available,
+		CPUGated:       a.cpuGated(),
 		CommittedVCPU:  committedVCPU,
-	}
-	if usable := saturatingSub(totals.memBytes, reserve); usable > committed {
-		st.AvailableBytes = usable - committed
 	}
 	if st.CPUGated {
 		st.LimitVCPU = a.vcpuLimit(totals.vcpus)
@@ -489,10 +626,81 @@ func (a *Accountant) stateLocked(snap *snapshot, node string) NodeState {
 	return st
 }
 
-// vcpuLimit is the vCPU admission ceiling for a node with the given
-// physical core count. Sole definition, shared by the fit check and the
-// reported NodeState so the two cannot disagree.
+// holdsAndCreditsLocked sums, for one node, the in-flight memory a ledger
+// must withhold from the node's free pool (host_available mode) and the
+// freeing credits to add back. Caller must hold a.mu.
+func (a *Accountant) holdsAndCreditsLocked(snap *snapshot, node string) (holds, credit uint64) {
+	for _, r := range a.res {
+		if r.node != node {
+			continue
+		}
+		observed := uint64(0)
+		if r.vmid != 0 {
+			observed = snap.guestMem[r.vmid]
+			if a.isHostMode() && !snap.guestPowered[r.vmid] {
+				// A powered-off guest's configured RAM is not in the node's
+				// live available-memory reading, so treat the reservation as fully
+				// withheld until its guest powers on and the fresh reading
+				// absorbs it.
+				observed = 0
+			}
+		}
+		// In host mode a reservation withholds its full shape scaled by the
+		// overcommit factor (a fresh measurement absorbs it once the guest's
+		// RAM shows up in free), not the allocated shortfall.
+		want := uint64(0)
+		if a.isHostMode() {
+			want = uint64(float64(r.shape.MemoryBytes) * a.memOvercommit())
+		} else {
+			want = r.shape.MemoryBytes
+		}
+		if want > observed {
+			holds += want - observed
+		}
+		for _, v := range r.freeing {
+			credit += snap.guestMem[v]
+		}
+	}
+	return holds, credit
+}
+
+// isHostMode reports whether the accountant plans against live available RAM
+// rather than the guests' allocated memory.
+func (a *Accountant) isHostMode() bool {
+	return a.opts.MemoryMode == MemoryModeHostAvailable
+}
+
+// memOvercommit is the host-mode memory overcommit factor, defaulting to
+// 1.0 (no oversubscription) when unset.
+func (a *Accountant) memOvercommit() float64 {
+	if a.opts.MemoryOvercommit <= 0 {
+		return 1.0
+	}
+	return a.opts.MemoryOvercommit
+}
+
+// stale reports whether a snapshot is too old to admit against in
+// host_available mode: older than twice the refresh interval, which is
+// the staleness an operator would call "not fresh" given the refresh cadence.
+func (a *Accountant) stale(snap *snapshot) bool {
+	if a.opts.Refresh <= 0 {
+		return false
+	}
+	return a.now().Sub(snap.takenAt) > 2*a.opts.Refresh
+}
+
+func (a *Accountant) cpuUsageMode() bool { return a.opts.CPUMode == CPUModeHostUsage }
+func (a *Accountant) cpuGated() bool     { return a.cpuUsageMode() || a.opts.CPUOvercommit > 0 }
+
+// vcpuLimit is shared by admission and reported capacity.
 func (a *Accountant) vcpuLimit(cores int) int {
+	if a.cpuUsageMode() {
+		limit := a.opts.CPUUsageLimit
+		if limit == 0 {
+			limit = 0.8
+		}
+		return int(float64(cores) * limit)
+	}
 	return int(float64(cores) * a.opts.CPUOvercommit)
 }
 
@@ -569,8 +777,10 @@ func (a *Accountant) reserveFor(total uint64) uint64 {
 //
 // A reservation retires once its VM is observed at (or above) its full
 // configured size — at that point the guest row carries the allocation
-// and keeping the reservation would double-count it. Expiry is the leak
-// guard for clones that never got that far.
+// and keeping the reservation would double-count it. In host_available
+// mode it also has to be powered on first, because the guest's RAM only
+// reaches the node's live available-memory reading when it is running. Expiry is
+// the leak guard for clones that never got that far.
 func (a *Accountant) sweepLocked(snap *snapshot) {
 	now := time.Now()
 	for id, r := range a.res {
@@ -581,7 +791,16 @@ func (a *Accountant) sweepLocked(snap *snapshot) {
 			delete(a.res, id)
 			continue
 		}
-		if r.vmid != 0 && snap.guestMem[r.vmid] >= r.shape.MemoryBytes {
+		retired := r.vmid != 0 && snap.guestMem[r.vmid] >= r.shape.MemoryBytes
+		if a.isHostMode() || a.cpuUsageMode() {
+			// In host mode the node's live available-memory reading absorbs a
+			// reservation's RAM only once its guest is actually powered on.
+			// A powered-off guest's configured RAM never reached that reading,
+			// so retiring now would stop withholding RAM the host is not yet
+			// spending.
+			retired = retired && snap.guestPowered[r.vmid]
+		}
+		if retired {
 			r.released = true
 			delete(a.res, id)
 			continue
@@ -650,11 +869,13 @@ func (a *Accountant) fetch(ctx context.Context) (*snapshot, error) {
 	if err := a.cli.Get(ctx, "/cluster/resources", &rs); err != nil {
 		return nil, fmt.Errorf("list cluster resources: %w", err)
 	}
+	hostMode := a.isHostMode()
 	snap := &snapshot{
-		nodes:     map[string]nodeTotals{},
-		guestMem:  map[int]uint64{},
-		guestVCPU: map[int]int{},
-		takenAt:   time.Now(),
+		nodes:        map[string]nodeTotals{},
+		guestMem:     map[int]uint64{},
+		guestVCPU:    map[int]int{},
+		guestPowered: map[int]bool{},
+		takenAt:      time.Now(),
 	}
 	want := func(name string) bool {
 		return len(a.opts.Nodes) == 0 || slices.Contains(a.opts.Nodes, name)
@@ -685,6 +906,10 @@ func (a *Accountant) fetch(ctx context.Context) (*snapshot, error) {
 				continue
 			}
 			vmid := int(r.VMID) //nolint:gosec // VMIDs are bounded well below int range
+			// Record power state before the allocation filter so the map is a
+			// faithful record of who is actually consuming live host RAM — the
+			// thing host_available mode keys its holds and retirement on.
+			snap.guestPowered[vmid] = r.Status != guestStopped
 			if !a.holdsMemory(r.Status, r.Tags, vmid) {
 				continue
 			}
@@ -700,9 +925,56 @@ func (a *Accountant) fetch(ctx context.Context) (*snapshot, error) {
 	for node, totals := range snap.nodes {
 		totals.guestMem = guestSums[node].guestMem
 		totals.guestVCPU = guestSums[node].guestVCPU
+		if hostMode || a.cpuUsageMode() {
+			// Admission plans against the node's live available RAM, which only the
+			// per-node status endpoint reports. A failed reading marks the node
+			// as missing so stateLocked fails closed rather than admit blind.
+			st, err := a.nodeLiveStatus(ctx, node)
+			free, ok := st.availableMemory()
+			totals.memAvailable = free
+			totals.memMissing = err != nil || !ok
+			totals.cpuMissing = err != nil || st.CPU == nil
+			if st.CPU != nil {
+				totals.cpuUsage = *st.CPU
+				totals.cpuMissing = totals.cpuMissing || math.IsNaN(*st.CPU) || math.IsInf(*st.CPU, 0) || *st.CPU < 0 || *st.CPU > 1
+			}
+		}
 		snap.nodes[node] = totals
 	}
 	return snap, nil
+}
+
+// nodeLiveStatus supplies both admission modes in one API round trip.
+type liveStatus struct {
+	CPU    *float64 `json:"cpu"`
+	Memory struct {
+		Available *uint64 `json:"available"`
+		Used      *uint64 `json:"used"`
+		Total     uint64  `json:"total"`
+	} `json:"memory"`
+}
+
+func (a *Accountant) nodeLiveStatus(ctx context.Context, node string) (liveStatus, error) {
+	var st liveStatus
+	err := a.cli.Get(ctx, "/nodes/"+node+"/status", &st)
+	if err != nil {
+		a.log.Warn("nodecap: node status read failed; node will fail closed this refresh", "node", node, "err", err)
+	}
+	return st, err
+}
+
+// Older APIs omit available but report used excluding reclaimable cache.
+func (st liveStatus) availableMemory() (uint64, bool) {
+	if st.Memory.Total == 0 {
+		return 0, false
+	}
+	if st.Memory.Available != nil {
+		return *st.Memory.Available, *st.Memory.Available <= st.Memory.Total
+	}
+	if st.Memory.Used == nil || *st.Memory.Used > st.Memory.Total {
+		return 0, false
+	}
+	return st.Memory.Total - *st.Memory.Used, true
 }
 
 // addClamped adds a signed delta to an unsigned base, flooring at 0.

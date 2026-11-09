@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -35,13 +36,22 @@ type resourceServer struct {
 	rows    []map[string]any
 	failing bool
 	calls   atomic.Int64
+	// nodeStatus maps a node name to its GET /nodes/{node}/status payload.
+	// The host_available mode reads memory.free from here. A node with no
+	// entry errors (500), which the accountant treats as a missing reading
+	// and fails closed for.
+	nodeStatus map[string]map[string]any
 }
 
 func newResourceServer(t *testing.T, rows []map[string]any) *resourceServer {
 	t.Helper()
 	rs := &resourceServer{rows: rows}
-	rs.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	rs.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rs.calls.Add(1)
+		if node, ok := nodeStatusPath(r.URL.Path); ok {
+			rs.serveNodeStatus(w, node)
+			return
+		}
 		rs.mu.Lock()
 		failing, rows := rs.failing, rs.rows
 		rs.mu.Unlock()
@@ -55,6 +65,52 @@ func newResourceServer(t *testing.T, rows []map[string]any) *resourceServer {
 	}))
 	t.Cleanup(rs.Close)
 	return rs
+}
+
+// nodeStatusPath reports whether the path is a GET /nodes/{node}/status and
+// returns the node name. The host_available mode reads each node's live
+// free RAM from this endpoint.
+func nodeStatusPath(path string) (string, bool) {
+	const prefix = "/nodes/"
+	const suffix = "/status"
+	if !strings.HasPrefix(path, prefix) || !strings.HasSuffix(path, suffix) {
+		return "", false
+	}
+	node := strings.TrimSuffix(strings.TrimPrefix(path, prefix), suffix)
+	if node == "" {
+		return "", false
+	}
+	return node, true
+}
+
+func (rs *resourceServer) serveNodeStatus(w http.ResponseWriter, node string) {
+	rs.mu.Lock()
+	payload, ok := rs.nodeStatus[node]
+	rs.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	if !ok {
+		// 500, not 404: go-proxmox only surfaces 5xx/400 as errors, so a
+		// 404 would unmarshal to a spurious free=0. A 500 makes the
+		// accountant see a failed read and fail closed.
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"error":"no such node"}`)
+		return
+	}
+	writeJSON(w, map[string]any{"data": payload})
+}
+
+// setNodeStatus pins a node's /status reading. The host_available mode
+// admits against free, bounded by total; call it for every node the
+// accountant must plan against in host mode.
+func (rs *resourceServer) setNodeStatus(node string, free, total uint64) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if rs.nodeStatus == nil {
+		rs.nodeStatus = map[string]map[string]any{}
+	}
+	rs.nodeStatus[node] = map[string]any{
+		"memory": map[string]any{"free": free, "total": total, "used": total - free},
+	}
 }
 
 func (rs *resourceServer) setRows(rows []map[string]any) {
@@ -126,6 +182,11 @@ func newAccountant(t *testing.T, rs *resourceServer, mutate func(*Options)) *Acc
 	}
 	a, err := New(cli, opts)
 	require.NoError(t, err)
+	// The tiny cache TTL drives refresh tests, not wall-clock freshness.
+	// Parallel/race instrumentation may pause a test beyond twice that TTL.
+	// Staleness tests explicitly advance this injected clock themselves.
+	fixedNow := time.Now()
+	a.now = func() time.Time { return fixedNow }
 	return a
 }
 
@@ -655,4 +716,306 @@ func TestSingleflightCollapsesConcurrentFetches(t *testing.T) {
 	wg.Wait()
 	require.LessOrEqual(t, rs.calls.Load(), int64(2),
 		"concurrent cache misses must collapse into a single API call")
+}
+
+// TestHostModeAdmitsAgainstFreeNotGuestSum is the premise of
+// host_available: admission plans against the node's actually-free RAM,
+// which already folds in the running guests AND host overhead — not the
+// sum of the guests' configured maxmem. The same node answers differently
+// under the two readings, and admission must follow the free number.
+func TestHostModeAdmitsAgainstFreeNotGuestSum(t *testing.T) {
+	t.Parallel()
+	rs := newResourceServer(t, []map[string]any{
+		nodeRow("pve1", 32*gib, 16),
+		guestRow(101, "pve1", 8*gib, 4), // a foreign running guest
+	})
+	// The host has consumed the guest's 8 GiB plus 4 GiB of PVE/ZFS/qemu
+	// overhead, leaving 20 GiB genuinely free.
+	rs.setNodeStatus("pve1", 20*gib, 32*gib)
+	a := newAccountant(t, rs, func(o *Options) { o.MemoryMode = MemoryModeHostAvailable })
+
+	states, err := a.Snapshot(context.Background())
+	require.NoError(t, err)
+	st := states["pve1"]
+	require.Equal(t, uint64(20*gib), st.AvailableBytes,
+		"admission follows the free reading, not total minus the guest sum (which would be 24)")
+	require.Equal(t, uint64(12*gib), st.CommittedBytes,
+		"committed is total minus free — everything the host is actually using")
+	require.False(t, st.MemoryPressured)
+
+	ctx := context.Background()
+	// 24 GiB is the number the guest-sum arithmetic would admit (32 - 8);
+	// the free reading must refuse it.
+	_, ok, err := a.Reserve(ctx, "pve1", Shape{MemoryBytes: 24 * gib})
+	require.NoError(t, err)
+	require.False(t, ok, "admission follows the free reading, not total minus the guest sum")
+	// The full free RAM still fits.
+	_, ok, err = a.Reserve(ctx, "pve1", Shape{MemoryBytes: 20 * gib})
+	require.NoError(t, err)
+	require.True(t, ok, "the 20 GiB free reading must be spendable")
+}
+
+// TestHostModeOvercommitAdmitsMore: memory_overcommit < 1.0 lets a
+// reservation withhold less than its full shape, so the box may be
+// oversubscribed; at the 1.0 default it may not.
+func TestHostModeOvercommitAdmitsMore(t *testing.T) {
+	t.Parallel()
+	newRS := func() *resourceServer {
+		rs := newResourceServer(t, []map[string]any{nodeRow("pve1", 32*gib, 16)})
+		rs.setNodeStatus("pve1", 32*gib, 32*gib) // empty node, 32 GiB free
+		return rs
+	}
+	ctx := context.Background()
+
+	// Default overcommit (1.0): a 16 GiB reservation withholds all 16.
+	full := newAccountant(t, newRS(), func(o *Options) { o.MemoryMode = MemoryModeHostAvailable })
+	_, ok, err := full.Reserve(ctx, "pve1", Shape{MemoryBytes: 16 * gib})
+	require.NoError(t, err)
+	require.True(t, ok)
+	_, ok, err = full.Reserve(ctx, "pve1", Shape{MemoryBytes: 17 * gib})
+	require.NoError(t, err)
+	require.False(t, ok, "at overcommit 1.0 the full 16 GiB is withheld, leaving 16")
+
+	// Overcommit 0.5: the same 16 GiB reservation withholds only 8, so the
+	// node still has 24 GiB to hand out.
+	half := newAccountant(t, newRS(), func(o *Options) {
+		o.MemoryMode = MemoryModeHostAvailable
+		o.MemoryOvercommit = 0.5
+	})
+	_, ok, err = half.Reserve(ctx, "pve1", Shape{MemoryBytes: 16 * gib})
+	require.NoError(t, err)
+	require.True(t, ok)
+	_, ok, err = half.Reserve(ctx, "pve1", Shape{MemoryBytes: 24 * gib})
+	require.NoError(t, err)
+	require.True(t, ok, "overcommit 0.5 withholds 8 GiB, leaving 24 for a second clone")
+}
+
+// TestHostModeMissingStatusFailsClosed: a node whose /status read fails
+// has no usable free-RAM number, and memory cannot be guessed, so the
+// node must withhold admission entirely rather than plan on a spurious
+// zero.
+func TestHostModeMissingStatusFailsClosed(t *testing.T) {
+	t.Parallel()
+	rs := newResourceServer(t, []map[string]any{nodeRow("pve1", 32*gib, 16)})
+	// pve1 has no /status payload: the read errors.
+	a := newAccountant(t, rs, func(o *Options) { o.MemoryMode = MemoryModeHostAvailable })
+
+	states, err := a.Snapshot(context.Background())
+	require.NoError(t, err)
+	st := states["pve1"]
+	require.True(t, st.MemoryPressured, "a missing free-RAM reading must be surfaced as pressure")
+	require.Zero(t, st.AvailableBytes, "admission must fail closed, not guess")
+
+	_, ok, err := a.Reserve(context.Background(), "pve1", Shape{MemoryBytes: gib})
+	require.NoError(t, err)
+	require.False(t, ok, "a pressured node admits nothing")
+}
+
+// TestHostModeStaleStatusFailsClosed: a free-RAM reading older than twice
+// the refresh interval is too old to trust, so the node fails closed until
+// a fresh read lands. The clock is advanced without sleeping so the cached
+// snapshot is not re-fetched (which would make it fresh again).
+func TestHostModeStaleStatusFailsClosed(t *testing.T) {
+	t.Parallel()
+	rs := newResourceServer(t, []map[string]any{nodeRow("pve1", 32*gib, 16)})
+	rs.setNodeStatus("pve1", 32*gib, 32*gib)
+	a := newAccountant(t, rs, func(o *Options) {
+		o.MemoryMode = MemoryModeHostAvailable
+		o.Refresh = time.Minute // keep the cache pinned so no re-fetch happens
+	})
+	ctx := context.Background()
+
+	states, err := a.Snapshot(ctx)
+	require.NoError(t, err)
+	require.False(t, states["pve1"].MemoryPressured)
+	require.Equal(t, uint64(32*gib), states["pve1"].AvailableBytes)
+
+	// Age the snapshot beyond 2*Refresh on the injected clock. The 1-minute
+	// cache TTL is not elapsed (no sleep), so resources() still serves this
+	// same snapshot; only the staleness check sees the advanced clock.
+	a.mu.Lock()
+	takenAt := a.lastFresh.takenAt
+	a.now = func() time.Time { return takenAt.Add(3 * time.Minute) }
+	a.mu.Unlock()
+
+	states, err = a.Snapshot(ctx)
+	require.NoError(t, err)
+	require.True(t, states["pve1"].MemoryPressured, "a stale reading must not be admitted against")
+	require.Zero(t, states["pve1"].AvailableBytes)
+}
+
+// TestHostModeReservationRetiresOnObservation: in host mode a
+// reservation withholds its RAM from the free pool until the guest's RAM
+// shows up in the free reading; once the guest is observed at full size
+// the reservation retires and the free reading alone carries it, with no
+// double count.
+func TestHostModeReservationRetiresOnObservation(t *testing.T) {
+	t.Parallel()
+	rs := newResourceServer(t, []map[string]any{nodeRow("pve1", 32*gib, 16)})
+	rs.setNodeStatus("pve1", 32*gib, 32*gib) // empty node
+	a := newAccountant(t, rs, func(o *Options) {
+		o.MemoryMode = MemoryModeHostAvailable
+		o.ReserveBytes = 0
+	})
+	ctx := context.Background()
+
+	res, ok, err := a.Reserve(ctx, "pve1", Shape{MemoryBytes: 16 * gib})
+	require.NoError(t, err)
+	require.True(t, ok)
+	res.Bind(10001)
+	states, err := a.Snapshot(ctx)
+	require.NoError(t, err)
+	require.Equal(t, uint64(16*gib), states["pve1"].AvailableBytes,
+		"the reservation withholds its 16 GiB from the 32 GiB free pool")
+
+	// The clone lands at full size and starts consuming RAM: free drops to
+	// 16 GiB. The reservation retires (observed >= shape) and the free
+	// reading carries the allocation — available stays 16, not 0.
+	rs.setRows([]map[string]any{nodeRow("pve1", 32*gib, 16), guestRow(10001, "pve1", 16*gib, 8)})
+	rs.setNodeStatus("pve1", 16*gib, 32*gib)
+	settle()
+	states, err = a.Snapshot(ctx)
+	require.NoError(t, err)
+	require.Equal(t, uint64(16*gib), states["pve1"].CommittedBytes, "total minus free")
+	require.Equal(t, uint64(16*gib), states["pve1"].AvailableBytes,
+		"retiring must not subtract the guest a second time off the free reading")
+}
+
+// TestAllocatedModeDoesNotReadNodeStatus is the back-compat contract: the
+// default allocated mode adds zero Proxmox calls — it never touches
+// /nodes/{node}/status, so a fleet that has not opted into host_available
+// pays no extra API cost.
+func TestAllocatedModeDoesNotReadNodeStatus(t *testing.T) {
+	t.Parallel()
+	rs := newResourceServer(t, []map[string]any{nodeRow("pve1", 32*gib, 16)})
+	a := newAccountant(t, rs, func(o *Options) { o.ReserveBytes = 0 })
+
+	states, err := a.Snapshot(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, uint64(32*gib), states["pve1"].AvailableBytes)
+	require.Equal(t, int64(1), rs.calls.Load(),
+		"allocated mode reads /cluster/resources only — one call, no /status")
+}
+
+// Proxmox reports unused RAM separately from memory available after reclaiming
+// cache. Admission must use the latter without losing reservation accounting.
+func TestHostModeAvailableMemoryFields(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name      string
+		memory    map[string]any
+		available uint64
+		pressured bool
+	}{
+		{"available preferred", map[string]any{"total": 64 * gib, "used": 24 * gib, "free": 2 * gib, "available": 40 * gib}, 36 * gib, false},
+		{"older API total minus used", map[string]any{"total": 64 * gib, "used": 24 * gib, "free": 2 * gib}, 36 * gib, false},
+		{"explicit zero available", map[string]any{"total": 64 * gib, "used": 24 * gib, "available": 0}, 0, false},
+		{"missing usage", map[string]any{"total": 64 * gib, "free": 2 * gib}, 0, true},
+		{"missing total", map[string]any{"available": 40 * gib}, 0, true},
+		{"used exceeds total", map[string]any{"total": 64 * gib, "used": 65 * gib}, 0, true},
+		{"available exceeds total", map[string]any{"total": 64 * gib, "available": 65 * gib}, 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			rs := newResourceServer(t, []map[string]any{nodeRow("pve1", 64*gib, 16)})
+			rs.nodeStatus = map[string]map[string]any{"pve1": {"memory": tc.memory}}
+			a := newAccountant(t, rs, func(o *Options) { o.MemoryMode = MemoryModeHostAvailable; o.ReserveBytes = 4 * gib })
+			states, err := a.Snapshot(context.Background())
+			require.NoError(t, err)
+			require.Equal(t, tc.available, states["pve1"].AvailableBytes)
+			require.Equal(t, tc.pressured, states["pve1"].MemoryPressured)
+			if tc.available == 0 {
+				_, ok, err := a.Reserve(context.Background(), "pve1", Shape{MemoryBytes: 4 * gib})
+				require.NoError(t, err)
+				require.False(t, ok)
+			}
+			if tc.available > 0 {
+				_, ok, err := a.Reserve(context.Background(), "pve1", Shape{MemoryBytes: 4 * gib})
+				require.NoError(t, err)
+				require.True(t, ok, "cache-backed available memory must admit the Windows worker")
+				states, err = a.Snapshot(context.Background())
+				require.NoError(t, err)
+				require.Equal(t, tc.available-4*gib, states["pve1"].AvailableBytes)
+			}
+		})
+	}
+}
+
+func TestCPUHostUsageAdmission(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name     string
+		cpu      any
+		admitted bool
+	}{
+		{"idle", 0.0, true}, {"39 percent", 0.39, true},
+		{"busy", 0.79, false}, {"missing", nil, false},
+		{"negative", -0.1, false}, {"above one", 1.1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			rs := newResourceServer(t, []map[string]any{nodeRow("pve1", 64*gib, 44), guestRow(101, "pve1", gib, 1000)})
+			rs.nodeStatus = map[string]map[string]any{"pve1": {"cpu": tc.cpu}}
+			a := newAccountant(t, rs, func(o *Options) {
+				o.CPUMode = CPUModeHostUsage
+				o.CPUUsageLimit = 0.8
+				o.CPUOvercommit = 0.1
+				o.Refresh = time.Minute
+			})
+			_, ok, err := a.Reserve(context.Background(), "pve1", Shape{MemoryBytes: gib, VCPUs: 4})
+			require.NoError(t, err)
+			require.Equal(t, tc.admitted, ok, "actual usage must replace allocated vCPUs and ignore overcommit ratio")
+			if tc.admitted {
+				a.mu.Lock()
+				takenAt := a.lastFresh.takenAt
+				a.now = func() time.Time { return takenAt.Add(3 * time.Minute) }
+				a.mu.Unlock()
+				_, ok, err = a.Reserve(context.Background(), "pve1", Shape{MemoryBytes: gib, VCPUs: 4})
+				require.NoError(t, err)
+				require.False(t, ok, "stale CPU usage must fail closed")
+			}
+		})
+	}
+}
+
+func TestCPUHostUsageConcurrentReservations(t *testing.T) {
+	t.Parallel()
+	rs := newResourceServer(t, []map[string]any{nodeRow("pve1", 64*gib, 44)})
+	rs.nodeStatus = map[string]map[string]any{"pve1": {"cpu": 0.39}}
+	a := newAccountant(t, rs, func(o *Options) { o.CPUMode = CPUModeHostUsage; o.CPUUsageLimit = 0.8; o.Refresh = time.Minute })
+	var mu sync.Mutex
+	var admitted int
+	var wg sync.WaitGroup
+	for range 20 {
+		wg.Go(func() {
+			_, ok, err := a.Reserve(context.Background(), "pve1", Shape{MemoryBytes: gib, VCPUs: 4})
+			require.NoError(t, err)
+			if ok {
+				mu.Lock()
+				admitted++
+				mu.Unlock()
+			}
+		})
+	}
+	wg.Wait()
+	require.Equal(t, 4, admitted, "ceil(44*0.39)=18 used, floor(44*0.8)=35 limit: four 4-vCPU launches fit")
+}
+
+func TestCPUHostUsageStoppedCloneRetainsReservation(t *testing.T) {
+	t.Parallel()
+	rows := []map[string]any{nodeRow("pve1", 64*gib, 44), stoppedGuestRow(10000, "pve1", gib, 4)}
+	rs := newResourceServer(t, rows)
+	rs.nodeStatus = map[string]map[string]any{"pve1": {"cpu": 0.39}}
+	a := newAccountant(t, rs, func(o *Options) { o.CPUMode = CPUModeHostUsage; o.CPUUsageLimit = 0.8; o.Refresh = time.Minute })
+	res, ok, err := a.Reserve(context.Background(), "pve1", Shape{MemoryBytes: gib, VCPUs: 4})
+	require.NoError(t, err)
+	require.True(t, ok)
+	res.Bind(10000)
+	states, err := a.Snapshot(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 22, states["pve1"].CommittedVCPU, "stopped warm clone is not in measured CPU and must retain its four-vCPU claim")
+	res.Release()
+	states, err = a.Snapshot(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 18, states["pve1"].CommittedVCPU, "failed launch releases its CPU claim")
 }
