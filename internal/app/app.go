@@ -563,6 +563,8 @@ func buildCapacityAccountant(cfg *config.Config, prov provisioner.Provisioner, l
 		ReserveBytes:     uint64(max(cc.ReserveMemoryMB, 0)) * 1024 * 1024,
 		ReserveFraction:  cc.ReserveMemoryFraction,
 		CPUOvercommit:    cc.CPUOvercommitRatio,
+		CPUMode:          cc.CPUMode,
+		CPUUsageLimit:    cc.CPUUsageLimit,
 		MemoryMode:       cc.MemoryMode,
 		MemoryOvercommit: cc.MemoryOvercommit,
 		// The in-flight clone grace already means "how long before we

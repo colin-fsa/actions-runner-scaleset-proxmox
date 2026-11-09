@@ -281,6 +281,8 @@ pool:
   #   # CPU is time-shared, so it is only gated when you ask: the cap is
   #   # (physical cores x ratio). 0 (default) means vCPUs are never a
   #   # reason to refuse a clone.
+  #   cpu_mode: allocated       # or host_usage for measured CPU admission
+  #   cpu_usage_limit: 0.8       # host_usage ceiling (80%); ignores ratio
   #   cpu_overcommit_ratio: 0
   #   # How memory is measured. allocated (default) plans against the node's
   #   # physical RAM minus the reserve minus the configured memory of every

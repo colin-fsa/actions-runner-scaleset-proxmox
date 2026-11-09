@@ -234,3 +234,28 @@ func TestCapacity_UnknownMemoryModeNamesTheField(t *testing.T) {
 	require.Contains(t, err.Error(), "pool.capacity.memory_mode")
 	require.Contains(t, err.Error(), `"oversubscribed"`)
 }
+
+func TestCapacity_CPUModes(t *testing.T) {
+	cfg, err := config.Parse(capacityCfg("10", capacityOn, "2", "4096"))
+	require.NoError(t, err)
+	require.Equal(t, "allocated", cfg.Pool.Capacity.CPUMode)
+	require.InDelta(t, 0.8, cfg.Pool.Capacity.CPUUsageLimit, 1e-9)
+	for _, tc := range []struct {
+		extra string
+		valid bool
+	}{
+		{"\n    cpu_mode: host_usage\n    cpu_usage_limit: 0.85", true},
+		{"\n    cpu_mode: nonsense", false},
+		{"\n    cpu_usage_limit: 1.1", false},
+		{"\n    cpu_usage_limit: -0.1", false},
+	} {
+		_, err := config.Parse(capacityCfg("10", capacityOn+tc.extra, "2", "4096"))
+		if tc.valid {
+			require.NoError(t, err)
+		} else {
+			require.Error(t, err)
+		}
+	}
+	_, err = config.Parse(capacityCfg("10", capacityOn+"\n    cpu_mode: host_usage", "0", "4096"))
+	require.Error(t, err, "usage forecasts require a known CPU shape")
+}

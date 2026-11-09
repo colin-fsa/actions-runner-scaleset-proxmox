@@ -935,3 +935,82 @@ func TestHostModeAvailableMemoryFields(t *testing.T) {
 		})
 	}
 }
+
+func TestCPUHostUsageAdmission(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name     string
+		cpu      any
+		admitted bool
+	}{
+		{"idle", 0.0, true}, {"39 percent", 0.39, true},
+		{"busy", 0.79, false}, {"missing", nil, false},
+		{"negative", -0.1, false}, {"above one", 1.1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			rs := newResourceServer(t, []map[string]any{nodeRow("pve1", 64*gib, 44), guestRow(101, "pve1", gib, 1000)})
+			rs.nodeStatus = map[string]map[string]any{"pve1": {"cpu": tc.cpu}}
+			a := newAccountant(t, rs, func(o *Options) {
+				o.CPUMode = CPUModeHostUsage
+				o.CPUUsageLimit = 0.8
+				o.CPUOvercommit = 0.1
+				o.Refresh = time.Minute
+			})
+			_, ok, err := a.Reserve(context.Background(), "pve1", Shape{MemoryBytes: gib, VCPUs: 4})
+			require.NoError(t, err)
+			require.Equal(t, tc.admitted, ok, "actual usage must replace allocated vCPUs and ignore overcommit ratio")
+			if tc.admitted {
+				a.mu.Lock()
+				takenAt := a.lastFresh.takenAt
+				a.now = func() time.Time { return takenAt.Add(3 * time.Minute) }
+				a.mu.Unlock()
+				_, ok, err = a.Reserve(context.Background(), "pve1", Shape{MemoryBytes: gib, VCPUs: 4})
+				require.NoError(t, err)
+				require.False(t, ok, "stale CPU usage must fail closed")
+			}
+		})
+	}
+}
+
+func TestCPUHostUsageConcurrentReservations(t *testing.T) {
+	t.Parallel()
+	rs := newResourceServer(t, []map[string]any{nodeRow("pve1", 64*gib, 44)})
+	rs.nodeStatus = map[string]map[string]any{"pve1": {"cpu": 0.39}}
+	a := newAccountant(t, rs, func(o *Options) { o.CPUMode = CPUModeHostUsage; o.CPUUsageLimit = 0.8; o.Refresh = time.Minute })
+	var mu sync.Mutex
+	var admitted int
+	var wg sync.WaitGroup
+	for range 20 {
+		wg.Go(func() {
+			_, ok, err := a.Reserve(context.Background(), "pve1", Shape{MemoryBytes: gib, VCPUs: 4})
+			require.NoError(t, err)
+			if ok {
+				mu.Lock()
+				admitted++
+				mu.Unlock()
+			}
+		})
+	}
+	wg.Wait()
+	require.Equal(t, 4, admitted, "ceil(44*0.39)=18 used, floor(44*0.8)=35 limit: four 4-vCPU launches fit")
+}
+
+func TestCPUHostUsageStoppedCloneRetainsReservation(t *testing.T) {
+	t.Parallel()
+	rows := []map[string]any{nodeRow("pve1", 64*gib, 44), stoppedGuestRow(10000, "pve1", gib, 4)}
+	rs := newResourceServer(t, rows)
+	rs.nodeStatus = map[string]map[string]any{"pve1": {"cpu": 0.39}}
+	a := newAccountant(t, rs, func(o *Options) { o.CPUMode = CPUModeHostUsage; o.CPUUsageLimit = 0.8; o.Refresh = time.Minute })
+	res, ok, err := a.Reserve(context.Background(), "pve1", Shape{MemoryBytes: gib, VCPUs: 4})
+	require.NoError(t, err)
+	require.True(t, ok)
+	res.Bind(10000)
+	states, err := a.Snapshot(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 22, states["pve1"].CommittedVCPU, "stopped warm clone is not in measured CPU and must retain its four-vCPU claim")
+	res.Release()
+	states, err = a.Snapshot(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 18, states["pve1"].CommittedVCPU, "failed launch releases its CPU claim")
+}

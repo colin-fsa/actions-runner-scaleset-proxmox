@@ -703,6 +703,11 @@ type CapacityConfig struct {
 	// typically idle on CPU while waiting on I/O. 1.0 would refuse to
 	// overcommit cores at all.
 	CPUOvercommitRatio float64 `yaml:"cpu_overcommit_ratio" validate:"gte=0,lte=64"`
+	// CPUMode selects allocated vCPUs (default) or measured host_usage.
+	CPUMode string `yaml:"cpu_mode"`
+	// CPUUsageLimit is the maximum forecast host utilization in host_usage mode.
+	// Defaults to 0.8; cpu_overcommit_ratio is ignored in this mode.
+	CPUUsageLimit float64 `yaml:"cpu_usage_limit" validate:"gt=0,lte=1"`
 
 	// EvictIdleForDemand lets a queued job reclaim capacity from an
 	// idle pool VM. When a job's clone cannot be admitted anywhere and
@@ -1396,6 +1401,12 @@ func (c *Config) applyPoolDefaults() {
 // CPUOvercommitRatio and EvictIdleForDemand are deliberately
 // zero-valued so the feature and each of its escalations stay opt-in.
 func (c *Config) applyCapacityDefaults() {
+	if c.Pool.Capacity.CPUMode == "" {
+		c.Pool.Capacity.CPUMode = "allocated"
+	}
+	if c.Pool.Capacity.CPUUsageLimit == 0 {
+		c.Pool.Capacity.CPUUsageLimit = 0.8
+	}
 	c.Pool.Capacity.RefreshInterval.setDefault(15 * time.Second)
 	if c.Pool.Capacity.MemoryMode == "" {
 		c.Pool.Capacity.MemoryMode = MemoryModeAllocated
@@ -1676,6 +1687,11 @@ func (c *Config) resolvePool() error {
 	}
 	if c.Pool.Capacity.Enabled && c.Pool.Capacity.RefreshInterval.D() <= 0 {
 		return errors.New("pool.capacity.refresh_interval must be positive")
+	}
+	switch c.Pool.Capacity.CPUMode {
+	case "allocated", "host_usage":
+	default:
+		return fmt.Errorf("pool.capacity.cpu_mode: unknown value %q (expected allocated or host_usage)", c.Pool.Capacity.CPUMode)
 	}
 	// MemoryMode is a closed enum; ApplyDefaults substituted the
 	// "allocated" default for the unset case, so anything else here is
@@ -2383,8 +2399,8 @@ func (c *Config) validateProfileFootprint(si int, ssName string, pi int, p Profi
 		return fmt.Errorf("scalesets[%d] %q.profiles[%d] %q: memory_mb must be > 0 when pool.capacity.enabled (admission cannot size a clone that inherits the template's memory)",
 			si, ssName, pi, p.Name)
 	}
-	if c.Pool.Capacity.CPUOvercommitRatio > 0 && p.CPUCores <= 0 {
-		return fmt.Errorf("scalesets[%d] %q.profiles[%d] %q: cpu must be > 0 when pool.capacity.cpu_overcommit_ratio is set (admission cannot size a clone that inherits the template's cpu count)",
+	if (c.Pool.Capacity.CPUOvercommitRatio > 0 || c.Pool.Capacity.CPUMode == "host_usage") && p.CPUCores <= 0 {
+		return fmt.Errorf("scalesets[%d] %q.profiles[%d] %q: cpu must be > 0 when CPU capacity admission is enabled (admission cannot size a clone that inherits the template's cpu count)",
 			si, ssName, pi, p.Name)
 	}
 	return nil

@@ -35,6 +35,8 @@ import (
 // keep tests terse: a single node "pve1", template VMID 9000 on that
 // node, no guest-agent delay, 5ms task duration.
 type Options struct {
+	// NodeCPUUsage is the host CPU utilization fraction returned by /status.
+	NodeCPUUsage float64
 	// Nodes is the list of cluster nodes the fake claims to host. Empty
 	// defaults to []string{"pve1"}.
 	Nodes []string
@@ -431,6 +433,7 @@ func (s *Server) handleNodeStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	writeData(w, map[string]any{
 		"uptime": 12345,
+		"cpu":    s.opts.NodeCPUUsage,
 		"memory": map[string]any{
 			"free":  free,
 			"total": total,

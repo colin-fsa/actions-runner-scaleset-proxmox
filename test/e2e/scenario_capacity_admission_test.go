@@ -332,3 +332,19 @@ func TestE2E_CapacityAdmission_HostAvailablePlansAgainstFreeMemory(t *testing.T)
 		h.MetricValue(t, "scaleset_clone_deferred_capacity_total"),
 		"the clone that exceeds the live free pool must be counted")
 }
+
+func TestE2E_CapacityAdmission_CPUHostUsage(t *testing.T) {
+	t.Parallel()
+	fp := fakeproxmox.New(t, fakeproxmox.Options{NodeCPUUsage: 0.39, TaskDuration: 5 * time.Millisecond})
+	fp.SetNodeCapacity("pve1", 64*gib, 16)
+	fp.SeedVM("pve1", 500, "foreign-large-allocation", true, nil)
+	require.NoError(t, fp.SetVMConfig(500, "cores", 64))
+	h := Start(t, Options{
+		FakeProxmox: fp, HotSize: 2, MaxConcurrentRunners: 2,
+		Profiles: []ProfileSpec{{Name: "cpu-2", CPUCores: 2, MemoryMB: 4096, HotSize: 2}},
+		Capacity: &CapacitySpec{ReserveMemoryMB: 2048, CPUMode: "host_usage", CPUUsageLimit: 0.8, CPUOvercommitRatio: 1},
+	})
+	require.Eventually(t, func() bool {
+		return h.MetricValue(t, "scaleset_pool_size", formatLabel("state", "hot")) >= 2
+	}, 20*time.Second, 200*time.Millisecond, "39 percent host CPU must admit workers despite the foreign guest's 64-vCPU allocation")
+}
