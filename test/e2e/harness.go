@@ -162,6 +162,8 @@ type ProfileSpec struct {
 type CapacitySpec struct {
 	ReserveMemoryMB    int
 	CPUOvercommitRatio float64
+	CPUMode            string
+	CPUUsageLimit      float64
 	EvictIdleForDemand bool
 	// MemoryMode is pool.capacity.memory_mode. Empty omits the key, so the
 	// accountant runs the historical allocated-memory policy.
@@ -663,6 +665,10 @@ pool:
     refresh_interval: 100ms
     reserve_memory_mb: {{.Capacity.ReserveMemoryMB}}
     cpu_overcommit_ratio: {{.Capacity.CPUOvercommitRatio}}
+    cpu_usage_limit: {{.Capacity.CPUUsageLimit}}
+{{- if .Capacity.CPUMode }}
+    cpu_mode: {{.Capacity.CPUMode}}
+{{- end }}
     evict_idle_for_demand: {{.Capacity.EvictIdleForDemand}}
     memory_overcommit: {{.Capacity.MemoryOvercommit}}
 {{- if .Capacity.MemoryMode }}

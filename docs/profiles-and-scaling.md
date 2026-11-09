@@ -173,6 +173,38 @@ cannot overcommit, so a missing reading is treated as "no room", never as
 `allocated` is unchanged and adds no extra Proxmox calls. `host_available`
 issues one additional `GET /nodes/{node}/status` per node per refresh.
 
+### CPU admission modes
+
+`cpu_mode: allocated` is the backwards-compatible default. It compares configured
+vCPUs with logical host CPUs times `cpu_overcommit_ratio`; a zero ratio disables
+CPU admission. It does not use current utilization.
+
+For a shared host where existing guests are often idle, select measured usage:
+
+```yaml
+pool:
+  capacity:
+    enabled: true
+    memory_mode: host_available
+    cpu_mode: host_usage
+    cpu_usage_limit: 0.8
+```
+
+`host_usage` reads the node's `cpu` fraction from `GET /nodes/{node}/status`,
+sharing the request with host memory admission. It ignores `cpu_overcommit_ratio`.
+The ceiling is `floor(logical CPUs * cpu_usage_limit)`, and measured consumption
+is rounded up to CPU equivalents. Pending launches reserve their full configured
+vCPU count until observed powered on. Thus concurrent clones cannot spend the
+same forecast headroom; configured vCPUs of existing guests do not set the base.
+The limit defaults to 0.8 (80%); missing, invalid or stale readings fail closed.
+Profiles must specify their CPU count so a launch can be sized.
+
+This is admission based on sampled usage, not a CPU throttle or a guarantee
+against future contention. Existing jobs may become busy after admission. Leave
+headroom, keep concurrency limits, and monitor the host. CPU checks never bypass
+memory, placement or concurrency checks. A stopped warm VM is reserved until it
+boots (or its reservation expires), since it is not yet in host usage.
+
 ### Deferral is backpressure, not failure
 
 A clone that does not fit is **deferred**: no VM is created, no row is

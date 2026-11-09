@@ -36,6 +36,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"slices"
 	"sync"
 	"time"
@@ -71,12 +72,14 @@ type NodeState struct {
 	// on; in the allocated mode (the default) it is always false.
 	MemoryPressured bool
 
-	// CPUGated reports whether cpu_overcommit_ratio is configured. When
+	// CPUGated reports whether either CPU admission mode is enabled. When
 	// false, CPU is never a reason to refuse a clone and the three
 	// fields below are informational only.
 	CPUGated bool
-	// LimitVCPU is the admission ceiling — physical cores x
-	// cpu_overcommit_ratio — and AvailableVCPU is what is left of it.
+	// LimitVCPU is the admission ceiling: logical CPUs times either the
+	// allocated overcommit ratio or the host usage limit. AvailableVCPU is
+	// the remaining headroom. In usage mode CommittedVCPU is measured CPU
+	// equivalents plus pending launches, rather than allocated vCPUs.
 	// Both are zero when CPUGated is false. (LimitVCPU is deliberately
 	// not the raw core count: a consumer comparing a Shape against it
 	// must see the same ceiling admission applies.)
@@ -123,6 +126,11 @@ type Options struct {
 	// overcommittable, memory is not, so the default is permissive.
 	CPUOvercommit float64
 
+	// CPUMode defaults to allocated. host_usage uses measured host CPU with
+	// CPUUsageLimit (0..1), reserving each pending clone at its full vCPU size.
+	CPUMode       string
+	CPUUsageLimit float64
+
 	// MemoryMode selects how a node's usable memory is derived. The
 	// zero value is MemoryModeAllocated (the default, and the historical
 	// behaviour): admitted RAM is bounded by the sum of the guests' ALLOCATED
@@ -168,6 +176,12 @@ type VMIDRange struct {
 	Min int
 	Max int
 }
+
+// CPU admission modes accepted by Options.CPUMode.
+const (
+	CPUModeAllocated = "allocated"
+	CPUModeHostUsage = "host_usage"
+)
 
 // Memory modes accepted by Options.MemoryMode. See Options.MemoryMode.
 const (
@@ -313,6 +327,8 @@ type nodeTotals struct {
 	// allocated mode, which never consults the live reading.
 	memAvailable uint64
 	memMissing   bool
+	cpuUsage     float64
+	cpuMissing   bool
 }
 
 // reservation is one outstanding claim.
@@ -482,10 +498,12 @@ func (a *Accountant) fitsLocked(snap *snapshot, node string, shape Shape, extraF
 	if need > avail {
 		return false
 	}
-	if a.opts.CPUOvercommit > 0 {
+	if a.cpuGated() {
 		vcpuCredit := 0
 		for _, vmid := range extraFreeing {
-			vcpuCredit += snap.guestVCPU[vmid]
+			if !a.cpuUsageMode() {
+				vcpuCredit += snap.guestVCPU[vmid]
+			}
 		}
 		if st.CommittedVCPU-vcpuCredit+shape.VCPUs > a.vcpuLimit(totals.vcpus) {
 			return false
@@ -499,9 +517,15 @@ func (a *Accountant) stateLocked(snap *snapshot, node string) NodeState {
 	totals := snap.nodes[node]
 	reserve := a.reserveFor(totals.memBytes)
 	committedVCPU := totals.guestVCPU
+	if a.cpuUsageMode() {
+		committedVCPU = int(math.Ceil(totals.cpuUsage * float64(totals.vcpus)))
+		if totals.cpuMissing || a.stale(snap) {
+			committedVCPU = a.vcpuLimit(totals.vcpus) + 1
+		}
+	}
 
-	// Reservation vCPU terms are identical in both modes — the vCPU gate is
-	// about core overcommit, independent of how memory is derived.
+	// CPU reservations withhold launch footprints until observation. Usage
+	// mode does not credit allocated vCPUs for prospective evictions.
 	// Signed: a freeing credit can exceed the pending claims, and unsigned
 	// wraparound there would report a wildly empty node.
 	deltaVCPU := 0
@@ -510,14 +534,16 @@ func (a *Accountant) stateLocked(snap *snapshot, node string) NodeState {
 			continue
 		}
 		observedVCPU := 0
-		if r.vmid != 0 {
+		if r.vmid != 0 && (!a.cpuUsageMode() || snap.guestPowered[r.vmid]) {
 			observedVCPU = snap.guestVCPU[r.vmid]
 		}
 		if r.shape.VCPUs > observedVCPU {
 			deltaVCPU += r.shape.VCPUs - observedVCPU
 		}
 		for _, v := range r.freeing {
-			deltaVCPU -= snap.guestVCPU[v]
+			if !a.cpuUsageMode() {
+				deltaVCPU -= snap.guestVCPU[v]
+			}
 		}
 	}
 	committedVCPU += deltaVCPU
@@ -536,7 +562,7 @@ func (a *Accountant) stateLocked(snap *snapshot, node string) NodeState {
 			return NodeState{
 				TotalBytes:      totals.memBytes,
 				ReserveBytes:    reserve,
-				CPUGated:        a.opts.CPUOvercommit > 0,
+				CPUGated:        a.cpuGated(),
 				CommittedVCPU:   committedVCPU,
 				MemoryPressured: true,
 			}
@@ -588,7 +614,7 @@ func (a *Accountant) stateLocked(snap *snapshot, node string) NodeState {
 		ReserveBytes:   reserve,
 		CommittedBytes: committed,
 		AvailableBytes: available,
-		CPUGated:       a.opts.CPUOvercommit > 0,
+		CPUGated:       a.cpuGated(),
 		CommittedVCPU:  committedVCPU,
 	}
 	if st.CPUGated {
@@ -663,10 +689,18 @@ func (a *Accountant) stale(snap *snapshot) bool {
 	return a.now().Sub(snap.takenAt) > 2*a.opts.Refresh
 }
 
-// vcpuLimit is the vCPU admission ceiling for a node with the given
-// physical core count. Sole definition, shared by the fit check and the
-// reported NodeState so the two cannot disagree.
+func (a *Accountant) cpuUsageMode() bool { return a.opts.CPUMode == CPUModeHostUsage }
+func (a *Accountant) cpuGated() bool     { return a.cpuUsageMode() || a.opts.CPUOvercommit > 0 }
+
+// vcpuLimit is shared by admission and reported capacity.
 func (a *Accountant) vcpuLimit(cores int) int {
+	if a.cpuUsageMode() {
+		limit := a.opts.CPUUsageLimit
+		if limit == 0 {
+			limit = 0.8
+		}
+		return int(float64(cores) * limit)
+	}
 	return int(float64(cores) * a.opts.CPUOvercommit)
 }
 
@@ -758,7 +792,7 @@ func (a *Accountant) sweepLocked(snap *snapshot) {
 			continue
 		}
 		retired := r.vmid != 0 && snap.guestMem[r.vmid] >= r.shape.MemoryBytes
-		if a.isHostMode() {
+		if a.isHostMode() || a.cpuUsageMode() {
 			// In host mode the node's live available-memory reading absorbs a
 			// reservation's RAM only once its guest is actually powered on.
 			// A powered-off guest's configured RAM never reached that reading,
@@ -891,36 +925,46 @@ func (a *Accountant) fetch(ctx context.Context) (*snapshot, error) {
 	for node, totals := range snap.nodes {
 		totals.guestMem = guestSums[node].guestMem
 		totals.guestVCPU = guestSums[node].guestVCPU
-		if hostMode {
+		if hostMode || a.cpuUsageMode() {
 			// Admission plans against the node's live available RAM, which only the
 			// per-node status endpoint reports. A failed reading marks the node
 			// as missing so stateLocked fails closed rather than admit blind.
-			free, ok := a.nodeAvailableMemory(ctx, node)
+			st, err := a.nodeLiveStatus(ctx, node)
+			free, ok := st.availableMemory()
 			totals.memAvailable = free
-			totals.memMissing = !ok
+			totals.memMissing = err != nil || !ok
+			totals.cpuMissing = err != nil || st.CPU == nil
+			if st.CPU != nil {
+				totals.cpuUsage = *st.CPU
+				totals.cpuMissing = totals.cpuMissing || math.IsNaN(*st.CPU) || math.IsInf(*st.CPU, 0) || *st.CPU < 0 || *st.CPU > 1
+			}
 		}
 		snap.nodes[node] = totals
 	}
 	return snap, nil
 }
 
-// nodeAvailableMemory reads usable host memory, including reclaimable cache, from
-// GET /nodes/{node}/status. Older Proxmox versions omit memory.available but
-// report memory.used excluding reclaimable cache, so total-used is equivalent.
-// Missing or inconsistent readings fail closed; explicit zero stays zero.
-func (a *Accountant) nodeAvailableMemory(ctx context.Context, node string) (uint64, bool) {
-	var st struct {
-		Memory struct {
-			Available *uint64 `json:"available"`
-			Used      *uint64 `json:"used"`
-			Total     uint64  `json:"total"`
-		} `json:"memory"`
+// nodeLiveStatus supplies both admission modes in one API round trip.
+type liveStatus struct {
+	CPU    *float64 `json:"cpu"`
+	Memory struct {
+		Available *uint64 `json:"available"`
+		Used      *uint64 `json:"used"`
+		Total     uint64  `json:"total"`
+	} `json:"memory"`
+}
+
+func (a *Accountant) nodeLiveStatus(ctx context.Context, node string) (liveStatus, error) {
+	var st liveStatus
+	err := a.cli.Get(ctx, "/nodes/"+node+"/status", &st)
+	if err != nil {
+		a.log.Warn("nodecap: node status read failed; node will fail closed this refresh", "node", node, "err", err)
 	}
-	if err := a.cli.Get(ctx, "/nodes/"+node+"/status", &st); err != nil {
-		a.log.Warn("nodecap: node status read failed; node will fail closed this refresh",
-			"node", node, "err", err)
-		return 0, false
-	}
+	return st, err
+}
+
+// Older APIs omit available but report used excluding reclaimable cache.
+func (st liveStatus) availableMemory() (uint64, bool) {
 	if st.Memory.Total == 0 {
 		return 0, false
 	}
