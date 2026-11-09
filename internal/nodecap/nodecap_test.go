@@ -182,6 +182,11 @@ func newAccountant(t *testing.T, rs *resourceServer, mutate func(*Options)) *Acc
 	}
 	a, err := New(cli, opts)
 	require.NoError(t, err)
+	// The tiny cache TTL drives refresh tests, not wall-clock freshness.
+	// Parallel/race instrumentation may pause a test beyond twice that TTL.
+	// Staleness tests explicitly advance this injected clock themselves.
+	fixedNow := time.Now()
+	a.now = func() time.Time { return fixedNow }
 	return a
 }
 
