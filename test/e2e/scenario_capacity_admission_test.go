@@ -284,3 +284,51 @@ func TestE2E_CapacityAdmission_DisabledKeepsLegacyBehaviour(t *testing.T) {
 	require.Zero(t, h.MetricValue(t, "scaleset_node_memory_total_bytes", formatLabel("node", "pve1")),
 		"the node gauges stay unpublished when no accountant is wired")
 }
+
+// TestE2E_CapacityAdmission_HostAvailablePlansAgainstFreeMemory is the
+// host_available analogue of the allocated-mode fill: admission is driven
+// by the node's LIVE free RAM (the per-node /status reading), which a
+// running foreign guest tightens on its own. The pool fills that free pool
+// down to the host reserve and stops, deferring the rest.
+func TestE2E_CapacityAdmission_HostAvailablePlansAgainstFreeMemory(t *testing.T) {
+	t.Parallel()
+	fp := fakeproxmox.New(t, fakeproxmox.Options{TaskDuration: 5 * time.Millisecond})
+	// 32 GiB node; a running foreign 8 GiB guest takes real host RAM, so
+	// live free starts at 24 GiB. 4 GiB host reserve => 20 GiB admissible,
+	// which is five mem-4g VMs — one short of the six the pool wants.
+	fp.SetNodeCapacity("pve1", 32*gib, 16)
+	fp.SeedVM("pve1", 500, "someone-elses-database", true, nil)
+	require.NoError(t, fp.SetVMConfig(500, "memory", 8*1024))
+
+	h := Start(t, Options{
+		FakeProxmox:          fp,
+		HotSize:              0,
+		MaxConcurrentRunners: 8,
+		Profiles: []ProfileSpec{
+			{Name: "mem-4g", CPUCores: 2, MemoryMB: 4096, WarmSize: 6},
+		},
+		Capacity: &CapacitySpec{
+			ReserveMemoryMB: 4096,
+			MemoryMode:      "host_available",
+		},
+	})
+
+	require.Eventually(t, func() bool {
+		_, mb := ownedAllocationMB(t, h)
+		return mb >= 20*1024
+	}, 20*time.Second, 200*time.Millisecond,
+		"the pool should fill the 20 GiB of live free RAM down to the reserve")
+	time.Sleep(2 * time.Second)
+
+	count, allocatedMB := ownedAllocationMB(t, h)
+	require.Equal(t, 20*1024, allocatedMB,
+		"host_available must stop at live free minus the reserve (20 GiB); saw %d MiB across %d VMs",
+		allocatedMB, count)
+	require.Equal(t, 5, count, "20 GiB of live free / 4 GiB = 5 VMs, not the 6 the pool wants")
+
+	// The sixth VM the pool wanted could not be admitted against the live
+	// free pool, so the wait is visible rather than silent.
+	require.Positive(t,
+		h.MetricValue(t, "scaleset_clone_deferred_capacity_total"),
+		"the clone that exceeds the live free pool must be counted")
+}

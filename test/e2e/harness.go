@@ -162,6 +162,12 @@ type CapacitySpec struct {
 	ReserveMemoryMB    int
 	CPUOvercommitRatio float64
 	EvictIdleForDemand bool
+	// MemoryMode is pool.capacity.memory_mode. Empty omits the key, so the
+	// accountant runs the historical allocated-memory policy.
+	MemoryMode string
+	// MemoryOvercommit is pool.capacity.memory_overcommit; only read in
+	// host_available mode. Zero omits the effective override (full RAM).
+	MemoryOvercommit float64
 }
 
 // RaftCluster manages the in-process raft transport network shared
@@ -657,6 +663,10 @@ pool:
     reserve_memory_mb: {{.Capacity.ReserveMemoryMB}}
     cpu_overcommit_ratio: {{.Capacity.CPUOvercommitRatio}}
     evict_idle_for_demand: {{.Capacity.EvictIdleForDemand}}
+    memory_overcommit: {{.Capacity.MemoryOvercommit}}
+{{- if .Capacity.MemoryMode }}
+    memory_mode: {{.Capacity.MemoryMode}}
+{{- end }}
 {{- end }}
 {{- if .Profiles }}
 profiles:

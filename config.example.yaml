@@ -235,6 +235,13 @@ pool:
   # while owning its full 16 GiB, so usage is the wrong number to plan
   # against.
   #
+  # memory_mode switches what "allocated" means. The default (allocated)
+  # plans against the guest CONFIGURED memory described above. Set it to
+  # host_available to plan against the node's LIVE free RAM from its
+  # /status endpoint — the real number, which already reflects host
+  # overhead and the gaps that appear while guests boot. See memory_mode
+  # below.
+  #
   # Powered-off foreign guests are ignored — they hold no host memory,
   # and counting them would refuse clones over capacity that physically
   # exists. This orchestrator's own VMs always count (the warm tier is
@@ -275,6 +282,20 @@ pool:
   #   # (physical cores x ratio). 0 (default) means vCPUs are never a
   #   # reason to refuse a clone.
   #   cpu_overcommit_ratio: 0
+  #   # How memory is measured. allocated (default) plans against the node's
+  #   # physical RAM minus the reserve minus the configured memory of every
+  #   # running guest. host_available plans against the node's LIVE free RAM
+  #   # from its /status endpoint, so host overhead and boot-time gaps are
+  #   # counted for real. host_available fails closed: a node whose free-RAM
+  #   # reading is missing or stale pauses provisioning instead of admitting
+  #   # blind, because memory is the one resource you cannot overcommit.
+  #   memory_mode: allocated
+  #   # host_available only: the fraction of a guest's requested RAM charged
+  #   # against the node's free pool. 1.0 (default) admits a guest only when
+  #   # its full RAM fits in the free pool; a value below 1.0 oversubscribes
+  #   # the host (0.7 admits a 4 GiB guest against 2.8 GiB of free). 0 means
+  #   # 1.0. Ignored in allocated mode.
+  #   memory_overcommit: 1.0
   #   # Let a queued job reclaim capacity from an idle pool VM. When a
   #   # job's clone cannot be placed anywhere and the node is full of
   #   # idle hot/warm VMs, the oldest idle one (warm before hot) is
