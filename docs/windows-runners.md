@@ -137,3 +137,31 @@ same node. Candidate selection currently happens after node admission; a
 candidate on another node fails closed and is cleaned up. Named source snapshot
 selection is deferred: prepared stopped templates already supply the supported
 linked-clone baseline without introducing a second source-state lifecycle.
+
+
+### Failed startup and cleanup
+
+New disposable clones explicitly clear inherited Proxmox deletion protection;
+the source template stays protected. The controller waits for Proxmox's
+asynchronous configuration task (tags and hardware included) before booting.
+If any VM in a profile is draining, destroying or poisoned, new cloning pauses
+until cleanup completes. This prevents a persistent startup failure and failed
+cleanup from accumulating replacement VMs.
+
+A JIT temporary-write failure occurs before the runner receives its config.
+Verify template preparation from an elevated PowerShell console on one clone:
+
+```powershell
+Test-Path 'C:\ProgramData\ActionsRunnerScaleSet'
+Get-ScheduledTask -TaskName ActionsRunnerScaleSetWatcher -ErrorAction SilentlyContinue |
+    Select-Object TaskName, State, Actions
+Test-Path 'C:\actions-runner\run.cmd'
+Get-Service -Name QEMU-GA -ErrorAction SilentlyContinue | Select-Object Name, Status
+```
+
+The directory, watcher task and runner must exist, and the QEMU guest agent must
+be running. Missing components require one-time template preparation above;
+increasing boot timeouts does not install them. Do not relaunch the whole fleet
+to diagnose a template problem. Inspect one clone while the controller is stopped.
+Already-created protected clones are not automatically unprotected by this fix;
+review their identities before separately approving cleanup.

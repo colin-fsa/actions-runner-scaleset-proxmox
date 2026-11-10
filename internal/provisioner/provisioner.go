@@ -623,8 +623,14 @@ func (p *pmox) Clone(ctx context.Context, opts CloneOptions) (*VM, error) {
 		configOpts = append(configOpts,
 			nicFirewallPatches(newVM.VirtualMachineConfig, len(opts.NICs))...)
 	}
-	if _, err := newVM.Config(ctx, configOpts...); err != nil {
+	configTask, err := newVM.Config(ctx, configOpts...)
+	if err != nil {
 		return nil, fmt.Errorf("set owner tags / overrides: %w", err)
+	}
+	// POST /config is asynchronous. Do not start or publish a clone until
+	// tags, protection and hardware overrides have actually landed.
+	if err := awaitTask(ctx, configTask, 120); err != nil {
+		return nil, fmt.Errorf("await owner tags / overrides: %w", err)
 	}
 
 	// Disk resize is a distinct API endpoint (not Config). Apply after
@@ -798,6 +804,9 @@ func buildCloneConfig(scaleSetName string, opts CloneOptions, firewallOn bool) (
 	}
 	configOpts := []proxmox.VirtualMachineOption{
 		{Name: "tags", Value: tags.Encode(initial)},
+		// The source template may be protected; its disposable children must
+		// remain deletable. This changes only the newly cloned VM.
+		{Name: "protection", Value: 0},
 	}
 	if opts.CPUCores > 0 {
 		configOpts = append(configOpts, proxmox.VirtualMachineOption{Name: "cores", Value: opts.CPUCores})

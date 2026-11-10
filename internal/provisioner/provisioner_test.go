@@ -1264,6 +1264,7 @@ func TestBuildCloneConfig_TagsAlwaysPresent(t *testing.T) {
 	require.NotEmpty(t, got)
 	require.Equal(t, "tags", got[0].Name, "tags must be first so it always lands")
 	require.NotEmpty(t, got[0].Value)
+	require.Contains(t, got, proxmox.VirtualMachineOption{Name: "protection", Value: 0}, "disposable clones must not inherit template deletion protection")
 }
 
 // TestBuildCloneConfig_HardwareOverridesEmitted: cores/memory only
@@ -1313,13 +1314,13 @@ func TestBuildCloneConfig_NICsAndIPConfigStamped(t *testing.T) {
 }
 
 // TestBuildCloneConfig_OmitsAbsentOverrides: a sparse CloneOptions
-// produces only the tags option. Prevents accidental emission of
+// produces only tags and the disposable-clone protection setting. Prevents accidental emission of
 // zero-valued cores/memory (which Proxmox would reject or default).
 func TestBuildCloneConfig_OmitsAbsentOverrides(t *testing.T) {
 	t.Parallel()
 	got, err := buildCloneConfig("test-scaleset", CloneOptions{NewVMID: 1, Profile: "default"}, false)
 	require.NoError(t, err)
-	require.Len(t, got, 1, "no overrides → only tags")
+	require.Len(t, got, 2, "no hardware overrides → tags and protection only")
 	require.Equal(t, "tags", got[0].Name)
 }
 

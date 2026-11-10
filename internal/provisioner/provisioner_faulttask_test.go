@@ -139,3 +139,13 @@ func TestNewUsesProfileTemplateWhenAllProfilesOverrideGlobal(t *testing.T) {
 	_, err = pm.SourceTemplateNode(ctx, 0)
 	require.ErrorIs(t, err, ErrTemplateNotFound)
 }
+
+func TestCloneConfigTaskFailurePreventsStart(t *testing.T) {
+	t.Parallel()
+	fp := fakeproxmox.New(t, fakeproxmox.Options{})
+	fp.InjectFault(fakeproxmox.Fault{Kind: fakeproxmox.FaultTaskFails, TaskType: "qmconfig"})
+	p := newFaultProvisioner(t, fp)
+	_, err := p.Clone(context.Background(), CloneOptions{NewVMID: 10042, Node: "pve1", Name: "x", PoweredOn: true})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "await owner tags / overrides")
+}

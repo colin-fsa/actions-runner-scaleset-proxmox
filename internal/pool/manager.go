@@ -1768,6 +1768,14 @@ type returningCredit struct {
 // clone is dispatched then — under-provisioning is bounded by one
 // reconcile pass, never permanent.
 func computeCloneNeeds(stats Stats, inflight, hotProv, warmProv, hotSize, warmSize, desired, profileMax int, credit returningCredit) (needHot, needWarm int) {
+	// Failed or completed VMs remain real resources until destruction succeeds.
+	// Do not replace them while cleanup is pending: an undeletable clone must
+	// apply backpressure instead of turning a persistent startup error into a
+	// fleet of leaked VMs. Existing usable VMs may still be assigned.
+	if stats.Draining+stats.Destroying+stats.Poison > 0 {
+		return 0, 0
+	}
+
 	base := stats.Available() + hotProv + inflight
 	busy := stats.Busy()
 

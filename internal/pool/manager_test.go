@@ -3942,3 +3942,14 @@ func TestAdoptStoppedWindowsDestroysUnverifiedDisk(t *testing.T) {
 	mgr.adoptOne(context.Background(), &provisioner.VM{VMID: 10001, Node: "pve1", Name: "runner", Profile: "win"}, nil)
 	require.Eventually(t, func() bool { fp.mu.Lock(); defer fp.mu.Unlock(); return len(fp.destroys) > 0 }, time.Second, time.Millisecond)
 }
+
+func TestComputeCloneNeedsBlocksWhileCleanupPending(t *testing.T) {
+	t.Parallel()
+	for _, stats := range []Stats{{Draining: 1}, {Destroying: 1}, {Poison: 1}, {Hot: 1, Draining: 1}} {
+		hot, warm := computeCloneNeeds(stats, 0, 0, 0, 2, 2, 2, 4, returningCredit{})
+		require.Zero(t, hot, "cleanup failures must not create replacement storms")
+		require.Zero(t, warm, "warm refill must also wait for cleanup")
+	}
+	hot, _ := computeCloneNeeds(Stats{}, 0, 0, 0, 0, 0, 2, 2, returningCredit{})
+	require.Equal(t, 2, hot, "demand resumes once cleanup actually completes")
+}
