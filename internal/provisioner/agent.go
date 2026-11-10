@@ -178,7 +178,7 @@ func (p *pmox) injectWindowsJIT(ctx context.Context, vm *VM, path, jit string) e
 		if isGuestAgentNotReady(err) {
 			return fmt.Errorf("%w: windows jit temporary write failed", ErrGuestAgentNotReady)
 		}
-		return fmt.Errorf("windows jit temporary write failed")
+		return windowsJITWriteError(err)
 	}
 	// Paths are validated at configuration load. Escape quotes as defense in depth.
 	quote := func(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
@@ -382,4 +382,20 @@ func (p *pmox) agentFileWrite(ctx context.Context, node string, vmid int, path s
 	}
 	p.log.Debug("agent file-write ok", "vmid", vmid, "node", node, "path", path, "bytes", len(content))
 	return nil
+}
+
+// windowsJITWriteError emits only fixed diagnoses, never a server response
+// that might echo the JIT payload. A permanent setup error must be actionable.
+func windowsJITWriteError(err error) error {
+	message := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(message, "no such file"), strings.Contains(message, "cannot find"), strings.Contains(message, "path not found"), strings.Contains(message, "file not found"):
+		return fmt.Errorf("windows jit temporary write failed: handoff directory is unavailable; prepare the template with scripts/windows/Install-JitRunnerWatcher.ps1")
+	case strings.Contains(message, "access is denied"), strings.Contains(message, "permission denied"):
+		return fmt.Errorf("windows jit temporary write failed: guest-agent access denied; check the handoff directory ACL and guest-agent service account")
+	case strings.Contains(message, "disabled"), strings.Contains(message, "not supported"), strings.Contains(message, "unsupported"):
+		return fmt.Errorf("windows jit temporary write failed: guest-agent file operations are disabled or unsupported")
+	default:
+		return fmt.Errorf("windows jit temporary write failed: guest-agent/API rejected the request; response suppressed to protect JIT credentials")
+	}
 }

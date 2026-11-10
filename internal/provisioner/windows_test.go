@@ -3,6 +3,7 @@ package provisioner
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -81,4 +82,17 @@ func TestWindowsJITWriteErrorDoesNotExposePayload(t *testing.T) {
 	err := p.InjectJITConfig(t.Context(), &VM{VMID: 7, Node: "pve1", Profile: "win"}, jit)
 	require.Error(t, err)
 	require.NotContains(t, err.Error(), jit)
+}
+
+func TestWindowsJITWriteDiagnosticsAreRedacted(t *testing.T) {
+	for _, tc := range []struct{ cause, hint string }{
+		{"No such file or directory", "prepare the template"},
+		{"Access is denied", "ACL"},
+		{"command is disabled", "disabled or unsupported"},
+		{"unexpected error", "response suppressed"},
+	} {
+		err := windowsJITWriteError(fmt.Errorf("%s: secret-jit-payload", tc.cause))
+		require.Contains(t, err.Error(), tc.hint)
+		require.NotContains(t, err.Error(), "secret-jit-payload")
+	}
 }
