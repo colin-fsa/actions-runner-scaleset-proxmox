@@ -27,8 +27,10 @@ advertise its labels. See [the complete mixed example](../examples/windows-linux
 4. The installer creates a boot-triggered scheduled task running as Local
    System. This is Session 0: jobs must work unattended and cannot rely on an
    interactive desktop, an RDP user's profile, mapped drives, or GUI prompts.
-   Test permissions and tools under that account; use a separately designed
-   interactive setup for workloads that require a visible desktop.
+   Test permissions and tools under that account. For workloads that require a
+   visible desktop, install with `-InteractiveUser` (a local Administrator with
+   automatic logon configured on the image) to run the runner in that user's
+   interactive session instead; see the scripts README.
 5. Shut down the clean VM and convert it to a Proxmox template. Keep the
    template unchanged while linked clones depend on it; build a new template
    for updates and retire the old one only after its clones are gone.
@@ -108,7 +110,7 @@ Proxmox version, storage, template IDs, guest versions, VMIDs and timestamps.
 1. Verify both scale sets register with the intended labels and only intended
    repositories can use them. Submit one harmless job for each OS and verify
    OS identity, guest-agent readiness, successful completion and VM shutdown.
-2. For Windows, verify the scheduled task runs as SYSTEM and the runner accepts
+2. For Windows, verify the scheduled task runs as SYSTEM (or the configured `-InteractiveUser`) and the runner accepts
    exactly one job. Confirm the baseline has no registration or JIT state;
    avoid exposing the JIT file or credentials in logs and artifacts.
 3. Inspect clone, snapshot and rollback tasks and controller logs/metrics. Run

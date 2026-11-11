@@ -2,6 +2,9 @@
 param(
     [string] $RunnerDirectory = 'C:\actions-runner',
     [string] $JitPath = 'C:\ProgramData\ActionsRunnerScaleSet\jitconfig',
+    # Optional. Run the watcher (and so the runner) in this local Administrator's interactive
+    # desktop session instead of as SYSTEM in Session 0. Requires automatic logon on the image.
+    [string] $InteractiveUser,
     # Only use after deregistering the old runner in GitHub using a removal token.
     [switch] $RemoveExistingRegistration
 )
@@ -15,6 +18,14 @@ $taskName = 'ActionsRunnerScaleSetWatcher'
 if ($runnerDir -notmatch '^[A-Za-z]:\\[A-Za-z0-9_. -]+(?:\\[A-Za-z0-9_. -]+)*$') { throw 'RunnerDirectory must be an absolute Windows path with safe characters.' }
 if ($JitPath -notmatch '^[A-Za-z]:\\[A-Za-z0-9_. -]+(?:\\[A-Za-z0-9_. -]+)*$' -or -not [string]::Equals((Split-Path -Parent $JitPath), $stateDir, [StringComparison]::OrdinalIgnoreCase)) { throw 'JitPath must be a file in C:\ProgramData\ActionsRunnerScaleSet; other locations require a custom watcher.' }
 if ((Split-Path -Leaf $JitPath) -in @('started', 'Watch-JitRunner.ps1', 'Test-JitConfig.ps1')) { throw 'JitPath conflicts with watcher state files.' }
+if ($InteractiveUser) {
+    if ($InteractiveUser -notmatch '^(?:[A-Za-z0-9_.-]+\\)?[A-Za-z0-9_. -]+$') { throw 'InteractiveUser must be a user name or DOMAIN\user with safe characters.' }
+    $lookup = if ($InteractiveUser.StartsWith('.\')) { "$env:COMPUTERNAME\$($InteractiveUser.Substring(2))" } else { $InteractiveUser }
+    try { $userSid = (New-Object System.Security.Principal.NTAccount($lookup)).Translate([System.Security.Principal.SecurityIdentifier]) } catch { throw "InteractiveUser '$InteractiveUser' was not found." }
+    # The state directory ACL admits only SYSTEM and Administrators, and the task runs elevated.
+    $adminGroup = Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction SilentlyContinue | Where-Object { $_.SID -eq $userSid }
+    if (-not $adminGroup) { throw "InteractiveUser '$InteractiveUser' must be a member of the local Administrators group." }
+}
 if (-not (Test-Path -LiteralPath (Join-Path $runnerDir 'run.cmd') -PathType Leaf)) { throw 'Install the GitHub Actions runner in RunnerDirectory first.' }
 # A conventional runner service can race the JIT runner. Never remove it implicitly.
 $services = @(Get-CimInstance Win32_Service | Where-Object { $_.PathName -and $_.PathName.IndexOf($runnerDir, [StringComparison]::OrdinalIgnoreCase) -ge 0 })
@@ -46,8 +57,14 @@ $watcher = Join-Path $stateDir 'Watch-JitRunner.ps1'
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'Watch-JitRunner.ps1') -Destination $watcher -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'Test-JitConfig.ps1') -Destination (Join-Path $stateDir 'Test-JitConfig.ps1') -Force
 $action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$watcher`" -RunnerDirectory `"$runnerDir`" -JitPath `"$JitPath`""
-$trigger = New-ScheduledTaskTrigger -AtStartup
 $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero)
-$taskPrincipal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+if ($InteractiveUser) {
+    # Starts when the account logs on (configure automatic logon on the image), in its desktop session.
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $InteractiveUser
+    $taskPrincipal = New-ScheduledTaskPrincipal -UserId $InteractiveUser -LogonType Interactive -RunLevel Highest
+} else {
+    $trigger = New-ScheduledTaskTrigger -AtStartup
+    $taskPrincipal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+}
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $taskPrincipal -Force | Out-Null
-Write-Host 'Installed boot watcher. Shut down the clean golden image before converting it to a template.'
+Write-Host 'Installed $(if ($InteractiveUser) { "logon watcher for $InteractiveUser (interactive session; ensure automatic logon is configured)" } else { 'boot watcher' }). Shut down the clean golden image before converting it to a template.'
