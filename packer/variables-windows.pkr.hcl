@@ -1,102 +1,48 @@
-# Variables for the Windows runner template build. Provide values via
-# `variables.auto.pkrvars.hcl` (gitignored) or -var/-var-file; see the .example.
-
-# ---------- Proxmox connection ----------
-
-variable "proxmox_url" {
-  type        = string
-  description = "Proxmox VE API endpoint, e.g. https://pve.example.com:8006/api2/json"
-}
-
-variable "proxmox_username" {
-  type        = string
-  description = "API token ID, e.g. packer@pve!automation"
-}
-
-variable "proxmox_token" {
-  type        = string
-  description = "API token secret. Prefer PKR_VAR_proxmox_token."
-  sensitive   = true
-}
-
-variable "proxmox_insecure_skip_tls_verify" {
-  type    = bool
-  default = false
-}
-
-variable "proxmox_node" {
-  type        = string
-  description = "Proxmox node to run the build on."
-}
+# Variables for the Windows runner template build (proxmox-windows.pkr.hcl).
+#
+# Connection, storage, network and runner_version settings are shared with the
+# Ubuntu build; see variables.pkr.hcl. Only Windows-specific values live here.
 
 # ---------- Template VM ----------
 
-variable "template_vm_id" {
+variable "windows_template_vm_id" {
   type        = number
   default     = 9100
   description = "VMID the resulting template gets. Must NOT overlap the orchestrator's vmid_range."
 }
 
-variable "template_name" {
+variable "windows_template_name" {
   type    = string
   default = "windows-runner-template"
 }
 
-variable "vm_cores" {
+variable "windows_vm_cores" {
   type    = number
   default = 4
 }
 
-variable "vm_memory_mb" {
+variable "windows_vm_memory_mb" {
   type    = number
   default = 8192
 }
 
-variable "vm_disk_size_gb" {
+variable "windows_vm_disk_size_gb" {
   type    = number
   default = 80
-}
-
-variable "enable_tpm" {
-  type        = bool
-  default     = true
-  description = "Attach a virtual TPM 2.0 (stored in storage_pool). Required by Windows 11."
-}
-
-# ---------- Storage / network ----------
-
-variable "storage_pool" {
-  type        = string
-  description = "Proxmox storage pool for the OS disk and EFI disk (e.g. local-lvm)."
-}
-
-variable "iso_storage_pool" {
-  type        = string
-  description = "Storage pool that holds (or will hold) the Windows and VirtIO ISOs."
-}
-
-variable "network_bridge" {
-  type    = string
-  default = "vmbr0"
-}
-
-variable "network_vlan_tag" {
-  type    = number
-  default = 0
 }
 
 # ---------- ISOs ----------
 
 variable "windows_iso_url" {
   type        = string
-  default     = ""
-  description = "HTTPS URL of a Windows ISO that the Proxmox host downloads. Set this OR windows_iso_file. Microsoft's Windows 11 ISO links are generated on the download page and expire after about 24 hours, so a fresh link works for an immediate build; for repeat builds upload the ISO and use windows_iso_file."
+  default     = "https://software-static.download.prss.microsoft.com/sg/download/888969d5-f34g-4e03-ac9d-1f9786c66749/SERVER_EVAL_x64FRE_en-us.iso"
+  description = "HTTPS URL of the Windows Server ISO that the Proxmox host downloads. Defaults to Microsoft's freely downloadable Server 2022 evaluation ISO (180-day evaluation; no login). The URL must end in a filename with an .iso extension (Proxmox requires one), so the go.microsoft.com redirect link does not work; if Microsoft rotates this direct link, resolve the current one from https://www.microsoft.com/evalcenter or upload the ISO and use windows_iso_file. For a licensed ISO, upload it and set windows_iso_file instead, which takes precedence."
 }
 
 variable "windows_iso_file" {
   type        = string
   default     = ""
-  description = "Proxmox storage path of an already-uploaded Windows ISO, e.g. 'local:iso/Win11_x64.iso'. Set this OR windows_iso_url."
+  description = "Proxmox storage path of an already-uploaded Windows Server ISO, e.g. 'local:iso/windows-server-2022.iso'. When set, windows_iso_url is ignored."
 }
 
 variable "windows_iso_checksum" {
@@ -107,14 +53,14 @@ variable "windows_iso_checksum" {
 
 variable "windows_image_name" {
   type        = string
-  default     = "Windows 11 Pro"
-  description = "Edition to install, exactly as named inside the ISO's install.wim. Windows 11 Pro is the supported target; interactive sessions need a Desktop Experience edition."
+  default     = "Windows Server 2022 SERVERSTANDARD"
+  description = "Edition to install, exactly as named inside the ISO's install.wim. '... SERVERSTANDARD' is Desktop Experience (required for interactive sessions); '... SERVERSTANDARDCORE' is Server Core."
 }
 
 variable "windows_driver_folder" {
   type        = string
-  default     = "w11"
-  description = "Folder under the VirtIO ISO's drivers (viostor, vioscsi, ...) matching your Windows version: w11, w10, 2k25, 2k22, 2k19."
+  default     = "2k22"
+  description = "Folder under the VirtIO ISO's drivers (viostor, vioscsi, ...) matching your Windows version (2k22 for Server 2022, 2k25 for Server 2025)."
 }
 
 variable "virtio_iso_url" {
@@ -135,12 +81,6 @@ variable "virtio_iso_checksum" {
   description = "Checksum ('sha256:...') of the virtio-win ISO, or 'none'. The 'stable' ISO changes over time, so none is pinned."
 }
 
-variable "iso_download_pve" {
-  type        = bool
-  default     = true
-  description = "Have the Proxmox host download ISOs from the URLs directly instead of routing multi-GB files through the machine running Packer."
-}
-
 variable "windows_product_key" {
   type        = string
   default     = ""
@@ -153,12 +93,17 @@ variable "windows_product_key" {
 # Used only while Packer provisions over WinRM. finalize.ps1 disables the
 # account, WinRM and its firewall rule before the template is finalized.
 
-variable "build_username" {
+# ---------- Build-time account ----------
+#
+# Used only while Packer provisions over WinRM; finalize.ps1 disables the account, WinRM
+# and its firewall rule before the template is finalized.
+
+variable "windows_build_username" {
   type    = string
   default = "packer"
 }
 
-variable "build_password" {
+variable "windows_build_password" {
   type      = string
   default   = "Packer-Build-1!"
   sensitive = true
@@ -166,21 +111,12 @@ variable "build_password" {
 
 # ---------- Runner ----------
 
-variable "runner_version" {
-  type        = string
-  default     = "2.334.0"
-  description = "GitHub Actions runner release. See https://github.com/actions/runner/releases."
-}
+# ---------- Runner ----------
 
 variable "runner_sha256" {
   type        = string
   default     = ""
   description = "SHA-256 of actions-runner-win-x64-<version>.zip (published in the release notes). Strongly recommended; empty skips verification."
-}
-
-variable "runner_directory" {
-  type    = string
-  default = "C:\\actions-runner"
 }
 
 # ---------- Interactive session (optional) ----------
