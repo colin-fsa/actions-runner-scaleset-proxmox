@@ -81,15 +81,22 @@ variable "network_vlan_tag" {
 
 # ---------- ISOs ----------
 
+variable "windows_iso_url" {
+  type        = string
+  default     = ""
+  description = "HTTPS URL of a Windows Server ISO that the Proxmox host downloads. Set this OR windows_iso_file. The Server 2022 evaluation ISO is freely downloadable (see the .example file); licensed ISOs usually need a Microsoft account, so upload those and use windows_iso_file."
+}
+
 variable "windows_iso_file" {
   type        = string
-  description = "Proxmox storage path of an uploaded Windows Server ISO, e.g. 'local:iso/windows-server-2022.iso'. Microsoft ISOs are not downloadable anonymously, so upload it first."
+  default     = ""
+  description = "Proxmox storage path of an already-uploaded Windows Server ISO, e.g. 'local:iso/windows-server-2022.iso'. Set this OR windows_iso_url."
 }
 
 variable "windows_iso_checksum" {
   type        = string
   default     = "none"
-  description = "Checksum of the Windows ISO ('sha256:...'), or 'none' to skip (the ISO is already on Proxmox)."
+  description = "Checksum ('sha256:...') of the Windows ISO. Microsoft republishes evaluation ISOs, so no value is pinned here; set one for reproducible builds, or leave 'none'."
 }
 
 variable "windows_image_name" {
@@ -104,9 +111,28 @@ variable "windows_driver_folder" {
   description = "Folder under the VirtIO ISO's drivers (viostor, vioscsi, ...) matching your Windows version: 2k19, 2k22, 2k25, w10, w11."
 }
 
+variable "virtio_iso_url" {
+  type        = string
+  default     = "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso"
+  description = "URL of the virtio-win ISO that the Proxmox host downloads. Set to \"\" and use virtio_iso_file to use one you already have."
+}
+
 variable "virtio_iso_file" {
   type        = string
-  description = "Proxmox storage path of the virtio-win ISO, e.g. 'local:iso/virtio-win.iso'. Download from https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/."
+  default     = ""
+  description = "Proxmox storage path of an already-uploaded virtio-win ISO, e.g. 'local:iso/virtio-win.iso'. Overrides virtio_iso_url when set."
+}
+
+variable "virtio_iso_checksum" {
+  type        = string
+  default     = "none"
+  description = "Checksum ('sha256:...') of the virtio-win ISO, or 'none'. The 'stable' ISO changes over time, so none is pinned."
+}
+
+variable "iso_download_pve" {
+  type        = bool
+  default     = true
+  description = "Have the Proxmox host download ISOs from the URLs directly instead of routing multi-GB files through the machine running Packer."
 }
 
 variable "windows_product_key" {
