@@ -16,7 +16,8 @@ foreach ($d in $dirs.PSObject.Properties) {
     $work = Join-Path $env:TEMP ('extra-' + [guid]::NewGuid())
     New-Item -ItemType Directory -Path $work | Out-Null
     $archive = Join-Path $work 'archive'
-    Invoke-WebRequest -UseBasicParsing -Uri $d.Value -Headers $headers -OutFile $archive
+    if (Test-Path -LiteralPath $d.Value -PathType Leaf) { $archive = $d.Value }   # local file (e.g. from an attached ISO)
+    else { Invoke-WebRequest -UseBasicParsing -Uri $d.Value -Headers $headers -OutFile $archive }
     $out = Join-Path $work 'out'
     New-Item -ItemType Directory -Path $out | Out-Null
     & tar.exe -xf $archive -C $out   # bsdtar: handles zip/tar.gz and archives over 2 GB
