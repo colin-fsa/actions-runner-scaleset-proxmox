@@ -24,4 +24,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $bin 'dockerd.exe'))) { throw 'docke
 & (Join-Path $bin 'dockerd.exe') --register-service
 if ($LASTEXITCODE -ne 0) { throw 'dockerd --register-service failed.' }
 Set-Service docker -StartupType Automatic
+# dockerd needs the Host Network Service (HNS) up at boot; without the dependency it can start first and exit.
+sc.exe config docker depend= hns | Out-Null
+sc.exe failure docker reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
 Write-Host "Installed Docker Engine $Version; reboot to activate the Containers feature."
