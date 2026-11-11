@@ -126,3 +126,18 @@ variable "interactive_password" {
   sensitive   = true
   description = "Password for interactive_user. Stored in plaintext in the Winlogon registry key of the template (required by Windows auto-logon): use a dedicated account."
 }
+
+# ---------- Extra directories ----------
+
+variable "windows_extra_dirs" {
+  type        = map(string)
+  default     = {}
+  description = "Archives baked into the image: guest destination path => archive URL (zip or tar), e.g. { \"C:\\\\DelphiCI\" = \"https://api.github.com/repos/org/repo/zipball/ref\" }. A single top-level folder in the archive is flattened into the destination."
+}
+
+variable "windows_extra_dirs_token" {
+  type        = string
+  default     = ""
+  sensitive   = true
+  description = "Bearer token sent when downloading windows_extra_dirs (e.g. a GitHub token for private repositories). Only used during the build."
+}

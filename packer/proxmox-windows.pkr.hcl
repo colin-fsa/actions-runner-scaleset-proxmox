@@ -145,6 +145,7 @@ build {
       "../scripts/windows/Test-JitConfig.ps1",
       "../scripts/windows/Initialize-InteractiveRunner.ps1",
       "windows/install-runner.ps1",
+      "windows/install-extra-dirs.ps1",
       "windows/finalize.ps1",
     ]
     destination = "C:\\Windows\\Temp\\scaleset\\"
@@ -154,6 +155,15 @@ build {
     inline = [
       "& C:\\Windows\\Temp\\scaleset\\install-runner.ps1 -RunnerVersion '${var.runner_version}' -RunnerSha256 '${var.runner_sha256}'",
     ]
+  }
+
+  # Optional toolchains baked into the image (var.windows_extra_dirs).
+  provisioner "powershell" {
+    environment_vars = [
+      "EXTRA_DIRS_JSON=${jsonencode(var.windows_extra_dirs)}",
+      "EXTRA_DIRS_TOKEN=${var.windows_extra_dirs_token}",
+    ]
+    inline = ["if ($env:EXTRA_DIRS_JSON -ne '{}') { & C:\\Windows\\Temp\\scaleset\\install-extra-dirs.ps1 }"]
   }
 
   # Fully patch Windows first (the Linux build does apt upgrade). The plugin reboots and
