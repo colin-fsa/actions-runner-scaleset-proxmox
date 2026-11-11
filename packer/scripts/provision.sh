@@ -86,6 +86,16 @@ ${RUNNER_USER} ALL=(ALL) NOPASSWD: ALL
 EOF
 
 # -----------------------------------------------------------------------------
+# Docker (Ubuntu's docker.io, no third-party repo). Membership of the docker
+# group is root-equivalent, which is acceptable here: the VM is single-use and
+# the runner already has passwordless sudo.
+# -----------------------------------------------------------------------------
+log "installing docker"
+apt-get install -y --no-install-recommends docker.io docker-buildx docker-compose-v2
+systemctl enable docker
+usermod -aG docker "${RUNNER_USER}"
+
+# -----------------------------------------------------------------------------
 # Shared cache (optional): a host directory attached to each clone as virtiofs
 # (qm set <vmid> --virtiofs0 <tag>; see packer/README.md). nofail keeps clones
 # booting if it is not attached. The pnpm store (pnpm-store-vm, world-writable: guest and LXC uids differ) lives on it; pnpm cannot
