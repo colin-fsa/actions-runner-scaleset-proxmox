@@ -1,0 +1,20 @@
+proxmox_url      = "https://pve.example.com:8006/api2/json"
+proxmox_username = "packer@pve!automation"
+# export PKR_VAR_proxmox_token='...'
+proxmox_node     = "pve1"
+
+template_vm_id   = 9100
+storage_pool     = "local-lvm"
+iso_storage_pool = "local"
+
+windows_iso_file   = "local:iso/windows-server-2022.iso"
+virtio_iso_file    = "local:iso/virtio-win.iso"
+windows_image_name = "Windows Server 2022 SERVERSTANDARD"
+
+runner_version = "2.334.0"
+# runner_sha256 = "..."
+
+# Optional: run jobs in an interactive desktop session instead of Session 0.
+# Needs a Desktop Experience image, e.g. "Windows Server 2022 SERVERSTANDARD" (not ...CORE).
+# interactive_user = "RunnerUI"
+# export PKR_VAR_interactive_password='...'

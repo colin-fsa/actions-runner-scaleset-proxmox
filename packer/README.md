@@ -1,5 +1,7 @@
 # Packer template: Ubuntu 26.04 LTS GitHub Actions runner
 
+> Looking for Windows? See [windows/](windows/README.md).
+
 Builds a Proxmox VM template that the [orchestrator](../README.md) clones into
 ephemeral GitHub Actions runners.
 

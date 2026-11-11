@@ -79,7 +79,7 @@ dropped listener callbacks, and sweeps Proxmox for orphaned VMs. See
 - **Proxmox VE**, single node or cluster, with an API token for the
   orchestrator.
 - **A VM template** with the Actions runner and `qemu-guest-agent` baked in.
-  [`packer/`](packer/) builds a Linux template; see [Windows setup](docs/windows-runners.md) for an existing Windows VM.
+  [`packer/`](packer/) builds a Linux template and [`packer/windows/`](packer/windows/) a Windows one; see [Windows setup](docs/windows-runners.md) for all options.
 - **A GitHub org or repo**, plus a PAT or GitHub App.
 
 ## Quick start
@@ -167,7 +167,7 @@ Full walkthrough, including GitHub App auth and verification steps:
 | --- | --- |
 | [Getting started](docs/getting-started.md) | End-to-end first run: template, tokens, config, verification, troubleshooting |
 | [Architecture](docs/architecture.md) | Job lifecycle, VM state machine, control loops, crash recovery, package map |
-| [Windows runners](docs/windows-runners.md) | Windows template preparation, mixed OS configuration, performance and validation |
+| [Windows runners](docs/windows-runners.md) | Windows templates (Packer, `prepare-windows-template`, manual), session modes, mixed OS configuration, validation |
 | [Configuration](docs/configuration.md) | Config blocks, env-var overrides, validation rules, GHES |
 | [Profiles and scaling](docs/profiles-and-scaling.md) | Hot/warm pools, profiles, where labels are matched, networking, schedules, canaries, quotas |
 | [Node placement](docs/node-placement.md) | Placement strategies and affinity rules on a PVE cluster |
