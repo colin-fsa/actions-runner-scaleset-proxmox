@@ -14,4 +14,4 @@ By default the watcher runs as SYSTEM in Session 0. For workloads that need a re
 - Configure automatic logon for that account on the golden image (for example Sysinternals Autologon or `netplwiz`) so the task starts on every clone boot. Without it the watcher never starts. The installer does not handle the password. Autologon stores credentials on the image; use a dedicated, low-privilege-network account with no reusable secrets.
 - Disable the lock screen/screensaver timeout and any first-run prompts for that account so the session stays usable.
 
-Default SYSTEM mode is unchanged. Re-run the installer with `-RemoveExistingRegistration` is not needed to switch modes; the task is re-registered with `-Force`.
+Default SYSTEM mode is unchanged. To switch modes, re-run the installer on a clean golden image; the task is re-registered with `-Force`.
