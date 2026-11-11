@@ -15,11 +15,6 @@ windows_iso_file   = "local:iso/Win11_x64.iso"
 windows_image_name = "Windows 11 Pro"
 windows_driver_folder = "w11"
 
-# Alternative: Windows Server 2022 evaluation ISO (180-day, stable link, no login).
-# windows_iso_url       = "https://go.microsoft.com/fwlink/p/?LinkID=2195280&clcid=0x409&culture=en-us&country=US"
-# windows_image_name    = "Windows Server 2022 SERVERSTANDARD"
-# windows_driver_folder = "2k22"
-
 # The virtio-win ISO is downloaded from Fedora by default; override with virtio_iso_file to reuse one.
 # virtio_iso_file = "local:iso/virtio-win.iso"
 

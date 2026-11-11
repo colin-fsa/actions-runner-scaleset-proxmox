@@ -60,7 +60,7 @@ variable "vm_disk_size_gb" {
 variable "enable_tpm" {
   type        = bool
   default     = true
-  description = "Attach a virtual TPM 2.0 (stored in storage_pool). Required by Windows 11; harmless for Server."
+  description = "Attach a virtual TPM 2.0 (stored in storage_pool). Required by Windows 11."
 }
 
 # ---------- Storage / network ----------
@@ -90,7 +90,7 @@ variable "network_vlan_tag" {
 variable "windows_iso_url" {
   type        = string
   default     = ""
-  description = "HTTPS URL of a Windows ISO that the Proxmox host downloads. Set this OR windows_iso_file. Microsoft's Windows 11 ISO links are generated on the download page and expire after about 24 hours, so a fresh link works for an immediate build; for repeat builds upload the ISO and use windows_iso_file. Server evaluation ISOs have a stable link (see the .example file)."
+  description = "HTTPS URL of a Windows ISO that the Proxmox host downloads. Set this OR windows_iso_file. Microsoft's Windows 11 ISO links are generated on the download page and expire after about 24 hours, so a fresh link works for an immediate build; for repeat builds upload the ISO and use windows_iso_file."
 }
 
 variable "windows_iso_file" {
@@ -108,7 +108,7 @@ variable "windows_iso_checksum" {
 variable "windows_image_name" {
   type        = string
   default     = "Windows 11 Pro"
-  description = "Edition to install, exactly as named inside the ISO's install.wim, e.g. 'Windows 11 Pro', or for Server 'Windows Server 2022 SERVERSTANDARD' (Desktop Experience) / '... SERVERSTANDARDCORE' (Server Core). Interactive sessions need a Desktop Experience edition."
+  description = "Edition to install, exactly as named inside the ISO's install.wim. Windows 11 Pro is the supported target; interactive sessions need a Desktop Experience edition."
 }
 
 variable "windows_driver_folder" {

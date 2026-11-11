@@ -1,7 +1,7 @@
-# Packer template: Windows GitHub Actions runner (Windows 11 Pro by default)
+# Packer template: Windows 11 Pro GitHub Actions runner
 
 Builds a Proxmox template for [Windows runners](../../docs/windows-runners.md): unattended
-Windows install (Windows 11 Pro by default; Windows Server also works) on UEFI with a virtual TPM and VirtIO, the QEMU guest agent, the Actions runner
+Windows 11 Pro install on UEFI with a virtual TPM and VirtIO, the QEMU guest agent, the Actions runner
 (unregistered) and the JIT watcher task from [`scripts/windows/`](../../scripts/windows/README.md).
 It reuses those same scripts, so a Packer-built template and a hand-prepared one behave identically.
 
@@ -27,19 +27,16 @@ Windows auto-logon requires it. Use a dedicated account with no reusable credent
    - upload an ISO to a Proxmox ISO store and set `windows_iso_file` (best for repeat builds), or
    - set `windows_iso_url`. Microsoft's Windows 11 download links are generated per request on the
      [download page](https://www.microsoft.com/software-download/windows11) and expire after about
-     24 hours, so this suits an immediate build. The Windows Server 2022 *evaluation* ISO has a stable,
-     login-free link (in the `.example` file) but is a 180-day evaluation.
+     24 hours, so this suits an immediate build.
    `iso_download_pve = false` routes URL downloads through the Packer host instead. Set
    `windows_iso_checksum`/`virtio_iso_checksum` for reproducible builds (none is pinned here).
 3. A Proxmox API token with the same permissions as the [Ubuntu build](../README.md).
 4. `windows_image_name` must match an image name inside the ISO's `install.wim`
-   (`Windows 11 Pro`; for Server, `... SERVERSTANDARD` is Desktop Experience and
-   `... SERVERSTANDARDCORE` is Server Core), and `windows_driver_folder` the VirtIO folder for your
-   Windows version (`w11`, `2k22`, `2k25`, ...).
+   (`Windows 11 Pro`), and `windows_driver_folder` the VirtIO folder for your Windows version (`w11`).
 5. Licensing: the template installs without a product key and runs unactivated. Activate with your own
    key or volume-activation setup (`windows_product_key` is only passed to Setup), and confirm that
-   your Windows license permits running it in VMs for CI. Windows client editions have different
-   virtualization terms from Windows Server.
+   your Windows license permits running it in VMs for CI. Windows client editions have their own
+   virtualization terms.
 
 ## Build
 
@@ -64,6 +61,8 @@ profile's `template_vmid` at it and set `guest_os: windows`.
    `Initialize-InteractiveRunner.ps1` first.
 4. `scripts/finalize.ps1` removes WinRM access and the build firewall rule, disables the build
    account, and fails the build if any JIT/`started` state exists. Packer then shuts down and templates the VM.
+   Before the runner is installed, three Windows Update + reboot rounds fully patch the guest
+   (community plugin `rgl/windows-update`, installed by `packer init`).
 
 ## Notes
 

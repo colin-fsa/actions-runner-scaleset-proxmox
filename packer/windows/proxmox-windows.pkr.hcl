@@ -1,4 +1,4 @@
-# Windows runner template (Windows 11 Pro by default; Windows Server also supported) for the orchestrator.
+# Windows 11 Pro runner template for the orchestrator.
 #
 # Produces a Proxmox template containing:
 #   - Windows installed unattended on UEFI with VirtIO storage/network.
@@ -21,6 +21,11 @@ packer {
       version = ">= 1.2.0"
       source  = "github.com/hashicorp/proxmox"
     }
+    # Community plugin: installs Windows Updates over WinRM and survives the reboots they need.
+    windows-update = {
+      version = ">= 0.16.0"
+      source  = "github.com/rgl/windows-update"
+    }
   }
 }
 
@@ -36,7 +41,7 @@ source "proxmox-iso" "windows_runner" {
   template_name        = var.template_name
   template_description = "Windows GitHub Actions runner (${var.interactive_user != "" ? "interactive" : "SYSTEM/Session 0"}). Built {{ timestamp }}."
 
-  os       = "win11" # Proxmox OS type for Windows 11 / Server 2022+ guests
+  os       = "win11" # Proxmox OS type for Windows 11 guests
   cpu_type = "host"
   cores    = var.vm_cores
   sockets  = 1
@@ -164,8 +169,46 @@ build {
     ]
   }
 
-  # Windows Update is deliberately not forced here: add a provisioner (for example the
-  # community windows-update plugin) if you want patches baked into the template.
+  # Fully patch Windows first (the Linux build does apt upgrade). Updates need several reboot
+  # rounds, so run update -> restart three times; later rounds are no-ops once current.
+  provisioner "windows-update" {
+    pause_before    = "30s"
+    search_criteria = "IsInstalled=0"
+    filters = [
+      "exclude:$_.Title -like '*Preview*'",
+      "include:$true",
+    ]
+    update_limit = 50
+  }
+  provisioner "windows-restart" {
+    restart_timeout = "30m"
+  }
+
+  provisioner "windows-update" {
+    pause_before    = "30s"
+    search_criteria = "IsInstalled=0"
+    filters = [
+      "exclude:$_.Title -like '*Preview*'",
+      "include:$true",
+    ]
+    update_limit = 50
+  }
+  provisioner "windows-restart" {
+    restart_timeout = "30m"
+  }
+
+  provisioner "windows-update" {
+    pause_before    = "30s"
+    search_criteria = "IsInstalled=0"
+    filters = [
+      "exclude:$_.Title -like '*Preview*'",
+      "include:$true",
+    ]
+    update_limit = 50
+  }
+  provisioner "windows-restart" {
+    restart_timeout = "30m"
+  }
 
   provisioner "powershell" {
     environment_vars = ["INTERACTIVE_PASSWORD=${var.interactive_password}"]
