@@ -146,6 +146,7 @@ build {
       "../scripts/windows/Initialize-InteractiveRunner.ps1",
       "windows/install-runner.ps1",
       "windows/install-extra-dirs.ps1",
+      "windows/install-docker.ps1",
       "windows/finalize.ps1",
     ]
     destination = "C:\\Windows\\Temp\\scaleset\\"
@@ -156,6 +157,13 @@ build {
       "& C:\\Windows\\Temp\\scaleset\\install-runner.ps1 -RunnerVersion '${var.runner_version}' -RunnerSha256 '${var.runner_sha256}'",
     ]
   }
+
+  # Docker Engine (Windows containers). The Containers feature needs the reboot; the update
+  # round below reboots again as needed, so this one is cheap insurance for the docker service.
+  provisioner "powershell" {
+    inline = ["& C:\\Windows\\Temp\\scaleset\\install-docker.ps1 -Version '${var.docker_version}'"]
+  }
+  provisioner "windows-restart" {}
 
   # Optional toolchains baked into the image (var.windows_extra_dirs).
   provisioner "powershell" {
