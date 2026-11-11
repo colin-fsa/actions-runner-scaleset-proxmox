@@ -67,4 +67,5 @@ if ($InteractiveUser) {
     $taskPrincipal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
 }
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $taskPrincipal -Force | Out-Null
-Write-Host 'Installed $(if ($InteractiveUser) { "logon watcher for $InteractiveUser (interactive session; ensure automatic logon is configured)" } else { 'boot watcher' }). Shut down the clean golden image before converting it to a template.'
+$mode = if ($InteractiveUser) { "logon watcher for $InteractiveUser (interactive session; ensure automatic logon is configured)" } else { 'boot watcher' }
+Write-Host "Installed $mode. Shut down the clean golden image before converting it to a template."
