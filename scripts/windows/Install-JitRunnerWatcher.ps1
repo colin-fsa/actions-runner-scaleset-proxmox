@@ -60,8 +60,9 @@ $action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\WindowsPowe
 $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero)
 if ($InteractiveUser) {
     # Starts when the account logs on (configure automatic logon on the image), in its desktop session.
-    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $InteractiveUser
-    $taskPrincipal = New-ScheduledTaskPrincipal -UserId $InteractiveUser -LogonType Interactive -RunLevel Highest
+    # Use the resolved COMPUTER\user name: Task Scheduler cannot resolve the ".\" prefix.
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $lookup
+    $taskPrincipal = New-ScheduledTaskPrincipal -UserId $lookup -LogonType Interactive -RunLevel Highest
 } else {
     $trigger = New-ScheduledTaskTrigger -AtStartup
     $taskPrincipal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
