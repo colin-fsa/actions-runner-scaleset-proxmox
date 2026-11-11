@@ -148,3 +148,11 @@ variable "windows_extra_dirs_token" {
   sensitive   = true
   description = "Bearer token sent when downloading windows_extra_dirs (e.g. a GitHub token for private repositories). Only used during the build."
 }
+
+# ---------- Docker ----------
+
+variable "docker_version" {
+  type        = string
+  default     = ""
+  description = "Docker Engine version to install in the Windows template (e.g. 28.0.4); empty installs the newest published on download.docker.com. Windows containers only."
+}
