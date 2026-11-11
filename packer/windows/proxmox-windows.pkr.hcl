@@ -1,7 +1,7 @@
-# Windows Server runner template for the orchestrator.
+# Windows runner template (Windows 11 Pro by default; Windows Server also supported) for the orchestrator.
 #
 # Produces a Proxmox template containing:
-#   - Windows Server installed unattended on UEFI with VirtIO storage/network.
+#   - Windows installed unattended on UEFI with VirtIO storage/network.
 #   - The QEMU guest agent (required for JIT injection) and VirtIO drivers.
 #   - The GitHub Actions runner at var.runner_directory (unregistered).
 #   - The ActionsRunnerScaleSetWatcher scheduled task (scripts/windows/), either as SYSTEM in
@@ -36,7 +36,7 @@ source "proxmox-iso" "windows_runner" {
   template_name        = var.template_name
   template_description = "Windows GitHub Actions runner (${var.interactive_user != "" ? "interactive" : "SYSTEM/Session 0"}). Built {{ timestamp }}."
 
-  os       = "win11" # Proxmox OS type for Windows 10/11/2022/2025 guests ("win11" also applies to Server 2022+)
+  os       = "win11" # Proxmox OS type for Windows 11 / Server 2022+ guests
   cpu_type = "host"
   cores    = var.vm_cores
   sockets  = 1
@@ -47,6 +47,15 @@ source "proxmox-iso" "windows_runner" {
     efi_storage_pool  = var.storage_pool
     efi_type          = "4m"
     pre_enrolled_keys = true # Windows Setup expects Microsoft's keys enrolled
+  }
+
+  # Windows 11 requires a TPM 2.0.
+  dynamic "tpm_config" {
+    for_each = var.enable_tpm ? [1] : []
+    content {
+      tpm_storage_pool = var.storage_pool
+      tpm_version      = "v2.0"
+    }
   }
 
   scsi_controller = "virtio-scsi-single"
