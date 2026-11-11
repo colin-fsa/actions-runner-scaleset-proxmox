@@ -6,7 +6,73 @@ separate scale sets with different labels: GitHub routes to a scale set, not an
 individual profile. All profiles in a scale set must use the same guest OS and
 advertise its labels. See [the complete mixed example](../examples/windows-linux.yaml).
 
-## Prepare an existing Windows VM once
+## Build the template
+
+There are three ways to get a Windows template. All of them end in the same
+result: Windows, the QEMU guest agent, an unregistered runner at
+`C:\actions-runner`, and the `ActionsRunnerScaleSetWatcher` scheduled task.
+
+| Path | Use when |
+| --- | --- |
+| [A. Packer](#a-packer-recommended) | You want a repeatable, from-scratch build. |
+| [B. Existing VM + `prepare-windows-template`](#b-existing-vm-and-the-prepare-command) | You already have a Windows VM with the runner and want the controller to finish setup. |
+| [C. By hand](#c-by-hand) | You want full control, or are customizing the scripts. |
+
+Put the finished template's VMID in a profile with `guest_os: windows` (see
+[Configure and route jobs](#configure-and-route-jobs)).
+
+### Choose a session mode first
+
+| Mode | Behavior | Choose it for |
+| --- | --- | --- |
+| **SYSTEM / Session 0** (default) | Task runs as Local System at startup. No desktop; jobs cannot rely on an RDP profile, mapped drives or GUI prompts. | Builds, tests and scripts that run unattended. |
+| **Interactive desktop** | Windows signs in automatically as a local Administrator; the task starts at that logon and the runner inherits the desktop session (typically Session 1). | GUI/UI tests, desktop automation, anything that needs a real desktop. |
+
+Interactive mode needs a Desktop Experience image, an Administrator account and
+automatic logon. The auto-logon password is stored in plaintext in the template
+(`Winlogon\DefaultPassword`) because Windows requires it; the runner itself
+never uses it. Use a dedicated account with no reusable credentials, and note
+that jobs running as that Administrator can read the value. The tooling below
+handles all of this for you when you give it an interactive user.
+
+### A. Packer (recommended)
+
+[`packer/windows/`](../packer/windows/README.md) installs Windows Server
+unattended, adds VirtIO drivers and the guest agent, installs the runner and
+the watcher, and removes its own build-time access. Set `interactive_user` and
+`interactive_password` for interactive mode. It reuses the same scripts as the
+other paths. Upload a Windows Server ISO and the virtio-win ISO to Proxmox
+first. See its README for variables and details.
+
+### B. Existing VM and the prepare command
+
+If you already have a running Windows VM (not yet a template) with the runner
+under `C:\actions-runner` and the guest agent working, the controller can finish
+the job through the guest agent:
+
+```sh
+RUNNER_UI_PASSWORD='...' scaleset prepare-windows-template \
+  --config config.yaml --vmid 120 --user RunnerUI
+```
+
+It creates or updates the Administrator account, configures automatic logon and
+disables the lock screen and display/standby timeouts, installs the watcher in
+interactive mode, verifies the task, removes its staging files and shuts the VM
+down. See [scripts/windows/README.md](../scripts/windows/README.md) for
+options. The Proxmox token needs guest-agent file-write and exec permission on
+that VM. The password is read from an environment variable or file, never a
+flag, and is never placed on a guest command line.
+
+A template cannot be started, so to use this on an existing template first make
+a startable VM: clone it to a new full VM (leaving the original untouched), or
+convert it back with `qm set <vmid> --template 0` (not possible while linked
+clones depend on it). Take a Proxmox snapshot before running the command, start
+the VM, wait for the guest agent, run the command, then convert the result back
+with `qm template <vmid>` and point your profile's `template_vmid` at it. The
+installer refuses a VM that already has a `jitconfig` or `started` marker, so
+always start from a clean VM, never from a clone that has run a job.
+
+### C. By hand
 
 1. Install Windows and updates, the build tools your jobs need, VirtIO drivers
    as appropriate, and the GitHub Actions runner distribution under
@@ -24,14 +90,11 @@ advertise its labels. See [the complete mixed example](../examples/windows-linux
    appropriate. The installer refuses existing registration state by default.
    Ensure no runner credentials, pending JIT file, started marker, job data,
    or other secrets are in the golden image.
-4. The installer creates a boot-triggered scheduled task running as Local
-   System. This is Session 0: jobs must work unattended and cannot rely on an
-   interactive desktop, an RDP user's profile, mapped drives, or GUI prompts.
-   Test permissions and tools under that account. For workloads that require a
-   visible desktop, install with `-InteractiveUser` (a local Administrator with
-   automatic logon configured on the image) to run the runner in that user's
-   interactive session instead; see the scripts README. `scaleset prepare-windows-template` can do the account,
-   auto-logon and installer steps for you through the guest agent.
+4. For SYSTEM mode, the installer creates a boot-triggered task running as
+   Local System (Session 0). For interactive mode, create a local Administrator,
+   configure automatic logon for it (Sysinternals Autologon or `netplwiz`),
+   disable its lock screen and screensaver, and run the installer with
+   `-InteractiveUser '.\RunnerUI'`.
 5. Shut down the clean VM and convert it to a Proxmox template. Keep the
    template unchanged while linked clones depend on it; build a new template
    for updates and retire the old one only after its clones are gone.
@@ -111,7 +174,8 @@ Proxmox version, storage, template IDs, guest versions, VMIDs and timestamps.
 1. Verify both scale sets register with the intended labels and only intended
    repositories can use them. Submit one harmless job for each OS and verify
    OS identity, guest-agent readiness, successful completion and VM shutdown.
-2. For Windows, verify the scheduled task runs as SYSTEM (or the configured `-InteractiveUser`) and the runner accepts
+2. For Windows, verify the scheduled task runs as SYSTEM (or the configured interactive user, and
+   that the runner's session is the interactive one) and the runner accepts
    exactly one job. Confirm the baseline has no registration or JIT state;
    avoid exposing the JIT file or credentials in logs and artifacts.
 3. Inspect clone, snapshot and rollback tasks and controller logs/metrics. Run
