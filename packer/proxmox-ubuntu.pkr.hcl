@@ -177,6 +177,8 @@ build {
       "RUNNER_ARCH=${var.runner_arch}",
       "RUNNER_USER=${var.runner_user}",
       "BUILD_USERNAME=${var.build_username}",
+      "SHARED_CACHE_TAG=${var.shared_cache_tag}",
+      "SHARED_CACHE_MOUNT=${var.shared_cache_mount}",
     ]
     scripts = [
       "scripts/provision.sh",

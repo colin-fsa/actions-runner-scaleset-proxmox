@@ -148,3 +148,17 @@ variable "build_password" {
   default   = "ubuntu"
   sensitive = true
 }
+
+# ---------- Shared cache (optional) ----------
+
+variable "shared_cache_mount" {
+  type        = string
+  default     = "/srv/shared/linux-runners-shared"
+  description = "Guest path where a host directory shared over virtiofs is mounted (e.g. /srv/shared/linux-runners-shared); also points the runner user's pnpm store at it. Empty disables. After the build, attach the share to the template: qm set <vmid> --virtiofs0 <shared_cache_tag>."
+}
+
+variable "shared_cache_tag" {
+  type        = string
+  default     = "linux-runners-shared"
+  description = "Proxmox directory-mapping ID of the shared directory; also the virtiofs tag the guest mounts."
+}

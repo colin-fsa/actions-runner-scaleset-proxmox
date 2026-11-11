@@ -18,6 +18,8 @@ RUNNER_VERSION="${RUNNER_VERSION:?missing}"
 RUNNER_ARCH="${RUNNER_ARCH:?missing}"
 RUNNER_USER="${RUNNER_USER:?missing}"
 BUILD_USERNAME="${BUILD_USERNAME:?missing}"
+SHARED_CACHE_TAG="${SHARED_CACHE_TAG:-}"
+SHARED_CACHE_MOUNT="${SHARED_CACHE_MOUNT:-}"
 
 STAGE_DIR="/tmp/scaleset-files"
 
@@ -82,6 +84,22 @@ passwd -l "${RUNNER_USER}" || true
 install -m 0440 /dev/stdin /etc/sudoers.d/10-runner <<EOF
 ${RUNNER_USER} ALL=(ALL) NOPASSWD: ALL
 EOF
+
+# -----------------------------------------------------------------------------
+# Shared cache (optional): a host directory attached to each clone as virtiofs
+# (qm set <vmid> --virtiofs0 <tag>; see packer/README.md). nofail keeps clones
+# booting if it is not attached. The pnpm store (pnpm-store-vm, world-writable: guest and LXC uids differ) lives on it; pnpm cannot
+# hard-link across filesystems, so import by copy instead of retrying links.
+# -----------------------------------------------------------------------------
+if [ -n "${SHARED_CACHE_MOUNT}" ]; then
+    log "configuring shared cache ${SHARED_CACHE_TAG} at ${SHARED_CACHE_MOUNT}"
+    mkdir -p "${SHARED_CACHE_MOUNT}"
+    echo "${SHARED_CACHE_TAG} ${SHARED_CACHE_MOUNT} virtiofs defaults,nofail 0 0" >> /etc/fstab
+    install -o "${RUNNER_USER}" -g "${RUNNER_USER}" -m 0644 /dev/stdin "/home/${RUNNER_USER}/.npmrc" <<EOF
+store-dir=${SHARED_CACHE_MOUNT}/pnpm-store-vm
+package-import-method=copy
+EOF
+fi
 
 # -----------------------------------------------------------------------------
 # GitHub Actions runner binary.
