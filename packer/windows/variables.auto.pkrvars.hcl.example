@@ -7,20 +7,27 @@ template_vm_id   = 9100
 storage_pool     = "local-lvm"
 iso_storage_pool = "local"
 
-# Windows Server 2022 *evaluation* ISO (180-day, no Microsoft login needed). The Proxmox host
-# downloads it directly. For a licensed ISO, upload it to Proxmox and use windows_iso_file instead.
-windows_iso_url = "https://go.microsoft.com/fwlink/p/?LinkID=2195280&clcid=0x409&culture=en-us&country=US"
-# windows_iso_file = "local:iso/windows-server-2022.iso"
+# Windows 11 Pro (default). Microsoft's Windows 11 ISO link is generated on
+# https://www.microsoft.com/software-download/windows11 and expires after ~24h, so either use that
+# fresh link right away, or upload the ISO to Proxmox and use windows_iso_file.
+# windows_iso_url  = "https://..."
+windows_iso_file   = "local:iso/Win11_x64.iso"
+windows_image_name = "Windows 11 Pro"
+windows_driver_folder = "w11"
+
+# Alternative: Windows Server 2022 evaluation ISO (180-day, stable link, no login).
+# windows_iso_url       = "https://go.microsoft.com/fwlink/p/?LinkID=2195280&clcid=0x409&culture=en-us&country=US"
+# windows_image_name    = "Windows Server 2022 SERVERSTANDARD"
+# windows_driver_folder = "2k22"
 
 # The virtio-win ISO is downloaded from Fedora by default; override with virtio_iso_file to reuse one.
 # virtio_iso_file = "local:iso/virtio-win.iso"
 
-windows_image_name = "Windows Server 2022 SERVERSTANDARD"
 
 runner_version = "2.334.0"
 # runner_sha256 = "..."
 
 # Optional: run jobs in an interactive desktop session instead of Session 0.
-# Needs a Desktop Experience image, e.g. "Windows Server 2022 SERVERSTANDARD" (not ...CORE).
+# Needs a Desktop Experience edition (Windows 11 Pro qualifies).
 # interactive_user = "RunnerUI"
 # export PKR_VAR_interactive_password='...'

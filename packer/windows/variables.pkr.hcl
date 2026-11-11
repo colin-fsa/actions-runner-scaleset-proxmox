@@ -57,6 +57,12 @@ variable "vm_disk_size_gb" {
   default = 80
 }
 
+variable "enable_tpm" {
+  type        = bool
+  default     = true
+  description = "Attach a virtual TPM 2.0 (stored in storage_pool). Required by Windows 11; harmless for Server."
+}
+
 # ---------- Storage / network ----------
 
 variable "storage_pool" {
@@ -84,13 +90,13 @@ variable "network_vlan_tag" {
 variable "windows_iso_url" {
   type        = string
   default     = ""
-  description = "HTTPS URL of a Windows Server ISO that the Proxmox host downloads. Set this OR windows_iso_file. The Server 2022 evaluation ISO is freely downloadable (see the .example file); licensed ISOs usually need a Microsoft account, so upload those and use windows_iso_file."
+  description = "HTTPS URL of a Windows ISO that the Proxmox host downloads. Set this OR windows_iso_file. Microsoft's Windows 11 ISO links are generated on the download page and expire after about 24 hours, so a fresh link works for an immediate build; for repeat builds upload the ISO and use windows_iso_file. Server evaluation ISOs have a stable link (see the .example file)."
 }
 
 variable "windows_iso_file" {
   type        = string
   default     = ""
-  description = "Proxmox storage path of an already-uploaded Windows Server ISO, e.g. 'local:iso/windows-server-2022.iso'. Set this OR windows_iso_url."
+  description = "Proxmox storage path of an already-uploaded Windows ISO, e.g. 'local:iso/Win11_x64.iso'. Set this OR windows_iso_url."
 }
 
 variable "windows_iso_checksum" {
@@ -101,14 +107,14 @@ variable "windows_iso_checksum" {
 
 variable "windows_image_name" {
   type        = string
-  default     = "Windows Server 2022 SERVERSTANDARD"
-  description = "Edition to install, exactly as named inside the ISO's install.wim. '... SERVERSTANDARD' is Desktop Experience and '... SERVERSTANDARDCORE' is Server Core. Interactive sessions need Desktop Experience."
+  default     = "Windows 11 Pro"
+  description = "Edition to install, exactly as named inside the ISO's install.wim, e.g. 'Windows 11 Pro', or for Server 'Windows Server 2022 SERVERSTANDARD' (Desktop Experience) / '... SERVERSTANDARDCORE' (Server Core). Interactive sessions need a Desktop Experience edition."
 }
 
 variable "windows_driver_folder" {
   type        = string
-  default     = "2k22"
-  description = "Folder under the VirtIO ISO's drivers (viostor, vioscsi, ...) matching your Windows version: 2k19, 2k22, 2k25, w10, w11."
+  default     = "w11"
+  description = "Folder under the VirtIO ISO's drivers (viostor, vioscsi, ...) matching your Windows version: w11, w10, 2k25, 2k22, 2k19."
 }
 
 variable "virtio_iso_url" {

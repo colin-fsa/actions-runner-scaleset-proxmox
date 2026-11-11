@@ -37,13 +37,13 @@ handles all of this for you when you give it an interactive user.
 
 ### A. Packer (recommended)
 
-[`packer/windows/`](../packer/windows/README.md) installs Windows Server
-unattended, adds VirtIO drivers and the guest agent, installs the runner and
+[`packer/windows/`](../packer/windows/README.md) installs Windows 11 Pro (or
+Server) unattended, adds VirtIO drivers and the guest agent, installs the runner and
 the watcher, and removes its own build-time access. Set `interactive_user` and
 `interactive_password` for interactive mode. It reuses the same scripts as the
-other paths. Proxmox downloads the virtio-win ISO and, if you give it a URL (the freely
-downloadable Server evaluation ISO works), the Windows ISO; for a licensed ISO
-upload it first. See its README for variables and details.
+other paths. Proxmox downloads the virtio-win ISO and, if you give it a URL, the Windows
+ISO (Microsoft's Windows 11 links expire after about a day, so for repeat
+builds upload the ISO first). A Server evaluation ISO has a stable link. See its README for variables and details.
 
 ### B. Existing VM and the prepare command
 

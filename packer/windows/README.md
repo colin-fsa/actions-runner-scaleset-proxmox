@@ -1,7 +1,7 @@
-# Packer template: Windows Server GitHub Actions runner
+# Packer template: Windows GitHub Actions runner (Windows 11 Pro by default)
 
 Builds a Proxmox template for [Windows runners](../../docs/windows-runners.md): unattended
-Windows Server install on UEFI with VirtIO, the QEMU guest agent, the Actions runner
+Windows install (Windows 11 Pro by default; Windows Server also works) on UEFI with a virtual TPM and VirtIO, the QEMU guest agent, the Actions runner
 (unregistered) and the JIT watcher task from [`scripts/windows/`](../../scripts/windows/README.md).
 It reuses those same scripts, so a Packer-built template and a hand-prepared one behave identically.
 
@@ -13,7 +13,7 @@ It reuses those same scripts, so a Packer-built template and a hand-prepared one
 | Mode | Set | Result |
 | --- | --- | --- |
 | SYSTEM, Session 0 (default) | nothing | Unattended; no desktop. Task runs as SYSTEM at startup. |
-| Interactive desktop | `interactive_user`, `interactive_password` | Creates that local Administrator, enables auto-logon, task starts at its logon in its desktop session (Session 1). Needs a Desktop Experience image. |
+| Interactive desktop | `interactive_user`, `interactive_password` | Creates that local Administrator, enables auto-logon, task starts at its logon in its desktop session (Session 1). Needs a Desktop Experience edition (Windows 11 Pro qualifies). |
 
 The interactive password is stored in plaintext in the template's Winlogon registry key because
 Windows auto-logon requires it. Use a dedicated account with no reusable credentials.
@@ -21,19 +21,25 @@ Windows auto-logon requires it. Use a dedicated account with no reusable credent
 ## Prerequisites
 
 1. Packer >= 1.10 (`packer init .` installs the Proxmox plugin).
-2. ISOs: nothing needs uploading by default. The Proxmox host downloads the
+2. ISOs. The Proxmox host downloads the
    [virtio-win ISO](https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/)
-   from Fedora and, if you set `windows_iso_url`, a Windows Server ISO. Microsoft's Server 2022
-   *evaluation* ISO is freely downloadable without a login (the link is in the `.example` file; it is
-   a 180-day evaluation, so don't use it for long-lived production runners). Licensed ISOs normally
-   need a Microsoft account to download: upload yours to a Proxmox ISO store and set `windows_iso_file`.
-   `iso_download_pve = false` routes downloads through the Packer host instead. Set
-   `windows_iso_checksum`/`virtio_iso_checksum` for reproducible builds (the upstream ISOs are
-   republished over time, so none is pinned here).
+   from Fedora automatically. For Windows, either:
+   - upload an ISO to a Proxmox ISO store and set `windows_iso_file` (best for repeat builds), or
+   - set `windows_iso_url`. Microsoft's Windows 11 download links are generated per request on the
+     [download page](https://www.microsoft.com/software-download/windows11) and expire after about
+     24 hours, so this suits an immediate build. The Windows Server 2022 *evaluation* ISO has a stable,
+     login-free link (in the `.example` file) but is a 180-day evaluation.
+   `iso_download_pve = false` routes URL downloads through the Packer host instead. Set
+   `windows_iso_checksum`/`virtio_iso_checksum` for reproducible builds (none is pinned here).
 3. A Proxmox API token with the same permissions as the [Ubuntu build](../README.md).
 4. `windows_image_name` must match an image name inside the ISO's `install.wim`
-   (`... SERVERSTANDARD` = Desktop Experience, `... SERVERSTANDARDCORE` = Server Core), and
-   `windows_driver_folder` the VirtIO folder for your Windows version (`2k22`, `2k25`, ...).
+   (`Windows 11 Pro`; for Server, `... SERVERSTANDARD` is Desktop Experience and
+   `... SERVERSTANDARDCORE` is Server Core), and `windows_driver_folder` the VirtIO folder for your
+   Windows version (`w11`, `2k22`, `2k25`, ...).
+5. Licensing: the template installs without a product key and runs unactivated. Activate with your own
+   key or volume-activation setup (`windows_product_key` is only passed to Setup), and confirm that
+   your Windows license permits running it in VMs for CI. Windows client editions have different
+   virtualization terms from Windows Server.
 
 ## Build
 
@@ -44,7 +50,7 @@ export PKR_VAR_interactive_password='...'   # only for interactive mode
 packer init . && packer validate . && packer build .
 ```
 
-Expect roughly 30-60 minutes. The result is a template at `template_vm_id` (default 9100); point a
+Expect roughly 30-60 minutes. It has not been run end to end on Windows 11 yet. The result is a template at `template_vm_id` (default 9100); point a
 profile's `template_vmid` at it and set `guest_os: windows`.
 
 ## How it works
@@ -65,5 +71,7 @@ profile's `template_vmid` at it and set `guest_os: windows`.
   network; the access is removed before templating.
 - No Windows Update, Sysprep or hostname change is done. Clones share the template's computer
   name; add Sysprep or patching provisioners if your environment needs them.
-- Windows 10/11 guests need extra VM settings (TPM 2.0) not configured here; Server is the supported path.
+- A virtual TPM 2.0 is attached by default (`enable_tpm`) for Windows 11. Windows 11 setup occasionally
+  changes its OOBE prompts between releases; if a build stalls at a screen, watch the VM console and
+  adjust `answer_files/Autounattend.xml.pkrtpl.hcl`.
 - Build repeatedly rather than editing a template that still has linked clones.
