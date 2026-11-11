@@ -24,7 +24,8 @@ foreach ($d in $dirs.PSObject.Properties) {
     if ($LASTEXITCODE -ne 0) { throw "Extracting $($d.Value) failed." }
     $items = @(Get-ChildItem -LiteralPath $out -Force)
     $src = if ($items.Count -eq 1 -and $items[0].PSIsContainer) { $items[0].FullName } else { $out }
-    New-Item -ItemType Directory -Path (Split-Path -Parent $dest) -Force | Out-Null
+    $parent = Split-Path -Parent $dest
+    if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
     Move-Item -LiteralPath $src -Destination $dest
     Remove-Item -LiteralPath $work -Recurse -Force
     Write-Host "Installed $dest"
