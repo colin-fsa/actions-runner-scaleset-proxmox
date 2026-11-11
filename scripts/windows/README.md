@@ -15,3 +15,16 @@ By default the watcher runs as SYSTEM in Session 0. For workloads that need a re
 - Disable the lock screen/screensaver timeout and any first-run prompts for that account so the session stays usable.
 
 Default SYSTEM mode is unchanged. To switch modes, re-run the installer on a clean golden image; the task is re-registered with `-Force`.
+
+### Automated preparation
+
+Instead of doing the account, auto-logon and installer steps by hand, the controller can do them through the QEMU guest agent. Install Windows, the runner at `C:\actions-runner` and the guest agent, leave the VM running (not yet a template), then:
+
+```
+RUNNER_UI_PASSWORD='...' scaleset prepare-windows-template --config config.yaml --vmid 120 --user RunnerUI
+```
+
+It creates or updates the local Administrator account, writes the Winlogon auto-logon values, disables the lock screen and display/standby timeouts, runs `Install-JitRunnerWatcher.ps1 -InteractiveUser .\RunnerUI`, verifies the task is interactive, removes its staging files and powers the VM off (`--no-shutdown` to skip). Then convert the VM to a template. Options: `--password-file`, `--password-env`, `--runner-dir`, `--jit-path` (must match `windows_jit_path`).
+
+The password is read from an environment variable or file, never a flag, and is never put on a guest command line; it travels in a temporary file in a SYSTEM/Administrators-only directory that is deleted after use. It does remain in the guest as the Winlogon `DefaultPassword` registry value (plaintext) because Windows needs it for auto-logon: use a dedicated account with no reusable credentials. The Proxmox API token needs guest-agent permissions (`VM.GuestAgent.FileWrite`/`Unrestricted` or equivalent for exec) on the VM.
+
