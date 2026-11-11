@@ -90,11 +90,6 @@ variable "windows_product_key" {
 
 # ---------- Build-time account ----------
 #
-# Used only while Packer provisions over WinRM. finalize.ps1 disables the
-# account, WinRM and its firewall rule before the template is finalized.
-
-# ---------- Build-time account ----------
-#
 # Used only while Packer provisions over WinRM; finalize.ps1 disables the account, WinRM
 # and its firewall rule before the template is finalized.
 
@@ -108,8 +103,6 @@ variable "windows_build_password" {
   default   = "Packer-Build-1!"
   sensitive = true
 }
-
-# ---------- Runner ----------
 
 # ---------- Runner ----------
 

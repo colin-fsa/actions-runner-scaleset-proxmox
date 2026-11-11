@@ -60,11 +60,13 @@ $action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\WindowsPowe
 $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero)
 if ($InteractiveUser) {
     # Starts when the account logs on (configure automatic logon on the image), in its desktop session.
-    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $InteractiveUser
-    $taskPrincipal = New-ScheduledTaskPrincipal -UserId $InteractiveUser -LogonType Interactive -RunLevel Highest
+    # Use the resolved COMPUTER\user name: Task Scheduler cannot resolve the ".\" prefix.
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $lookup
+    $taskPrincipal = New-ScheduledTaskPrincipal -UserId $lookup -LogonType Interactive -RunLevel Highest
 } else {
     $trigger = New-ScheduledTaskTrigger -AtStartup
     $taskPrincipal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
 }
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $taskPrincipal -Force | Out-Null
-Write-Host 'Installed $(if ($InteractiveUser) { "logon watcher for $InteractiveUser (interactive session; ensure automatic logon is configured)" } else { 'boot watcher' }). Shut down the clean golden image before converting it to a template.'
+$mode = if ($InteractiveUser) { "logon watcher for $InteractiveUser (interactive session; ensure automatic logon is configured)" } else { 'boot watcher' }
+Write-Host "Installed $mode. Shut down the clean golden image before converting it to a template."
