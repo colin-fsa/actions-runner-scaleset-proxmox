@@ -21,9 +21,15 @@ Windows auto-logon requires it. Use a dedicated account with no reusable credent
 ## Prerequisites
 
 1. Packer >= 1.10 (`packer init .` installs the Proxmox plugin).
-2. Upload to a Proxmox ISO store: a Windows Server ISO (Microsoft's media is not anonymously
-   downloadable, so Packer can't fetch it; evaluation ISOs work) and the
-   [virtio-win ISO](https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/).
+2. ISOs: nothing needs uploading by default. The Proxmox host downloads the
+   [virtio-win ISO](https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/)
+   from Fedora and, if you set `windows_iso_url`, a Windows Server ISO. Microsoft's Server 2022
+   *evaluation* ISO is freely downloadable without a login (the link is in the `.example` file; it is
+   a 180-day evaluation, so don't use it for long-lived production runners). Licensed ISOs normally
+   need a Microsoft account to download: upload yours to a Proxmox ISO store and set `windows_iso_file`.
+   `iso_download_pve = false` routes downloads through the Packer host instead. Set
+   `windows_iso_checksum`/`virtio_iso_checksum` for reproducible builds (the upstream ISOs are
+   republished over time, so none is pinned here).
 3. A Proxmox API token with the same permissions as the [Ubuntu build](../README.md).
 4. `windows_image_name` must match an image name inside the ISO's `install.wim`
    (`... SERVERSTANDARD` = Desktop Experience, `... SERVERSTANDARDCORE` = Server Core), and

@@ -7,8 +7,14 @@ template_vm_id   = 9100
 storage_pool     = "local-lvm"
 iso_storage_pool = "local"
 
-windows_iso_file   = "local:iso/windows-server-2022.iso"
-virtio_iso_file    = "local:iso/virtio-win.iso"
+# Windows Server 2022 *evaluation* ISO (180-day, no Microsoft login needed). The Proxmox host
+# downloads it directly. For a licensed ISO, upload it to Proxmox and use windows_iso_file instead.
+windows_iso_url = "https://go.microsoft.com/fwlink/p/?LinkID=2195280&clcid=0x409&culture=en-us&country=US"
+# windows_iso_file = "local:iso/windows-server-2022.iso"
+
+# The virtio-win ISO is downloaded from Fedora by default; override with virtio_iso_file to reuse one.
+# virtio_iso_file = "local:iso/virtio-win.iso"
+
 windows_image_name = "Windows Server 2022 SERVERSTANDARD"
 
 runner_version = "2.334.0"

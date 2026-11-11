@@ -73,20 +73,26 @@ source "proxmox-iso" "windows_runner" {
 
   # Windows install media.
   boot_iso {
-    type         = "ide"
-    index        = "2"
-    iso_file     = var.windows_iso_file
-    iso_checksum = var.windows_iso_checksum
-    unmount      = true
+    type             = "ide"
+    index            = "2"
+    iso_url          = var.windows_iso_url
+    iso_file         = var.windows_iso_file
+    iso_checksum     = var.windows_iso_checksum
+    iso_storage_pool = var.iso_storage_pool
+    iso_download_pve = var.windows_iso_url != "" && var.windows_iso_file == "" ? var.iso_download_pve : false
+    unmount          = true
   }
 
   # VirtIO drivers + guest agent installers.
   additional_iso_files {
-    type         = "ide"
-    index        = "3"
-    iso_file     = var.virtio_iso_file
-    iso_checksum = "none"
-    unmount      = true
+    type             = "ide"
+    index            = "3"
+    iso_url          = var.virtio_iso_file == "" ? var.virtio_iso_url : ""
+    iso_file         = var.virtio_iso_file
+    iso_checksum     = var.virtio_iso_checksum
+    iso_storage_pool = var.iso_storage_pool
+    iso_download_pve = var.virtio_iso_file == "" ? var.iso_download_pve : false
+    unmount          = true
   }
 
   # Autounattend.xml and the first-logon bootstrap script ride on a small generated CD.
