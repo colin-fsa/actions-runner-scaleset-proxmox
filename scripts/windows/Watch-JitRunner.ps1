@@ -2,7 +2,7 @@ param(
     [string] $RunnerDirectory = 'C:\actions-runner',
     [string] $JitPath = 'C:\ProgramData\ActionsRunnerScaleSet\jitconfig'
 )
-# Runs as SYSTEM at startup. The controller publishes jitconfig atomically.
+# Runs as SYSTEM at startup, or as the configured Administrator at logon (interactive mode). The controller publishes jitconfig atomically.
 $ErrorActionPreference = 'Stop'
 $stateDir = 'C:\ProgramData\ActionsRunnerScaleSet'
 $configPath = $JitPath
