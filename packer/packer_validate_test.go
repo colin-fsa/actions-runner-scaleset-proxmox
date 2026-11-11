@@ -34,15 +34,12 @@ func TestPackerValidateSyntax(t *testing.T) {
 	}
 	packerDir := filepath.Dir(thisFile)
 
-	// The Windows build lives in its own directory (own variable namespace).
-	for _, dir := range []string{packerDir, filepath.Join(packerDir, "windows")} {
-		cmd := exec.Command("packer", "validate", "-syntax-only", dir)
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("packer validate %s failed: %v\n%s", dir, err, out)
-		}
-		if !strings.Contains(string(out), "passed") {
-			t.Fatalf("packer validate %s output unexpected; want 'passed' marker:\n%s", dir, out)
-		}
+	cmd := exec.Command("packer", "validate", "-syntax-only", packerDir)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("packer validate failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "passed") {
+		t.Fatalf("packer validate output unexpected; want 'passed' marker:\n%s", out)
 	}
 }

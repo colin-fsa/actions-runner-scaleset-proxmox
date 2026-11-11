@@ -79,7 +79,7 @@ dropped listener callbacks, and sweeps Proxmox for orphaned VMs. See
 - **Proxmox VE**, single node or cluster, with an API token for the
   orchestrator.
 - **A VM template** with the Actions runner and `qemu-guest-agent` baked in.
-  [`packer/`](packer/) builds a Linux template and [`packer/windows/`](packer/windows/) a Windows one; see [Windows setup](docs/windows-runners.md) for all options.
+  [`packer/`](packer/) builds Linux and Windows templates; see [Windows setup](docs/windows-runners.md) for all options.
 - **A GitHub org or repo**, plus a PAT or GitHub App.
 
 ## Quick start
