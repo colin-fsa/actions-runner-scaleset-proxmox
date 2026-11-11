@@ -30,7 +30,8 @@ advertise its labels. See [the complete mixed example](../examples/windows-linux
    Test permissions and tools under that account. For workloads that require a
    visible desktop, install with `-InteractiveUser` (a local Administrator with
    automatic logon configured on the image) to run the runner in that user's
-   interactive session instead; see the scripts README.
+   interactive session instead; see the scripts README. `scaleset prepare-windows-template` can do the account,
+   auto-logon and installer steps for you through the guest agent.
 5. Shut down the clean VM and convert it to a Proxmox template. Keep the
    template unchanged while linked clones depend on it; build a new template
    for updates and retire the old one only after its clones are gone.
