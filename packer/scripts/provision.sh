@@ -69,6 +69,21 @@ apt-get install -y --no-install-recommends \
 systemctl enable --now qemu-guest-agent
 log "qemu-guest-agent active"
 
+# Toolchain the GitHub-hosted ubuntu images ship, so workflows written for them run unchanged:
+# build tools, python, zip/wget/rsync, Node LTS (+ npm; pnpm/action-setup and others call npm from PATH) and gh.
+log "installing GitHub-hosted-runner toolchain"
+apt-get install -y --no-install-recommends \
+    build-essential python3 python3-pip python3-venv zip wget rsync patch gnupg
+curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
+apt-get install -y --no-install-recommends nodejs
+install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli.gpg] https://cli.github.com/packages stable main" \
+    > /etc/apt/sources.list.d/github-cli.list
+apt-get update
+apt-get install -y --no-install-recommends gh
+node --version && npm --version && gh --version | head -1
+
 # -----------------------------------------------------------------------------
 # Runner user.
 # -----------------------------------------------------------------------------

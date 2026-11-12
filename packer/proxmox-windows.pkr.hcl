@@ -147,6 +147,7 @@ build {
       "windows/install-runner.ps1",
       "windows/install-extra-dirs.ps1",
       "windows/install-docker.ps1",
+      "windows/install-tools.ps1",
       "windows/finalize.ps1",
     ]
     destination = "C:\\Windows\\Temp\\scaleset\\"
@@ -156,6 +157,10 @@ build {
     inline = [
       "& C:\\Windows\\Temp\\scaleset\\install-runner.ps1 -RunnerVersion '${var.runner_version}' -RunnerSha256 '${var.runner_sha256}'",
     ]
+  }
+
+  provisioner "powershell" {
+    inline = ["& C:\\Windows\\Temp\\scaleset\\install-tools.ps1"]
   }
 
   # Docker Engine (Windows containers). The Containers feature needs the reboot; the update
