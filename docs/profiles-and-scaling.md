@@ -355,6 +355,35 @@ Prometheus metrics are partitioned by `profile=` so dashboards can slice by
 hardware shape. See `profiles:` in
 [config.example.yaml](../config.example.yaml) for the full schema.
 
+### Proxmox resource pools
+
+Set `proxmox_pool` on a profile to place its **newly cloned** VMs into an
+existing Proxmox resource pool:
+
+```yaml
+scalesets:
+  - name: windows-x64
+    # ... scope, labels, concurrency and VMID range ...
+    profiles:
+      - name: windows
+        # ... template, labels, CPU, memory and hot/warm sizing ...
+        proxmox_pool: ci-runners
+```
+
+This passes the clone API's `pool` parameter for both linked and full clones.
+Omitting it (or setting `""`) leaves that parameter absent, preserving previous
+behavior. It is distinct from `pool:` hot/warm lifecycle settings and from
+`storage:`, which selects disk storage.
+
+The resource pool must already exist, and the Proxmox API identity must have
+permission to allocate a VM into it in addition to cloning the source template.
+The controller does not create pools or change ACLs. A rejected pool assignment
+fails the clone; it is not silently retried without the pool.
+
+Existing hot/warm VMs, adopted VMs, and snapshot-recycled VMs are **not moved**
+when this setting changes. It takes effect on the next new clone. Pool membership
+may inherit Proxmox ACLs, so select a pool with the intended access policy.
+
 ### Where labels are matched
 
 **Labels select a scale set, never a profile.** A runner registers with a

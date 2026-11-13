@@ -407,6 +407,7 @@ pool:
 #     memory_mb: 8192               # 0 inherits the template default
 #     disk_gb: 0                    # 0 inherits the template default (resize is absolute)
 #     storage: ""                   # override of proxmox.storage.disk for full clones; "" inherits
+#     proxmox_pool: ci-runners       # existing PVE resource pool for new linked/full clones; omitted = no pool parameter
 #     hot_size: 5
 #     warm_size: 10
 #     max_concurrent_runners: 20

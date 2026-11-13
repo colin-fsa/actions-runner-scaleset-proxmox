@@ -3131,7 +3131,7 @@ func TestProfiles_PerProfileReconcileClonesOnlyToProfileTarget(t *testing.T) {
 		MaxConcurrentRunners: 20,
 		Profiles: []ProfileSettings{
 			{Name: "linux-x64", HotSize: 3, WarmSize: 0, MaxConcurrentRunners: 5, BootMaxAttempts: 3},
-			{Name: "gpu", HotSize: 1, WarmSize: 0, MaxConcurrentRunners: 2, BootMaxAttempts: 3, CPUCores: 8, MemoryMB: 32768, TemplateVMID: 9100},
+			{Name: "gpu", HotSize: 1, WarmSize: 0, MaxConcurrentRunners: 2, BootMaxAttempts: 3, CPUCores: 8, MemoryMB: 32768, TemplateVMID: 9100, ProxmoxPool: "ci-gpu"},
 		},
 	})
 
@@ -3158,6 +3158,9 @@ func TestProfiles_PerProfileReconcileClonesOnlyToProfileTarget(t *testing.T) {
 			require.Equal(t, 8, c.CPUCores, "gpu profile must propagate cpu override")
 			require.Equal(t, 32768, c.MemoryMB)
 			require.Equal(t, 9100, c.TemplateVMID)
+			require.Equal(t, "ci-gpu", c.ProxmoxPool)
+		} else {
+			require.Empty(t, c.ProxmoxPool)
 		}
 	}
 	require.Equal(t, 3, byProfile["linux-x64"])

@@ -109,6 +109,10 @@ type CloneOptions struct {
 	DiskGB       int
 	Storage      string
 
+	// ProxmoxPool is an existing PVE resource pool for linked or full clones.
+	// Empty preserves the API default; pool membership is not a VM config key.
+	ProxmoxPool string
+
 	// TemplateClass is "stable" or "candidate" — stamped onto
 	// the VM's Proxmox tag for canary attribution. Empty
 	// defaults to "stable" via tags.Initial so callers without
@@ -767,6 +771,7 @@ func buildLibCloneOptions(opts CloneOptions, templateNodeName string) *proxmox.V
 	cloneOpts := &proxmox.VirtualMachineCloneOptions{
 		NewID: opts.NewVMID,
 		Name:  opts.Name,
+		Pool:  opts.ProxmoxPool,
 	}
 	if opts.Linked {
 		cloneOpts.Full = proxmox.IntOrBool(false)
