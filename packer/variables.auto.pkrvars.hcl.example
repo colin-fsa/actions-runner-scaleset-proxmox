@@ -29,3 +29,15 @@ iso_checksum = "sha256:dec49008a71f6098d0bcfc822021f4d042d5f2db279e4d75bdd981304
 runner_version = "2.334.0"
 runner_arch    = "x64"
 runner_user    = "runner"
+
+# ---------- Windows template (proxmox-windows.pkr.hcl) ----------
+# Optional. Everything above (connection, storage, network, runner_version) is shared; only
+# set these to override Windows defaults. By default the Proxmox host downloads Microsoft's
+# Windows Server 2022 evaluation ISO and the virtio-win ISO.
+# windows_template_vm_id = 9100
+# windows_template_name  = "windows-runner-template"
+# windows_iso_file       = "local:iso/windows-server-2022.iso"  # licensed ISO you uploaded
+# runner_sha256          = "..."                                  # checksum of the Windows runner zip
+# Run the runner in an interactive desktop session (needs a "... SERVERSTANDARD" image):
+# interactive_user = "RunnerUI"
+# export PKR_VAR_interactive_password='...'

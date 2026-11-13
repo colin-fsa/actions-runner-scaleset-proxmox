@@ -1,4 +1,15 @@
-# Packer template: Ubuntu 26.04 LTS GitHub Actions runner
+# Packer templates: GitHub Actions runners (Ubuntu 26.04 and Windows Server)
+
+This directory builds two templates, selected with `-only`:
+
+```sh
+packer build -only='ubuntu-2604-runner.*' .   # Linux (below)
+packer build -only='windows-runner.*' .       # Windows (see the Windows section)
+packer build .                                # both
+```
+
+Connection, storage and network variables are shared between the builds.
+
 
 Builds a Proxmox VM template that the [orchestrator](../README.md) clones into
 ephemeral GitHub Actions runners.
@@ -92,3 +103,41 @@ security updates land — ephemeral VMs deliberately have no
 - If you need a `arm64` template, set `runner_arch = "arm64"` and switch the
   ISO URL/checksum to the arm64 release; ensure your Proxmox node supports
   arm64 emulation (or runs on arm64 hardware).
+
+## Windows template
+
+`proxmox-windows.pkr.hcl` builds a Windows Server 2022 template using the same scripts as
+[manual preparation](../scripts/windows/README.md), so a Packer-built and a hand-prepared template
+behave identically. Windows-specific variables are in `variables-windows.pkr.hcl`; the unattended
+answer file and first-logon scripts are in [`windows/`](windows/).
+
+> Status: not yet validated against every Windows release. Adjust ISO, driver folder and
+> image name for your environment.
+
+Nothing needs uploading by default: the Proxmox host downloads Microsoft's free Server 2022
+*evaluation* ISO (a 180-day evaluation; no login) and the
+[virtio-win ISO](https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/).
+For a licensed ISO, upload it and set `windows_iso_file`. Downloading by URL needs the same Proxmox
+permissions as the Ubuntu build; set `iso_download_pve = false` to download through the Packer host.
+Pin `windows_iso_checksum`/`virtio_iso_checksum` for reproducible builds.
+
+### How it works
+
+1. `Autounattend.xml` partitions the disk, loads VirtIO storage/network drivers, installs Windows
+   and creates a temporary build admin. `bootstrap.ps1` then installs the VirtIO drivers and QEMU
+   guest agent and enables WinRM (Packer finds the VM's address through the guest agent).
+2. Packer uploads the repo's Windows scripts, installs the runner (`install-runner.ps1`, optional
+   `runner_sha256` verification) and fully patches Windows (community plugin
+   [`rgl/windows-update`](https://github.com/rgl/packer-plugin-windows-update), fetched by
+   `packer init`).
+3. `Install-JitRunnerWatcher.ps1` registers the watcher task: SYSTEM in Session 0 by default, or,
+   with `interactive_user`/`interactive_password`, an Administrator with automatic logon so the
+   runner gets a desktop session (`Initialize-InteractiveRunner.ps1`). The password is stored in
+   plaintext in the template (Windows auto-logon requires it): use a dedicated account.
+4. `finalize.ps1` removes WinRM access and the build account and fails if any JIT state exists.
+   Packer then shuts down and templates the VM.
+
+Like the Linux build, SSH-style build access is removed at the end (here WinRM, which is used instead
+of SSH because Packer's reboot handling for Windows Update needs it). No Sysprep is run and clones
+share the template's computer name. Point a `guest_os: windows` profile's `template_vmid` at
+`windows_template_vm_id` (default 9100).
