@@ -20,6 +20,7 @@ RUNNER_USER="${RUNNER_USER:?missing}"
 BUILD_USERNAME="${BUILD_USERNAME:?missing}"
 SHARED_CACHE_TAG="${SHARED_CACHE_TAG:-}"
 SHARED_CACHE_MOUNT="${SHARED_CACHE_MOUNT:-}"
+RUNNER_UID="${RUNNER_UID:-}"
 
 STAGE_DIR="/tmp/scaleset-files"
 
@@ -89,7 +90,14 @@ node --version && npm --version && gh --version | head -1
 # -----------------------------------------------------------------------------
 log "creating runner user ${RUNNER_USER}"
 if ! id "${RUNNER_USER}" >/dev/null 2>&1; then
-    useradd --create-home --shell /bin/bash "${RUNNER_USER}"
+    # RUNNER_UID, when set, makes the guest uid/gid equal to the owner of the shared cache on the host
+    # (virtiofs passes ids through unmapped), so the cache dirs the LXC runners created stay writable.
+    if [ -n "${RUNNER_UID}" ]; then
+        groupadd --gid "${RUNNER_UID}" "${RUNNER_USER}"
+        useradd --create-home --shell /bin/bash --uid "${RUNNER_UID}" --gid "${RUNNER_UID}" "${RUNNER_USER}"
+    else
+        useradd --create-home --shell /bin/bash "${RUNNER_USER}"
+    fi
 fi
 # Lock the password so console / SSH password login is impossible.
 passwd -l "${RUNNER_USER}" || true
@@ -113,17 +121,31 @@ usermod -aG docker "${RUNNER_USER}"
 # -----------------------------------------------------------------------------
 # Shared cache (optional): a host directory attached to each clone as virtiofs
 # (qm set <vmid> --virtiofs0 <tag>; see packer/README.md). nofail keeps clones
-# booting if it is not attached. The pnpm store (pnpm-store-vm, world-writable: guest and LXC uids differ) lives on it; pnpm cannot
-# hard-link across filesystems, so import by copy instead of retrying links.
+# booting if it is not attached.
+# pnpm's store is SQLite and virtiofs file locks are not coherent between guests (or with the LXC
+# runners), so a shared store can corrupt. Bind a per-runner local directory over <share>/pnpm-store:
+# jobs that point pnpm at the shared path get a writable local store and the share's store is never
+# touched. pip and ESLint caches stay shared (file-based, per-runner names).
 # -----------------------------------------------------------------------------
 if [ -n "${SHARED_CACHE_MOUNT}" ]; then
     log "configuring shared cache ${SHARED_CACHE_TAG} at ${SHARED_CACHE_MOUNT}"
     mkdir -p "${SHARED_CACHE_MOUNT}"
     echo "${SHARED_CACHE_TAG} ${SHARED_CACHE_MOUNT} virtiofs defaults,nofail 0 0" >> /etc/fstab
-    install -o "${RUNNER_USER}" -g "${RUNNER_USER}" -m 0644 /dev/stdin "/home/${RUNNER_USER}/.npmrc" <<EOF
-store-dir=${SHARED_CACHE_MOUNT}/pnpm-store-vm
-package-import-method=copy
+    install -d -o "${RUNNER_USER}" -g "${RUNNER_USER}" -m 0755 /var/lib/pnpm-store
+    PNPM_UNIT="$(systemd-escape --path --suffix=mount "${SHARED_CACHE_MOUNT}/pnpm-store")"
+    install -m 0644 /dev/stdin "/etc/systemd/system/${PNPM_UNIT}" <<EOF
+[Unit]
+Description=Per-runner local pnpm store over the shared cache path
+RequiresMountsFor=${SHARED_CACHE_MOUNT}
+[Mount]
+What=/var/lib/pnpm-store
+Where=${SHARED_CACHE_MOUNT}/pnpm-store
+Type=none
+Options=bind
+[Install]
+WantedBy=multi-user.target
 EOF
+    systemctl enable "${PNPM_UNIT}"
 fi
 
 # -----------------------------------------------------------------------------

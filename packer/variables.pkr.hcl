@@ -162,3 +162,9 @@ variable "shared_cache_tag" {
   default     = "linux-runners-shared"
   description = "Proxmox directory-mapping ID of the shared directory; also the virtiofs tag the guest mounts."
 }
+
+variable "runner_uid" {
+  type        = string
+  default     = "101000"
+  description = "uid/gid of the runner user. virtiofs passes ids through unmapped, so this must equal the host owner of the shared cache (101000 = uid 1000 in the unprivileged LXC runners). Empty = distro default."
+}
