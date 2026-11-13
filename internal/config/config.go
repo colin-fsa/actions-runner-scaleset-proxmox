@@ -770,6 +770,10 @@ type ProfileConfig struct {
 	// Empty inherits the global proxmox.storage.disk.
 	Storage string `yaml:"storage"`
 
+	// ProxmoxPool assigns new clones to an existing Proxmox resource pool.
+	// Empty omits the clone API pool parameter; it is unrelated to hot/warm sizing.
+	ProxmoxPool string `yaml:"proxmox_pool"`
+
 	// HotSize / WarmSize / MaxConcurrentRunners are per-profile pool
 	// sizes. *int so the unmarshaller can distinguish "field omitted"
 	// (nil — inherit from global pool / scaleset) from "explicit 0"

@@ -85,6 +85,9 @@ type ProfileSettings struct {
 	DiskGB       int
 	Storage      string
 
+	// ProxmoxPool is the resource pool assigned when a new VM is cloned.
+	ProxmoxPool string
+
 	// NICs sets the cloned VM's network interfaces. Empty leaves
 	// the template's NICs in place — production typically lists
 	// at least net0 even for the default profile to disambiguate
@@ -2228,6 +2231,7 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 		MemoryMB:      prep.ps.settings.MemoryMB,
 		DiskGB:        prep.ps.settings.DiskGB,
 		Storage:       prep.ps.settings.Storage,
+		ProxmoxPool:   prep.ps.settings.ProxmoxPool,
 		NICs:          prep.ps.settings.NICs,
 		IPConfig:      prep.ipConfig,
 	})

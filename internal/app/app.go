@@ -1490,6 +1490,7 @@ func profileSettingsForScaleset(ss config.ScaleSetEntry, cfg *config.Config) []p
 			MemoryMB:             p.MemoryMB,
 			DiskGB:               p.DiskGB,
 			Storage:              p.Storage,
+			ProxmoxPool:          p.ProxmoxPool,
 			NICs:                 nicsFromProfileNetwork(cfg, p),
 			IPAM:                 ipamFromProfileNetwork(p, slog.Default()),
 		})

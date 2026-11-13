@@ -729,13 +729,14 @@ func TestProfileSettingsForScaleset(t *testing.T) {
 		MaxConcurrentRunners: 10,
 		Profiles: []config.ProfileConfig{
 			{Name: "default"}, // inherits global sizes
-			{Name: "gpu", HotSize: intp(0), WarmSize: intp(1), TemplateVMID: 9001, CPUCores: 8},
+			{Name: "gpu", HotSize: intp(0), WarmSize: intp(1), TemplateVMID: 9001, CPUCores: 8, ProxmoxPool: "ci/gpu"},
 		},
 	}
 	got := profileSettingsForScaleset(entry, cfg)
 	require.Len(t, got, 2)
 
 	require.Equal(t, "default", got[0].Name)
+	require.Empty(t, got[0].ProxmoxPool)
 	require.Equal(t, 2, got[0].HotSize, "default profile inherits global hot_size")
 	require.Equal(t, 5, got[0].WarmSize, "default profile inherits global warm_size")
 	require.Equal(t, 10, got[0].MaxConcurrentRunners, "profile inherits the entry's concurrency cap")
@@ -747,6 +748,7 @@ func TestProfileSettingsForScaleset(t *testing.T) {
 	require.Equal(t, 1, got[1].WarmSize)
 	require.Equal(t, 9001, got[1].TemplateVMID)
 	require.Equal(t, 8, got[1].CPUCores)
+	require.Equal(t, "ci/gpu", got[1].ProxmoxPool)
 }
 
 // TestNicsFromProfileNetwork pins the NIC layering: no network block
