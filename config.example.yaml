@@ -319,6 +319,11 @@ pool:
   # the signal to mark the row completed and queue destroy. Lower =
   # snappier end-of-job tail; higher = lighter Proxmox load.
   power_poll_interval: 3s
+  # Opt in only while investigating suspicious assigned Windows runners.
+  # Holds at most one VM for operator inspection; never deletes evidence on a timer.
+  quarantine_suspicious_windows: false
+  # Required when enabled: a durable, writable volume shared by all leaders.
+  # quarantine_journal_dir: /var/lib/scaleset/quarantine
 
   # Minimum time after a destroy completes before the VMID allocator
   # may reissue the same ID. Protects against PVE-side qmdestroy task

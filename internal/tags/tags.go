@@ -48,7 +48,28 @@ const (
 	// TemplateCandidate is the template-class value for clones
 	// that used the staging template during a canary rollout.
 	TemplateCandidate = "candidate"
+
+	// QuarantinePrefix marks a protected VM retained for operator inspection.
+	// The decimal suffix is the UTC Unix time at which the hold became due
+	// for review. Expiry is a notification, not permission to delete evidence.
+	QuarantinePrefix = "gh-quarantine-until-"
 )
+
+// QuarantineTag encodes an operator-review deadline in a PVE-safe tag.
+func QuarantineTag(unix int64) string {
+	return fmt.Sprintf("%s%d", QuarantinePrefix, unix)
+}
+
+// HasQuarantine identifies the marker even when malformed. Fail closed: a
+// corrupt marker must not make a retained VM eligible for automated cleanup.
+func HasQuarantine(wireTags string) bool {
+	for _, t := range Decode(wireTags) {
+		if strings.HasPrefix(t, QuarantinePrefix) {
+			return true
+		}
+	}
+	return false
+}
 
 // scaleSetNameRE is what we accept for an unsanitized scale set name.
 var scaleSetNameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$`)

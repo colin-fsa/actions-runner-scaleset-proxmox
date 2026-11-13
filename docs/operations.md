@@ -155,6 +155,47 @@ observability:
   log_format: json                    # json | text
 ```
 
+### Inspecting a retained Windows runner
+
+`pool.quarantine_suspicious_windows: true` opts in to holding at most one per
+controller. Enabling it requires no more than one Windows scale set in that
+controller; separate independently deployed controllers are not coordinated.
+It retains a Windows VM that is stopped while assigned or still running when the reconciler
+would otherwise destroy it for never registering or going offline before an
+observed job start. It is a diagnostic candidate, not proof that the job
+failed. The controller tags and protects the VM in Proxmox; the normal orphan
+cleanup attempts to remove any runner registration. The VM does not return to
+the pool. Other candidates continue through normal cleanup while the slot is
+occupied.
+The retained VM conservatively consumes one admission-cap slot until cleared,
+because its job-start event might have been missed. It is not counted as useful
+running work when calculating desired pool replenishment.
+
+Set `pool.quarantine_journal_dir` to an absolute path on a durable writable
+volume, shared by every potential leader. The feature will not start without
+the directory. This journal records the VM identity before the Proxmox update
+so a failed or uncertain protection request can be retried after a restart.
+The existing read-only configuration mount is not suitable for this purpose.
+
+The tag records a one-hour review deadline, not automatic deletion. Once the
+deadline passes, the controller logs an overdue warning every 30 minutes. An
+operator must inspect the guest or disk and explicitly authorize cleanup. A running VM
+is not forcibly stopped. Its single intended JIT job can still start or finish
+before deregistration completes; the reconciler does not remove a runner that
+GitHub reports as busy. If the
+journal cannot be written, the pending reservation is only in memory: treat
+that error as requiring immediate operator attention and do not restart until
+the durable record and Proxmox protection are confirmed. Keep the journal
+volume configured even if disabling new captures, until existing holds have
+been explicitly inspected and cleared.
+
+After authorized inspection and separate operator removal of the VM and disk,
+`POST /admin/quarantine/{vmid}/forget` clears only the controller's journal and
+bookkeeping. It checks the cluster-wide allocator first and refuses while the
+VMID exists. It does not delete a VM or disk. The namespaced form is
+`POST /admin/{scaleset}/quarantine/{vmid}/forget`; the admin API remains
+disabled unless explicitly configured and authenticated.
+
 ## Admin API
 
 An optional escape hatch, enabled by setting `admin_api.http_addr` and

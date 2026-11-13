@@ -477,7 +477,7 @@ func (s *Store) AcquireHot(jobID int64, maxConcurrent, maxBusy int) (*VM, error)
 	return s.AcquireHotInProfile("", jobID, maxConcurrent, maxBusy)
 }
 
-// countBusy counts rows in StateAssigned + StateRunning inside the
+// countBusy counts assigned, running, and quarantined rows inside the
 // supplied transaction. Empty profile == fleet-wide count via the
 // "state" index; a non-empty profile uses the "profile_state"
 // composite index. Callers MUST pass the active write txn so the
@@ -496,7 +496,9 @@ func countBusy(txn *memdb.Txn, profile string) (int, error) {
 		scope = profile + "/"
 	}
 	busy := 0
-	for _, st := range []State{StateAssigned, StateRunning} {
+	// A quarantined guest may still be executing a job whose start event was
+	// delayed. Reserve one busy slot until an operator clears the hold.
+	for _, st := range []State{StateAssigned, StateRunning, StateQuarantined} {
 		args := append(append([]any{}, prefix...), string(st))
 		it, err := txn.Get(tableVM, index, args...)
 		if err != nil {

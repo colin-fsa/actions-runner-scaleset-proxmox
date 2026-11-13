@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -124,7 +125,9 @@ type Config struct {
 	// VM appears stopped, the row is queued for destruction — this is
 	// the orchestrator's "job completed" signal in lieu of the deleted
 	// in-VM runner-hook. Zero falls back to a sane default (3s).
-	PowerPollInterval time.Duration
+	PowerPollInterval           time.Duration
+	QuarantineSuspiciousWindows bool
+	QuarantineJournalDir        string
 
 	// RecycleMode selects the post-job VM lifecycle:
 	// config.RecycleModeDestroy (the default for the empty string) or
@@ -276,6 +279,14 @@ type manager struct {
 	sel     nodeselector.Selector
 	log     *slog.Logger
 	metrics *observability.Metrics
+	// Serializes a quarantine claim with destructive/assignment transitions.
+	quarantineMu sync.Mutex
+	// pendingProtection holds review deadlines for captures needing PVE protection.
+	pendingProtection       map[int]time.Time
+	quarantineJournal       *quarantineJournal
+	quarantineErrorLastLog  map[int]time.Time
+	quarantineReview        map[int]time.Time
+	quarantineReviewLastLog map[int]time.Time
 
 	// profiles is the per-profile state keyed by ProfileSettings.Name.
 	// At least one entry — NewManager synthesises a default profile
@@ -504,6 +515,28 @@ func NewManager(cfg Config, st *store.Store, prov provisioner.Provisioner, sel n
 		m.profiles[p.Name] = ps
 		m.profileOrder = append(m.profileOrder, p.Name)
 	}
+	if cfg.QuarantineSuspiciousWindows || cfg.QuarantineJournalDir != "" {
+		journal, err := newQuarantineJournal(cfg.QuarantineJournalDir, cfg.ScaleSetName)
+		if err != nil {
+			wcancel()
+			return nil, err
+		}
+		rec, err := journal.load()
+		if err != nil {
+			wcancel()
+			return nil, err
+		}
+		m.quarantineJournal = journal
+		if rec != nil {
+			row := &store.VM{VMID: rec.VMID, Node: rec.Node, Name: rec.Name, Profile: rec.Profile, RunnerID: rec.RunnerID, PoolKind: store.PoolKindHot, State: store.StateQuarantined}
+			if err := st.Insert(row); err != nil {
+				wcancel()
+				return nil, fmt.Errorf("restore quarantine journal: %w", err)
+			}
+			m.pendingProtection = map[int]time.Time{rec.VMID: rec.ReviewAt}
+			m.quarantineReview = map[int]time.Time{rec.VMID: rec.ReviewAt}
+		}
+	}
 	go m.destroyDispatcher()
 	return m, nil
 }
@@ -703,6 +736,7 @@ func statsFromRaw(raw map[store.State]int) Stats {
 		Draining:     raw[store.StateDraining],
 		Destroying:   raw[store.StateDestroying],
 		Poison:       raw[store.StatePoison],
+		Quarantined:  raw[store.StateQuarantined],
 	}
 }
 
@@ -856,6 +890,8 @@ func (m *manager) StampJobMetadata(_ context.Context, vmid int, meta JobMetadata
 
 // MarkRunning transitions Assigned → Running and stamps the runner ID.
 func (m *manager) MarkRunning(_ context.Context, vmid int, runnerID int64) error {
+	m.quarantineMu.Lock()
+	defer m.quarantineMu.Unlock()
 	ok, err := m.store.UpdateState(vmid, store.StateAssigned, store.StateRunning, func(v *store.VM) {
 		v.RunnerID = runnerID
 	})
@@ -875,6 +911,8 @@ func (m *manager) MarkRunning(_ context.Context, vmid int, runnerID int64) error
 // job before we even observed the assignment). A row already past Running
 // is left alone — this method is idempotent.
 func (m *manager) PromoteToRunning(_ context.Context, vmid int, runnerID, jobID int64) error {
+	m.quarantineMu.Lock()
+	defer m.quarantineMu.Unlock()
 	ok, err := m.store.UpdateStateIn(vmid,
 		[]store.State{store.StateAssigned, store.StateHot},
 		store.StateRunning,
@@ -905,7 +943,38 @@ func (m *manager) PromoteToRunning(_ context.Context, vmid int, runnerID, jobID 
 // already Draining/Destroying) observe ok == false and return cleanly,
 // so we don't double-call prov.Destroy or burn duplicate Proxmox /
 // GitHub API budget.
-func (m *manager) ForceDestroy(_ context.Context, vmid int, reason string) error {
+func (m *manager) ForceDestroy(ctx context.Context, vmid int, reason string) error {
+	m.quarantineMu.Lock()
+	defer m.quarantineMu.Unlock()
+	if row, err := m.store.Get(vmid); err == nil && row.State == store.StateQuarantined {
+		return ErrQuarantineHeld
+	}
+	// The reconciler can discover an offline assigned runner before the
+	// power poller sees it. Preserve the same stopped Windows candidate
+	// here, rather than allowing that race to bypass quarantine.
+	if m.cfg.QuarantineSuspiciousWindows && strings.HasPrefix(reason, "assigned:") {
+		row, err := m.store.Get(vmid)
+		if err == nil && row.State == store.StateAssigned {
+			if ps := m.profileOf(row.Profile); ps != nil && ps.settings.GuestOS == "windows" {
+				qctx, cancel := context.WithTimeout(ctx, powerPollTimeoutPerVM)
+				state, stateErr := m.prov.PowerState(qctx, &provisioner.VM{VMID: row.VMID, Node: row.Node, Name: row.Name, Profile: row.Profile})
+				cancel()
+				if stateErr != nil {
+					return fmt.Errorf("force destroy: cannot safely inspect quarantine candidate: %w", stateErr)
+				}
+				if state == "" {
+					return errors.New("force destroy: quarantine candidate power state is unknown")
+				}
+				// A live, unregistered/offline guest may hold the evidence we
+				// need. Retain it without stopping it. If it is actually busy,
+				// GitHub cleanup must wait until it is no longer busy.
+				liveCandidate := state == "running" && (reason == "assigned: runner never registered on GitHub" || reason == "assigned: runner registered then went offline")
+				if (state == "stopped" || liveCandidate) && m.quarantineCandidateLocked(ctx, vmid) {
+					return ErrQuarantineHeld
+				}
+			}
+		}
+	}
 	from := []store.State{
 		store.StateProvisioning,
 		store.StateWarm,
@@ -946,6 +1015,8 @@ func (m *manager) ForceDestroy(_ context.Context, vmid int, reason string) error
 // reason (lookup miss, wrong state) when the transition is not
 // applied.
 func (m *manager) Preempt(_ context.Context, vmid int, reason string) error {
+	m.quarantineMu.Lock()
+	defer m.quarantineMu.Unlock()
 	target, err := m.store.Get(vmid)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -1038,6 +1109,8 @@ func (m *manager) ListRows(_ context.Context) ([]RowSnapshot, error) {
 // no-op return (the existing rollback/destroy goroutine handles
 // cleanup).
 func (m *manager) MarkCompleted(_ context.Context, vmid int) error {
+	m.quarantineMu.Lock()
+	defer m.quarantineMu.Unlock()
 	target, err := m.store.Get(vmid)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -1053,6 +1126,8 @@ func (m *manager) MarkCompleted(_ context.Context, vmid int) error {
 		// refill in case the previous rollback/destroy is mid-flight
 		// and the freed slot hasn't been announced yet.
 		m.SignalRefill()
+		return nil
+	case store.StateQuarantined:
 		return nil
 	case store.StateProvisioning,
 		store.StateWarm,
@@ -1189,13 +1264,20 @@ func (m *manager) Adopt(ctx context.Context) error {
 // store. Extracted so the per-VM error paths can `return` cleanly
 // without leaking the loop control structure into the classification.
 func (m *manager) adoptOne(ctx context.Context, pv *provisioner.VM, runners map[string]RunnerInfo) {
+	// A journal-restored hold must win over approximate adoption, even when
+	// the Proxmox marker write failed before the previous process stopped.
+	if row, err := m.store.Get(pv.VMID); err == nil && row.State == store.StateQuarantined {
+		return
+	}
 	state, kind, runnerID := m.classifyAdoption(ctx, pv, runners)
 	profile := pv.Profile
 	unknownProfile := profile != "" && m.profileOf(profile) == nil
 	if profile == "" || unknownProfile {
 		profile = m.defaultProfile()
 	}
-	if unknownProfile {
+	if pv.Quarantined {
+		state = store.StateQuarantined
+	} else if unknownProfile {
 		m.log.Warn("adopt: unknown profile; destroying inherited vm", "vmid", pv.VMID, "profile", pv.Profile)
 		state = store.StateDestroying
 	} else if ps := m.profileOf(profile); ps != nil && ps.settings.GuestOS == "windows" {
@@ -1482,6 +1564,8 @@ var adoptPowerStateTimeoutPerVM = 10 * time.Second
 // the time-based Run loop. Each per-VM PowerState call is bounded by
 // powerPollTimeoutPerVM so a single hung node can't freeze the poller.
 func (m *manager) powerPollOnce(ctx context.Context) {
+	m.retryQuarantineProtection(ctx)
+	m.warnOverdueQuarantines()
 	rows, err := m.store.ListByState(store.StateAssigned, store.StateRunning)
 	if err != nil {
 		m.log.Warn("power-poll: list rows failed", "err", err)
@@ -1514,6 +1598,15 @@ func (m *manager) powerPollOnce(ctx context.Context) {
 		if state == "" || state == "running" {
 			continue
 		}
+		// Only Assigned Windows VMs that stopped before an observed job start
+		// are candidates. The state is suspicious, not proof of a failed job.
+		if m.cfg.QuarantineSuspiciousWindows && state == "stopped" && row.State == store.StateAssigned {
+			if ps := m.profileOf(row.Profile); ps != nil && ps.settings.GuestOS == "windows" {
+				if held := m.quarantineCandidate(ctx, row.VMID); held {
+					continue
+				}
+			}
+		}
 		// Anything else ("stopped", "paused", ...) signals the job is
 		// no longer executing. MarkCompleted is idempotent and refuses
 		// rows already in Draining/Destroying, so a duplicate poll
@@ -1538,6 +1631,165 @@ func (m *manager) powerPollOnce(ctx context.Context) {
 			delete(m.powerPollErrLastLog, vmid)
 		}
 	}
+}
+
+// quarantineCandidate preserves one suspicious assigned Windows runner before
+// normal cleanup. A reservation is made, then journaled before requesting the
+// PVE protection+tag. A failure is retried by the next power poll. A full
+// one-VM quarantine falls back to normal cleanup. If journal writing itself
+// fails, the reservation remains only in memory until a retry succeeds.
+// The review deadline is informational; evidence is never auto-deleted.
+func (m *manager) quarantineCandidate(ctx context.Context, vmid int) bool {
+	m.quarantineMu.Lock()
+	defer m.quarantineMu.Unlock()
+	return m.quarantineCandidateLocked(ctx, vmid)
+}
+
+func (m *manager) quarantineCandidateLocked(ctx context.Context, vmid int) bool {
+	row, err := m.store.Get(vmid)
+	if err != nil || row.State != store.StateAssigned {
+		return true
+	}
+	held, err := m.store.ListByState(store.StateQuarantined)
+	if err != nil {
+		m.log.Warn("quarantine: list failed; preserving candidate", "vmid", vmid, "err", err)
+		return true
+	}
+	if len(held) > 0 {
+		return false
+	}
+	// Reserve the only slot before making an external call. Otherwise a
+	// timeout or a failed protection call leaves the row Assigned and a
+	// concurrent orphan cleanup can destroy the evidence.
+	claimed, err := m.store.UpdateState(vmid, store.StateAssigned, store.StateQuarantined, nil)
+	if err != nil || !claimed {
+		m.log.Error("quarantine: unable to reserve candidate", "vmid", vmid, "err", err)
+		return true
+	}
+	if m.pendingProtection == nil {
+		m.pendingProtection = make(map[int]time.Time)
+	}
+	m.pendingProtection[vmid] = time.Now().UTC().Add(time.Hour)
+	if m.quarantineReview == nil {
+		m.quarantineReview = make(map[int]time.Time)
+	}
+	m.quarantineReview[vmid] = m.pendingProtection[vmid]
+	return m.protectQuarantineLocked(ctx, row)
+}
+
+// protectQuarantineLocked retries an already-reserved candidate. Caller holds
+// quarantineMu; failure leaves the reservation intact for the next poll.
+func (m *manager) protectQuarantineLocked(ctx context.Context, row *store.VM) bool {
+	vmid := row.VMID
+	reviewAt := m.pendingProtection[vmid]
+	if m.quarantineJournal != nil {
+		if err := m.quarantineJournal.save(row, reviewAt); err != nil {
+			m.logQuarantineRetry(vmid, "durable journal write failed; holding only in memory", err)
+			return true
+		}
+	}
+	qp, ok := m.prov.(interface {
+		Quarantine(context.Context, *provisioner.VM, time.Time) error
+	})
+	if !ok {
+		m.log.Error("quarantine: provider unsupported; preserving candidate", "vmid", vmid)
+		return true
+	}
+	qctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	err := qp.Quarantine(qctx, &provisioner.VM{VMID: row.VMID, Node: row.Node, Name: row.Name, Profile: row.Profile}, reviewAt)
+	cancel()
+	if err != nil {
+		m.logQuarantineRetry(vmid, "protect/tag failed; preserving candidate", err)
+		return true
+	}
+	delete(m.pendingProtection, vmid)
+	delete(m.quarantineErrorLastLog, vmid)
+	m.log.Warn("quarantine: runner retained for inspection", "vmid", vmid, "node", row.Node, "runner_id", row.RunnerID, "requested_review_at", reviewAt)
+	m.SignalRefill()
+	return true
+}
+
+// Caller holds quarantineMu. Avoid filling Docker logs while an unavailable
+// service is retried on every power-poll tick.
+func (m *manager) logQuarantineRetry(vmid int, message string, err error) {
+	if m.quarantineErrorLastLog == nil {
+		m.quarantineErrorLastLog = make(map[int]time.Time)
+	}
+	if last, ok := m.quarantineErrorLastLog[vmid]; ok && time.Since(last) < 30*time.Second {
+		return
+	}
+	m.quarantineErrorLastLog[vmid] = time.Now()
+	m.log.Warn("quarantine: "+message, "vmid", vmid, "err", err)
+}
+
+func (m *manager) retryQuarantineProtection(ctx context.Context) {
+	m.quarantineMu.Lock()
+	defer m.quarantineMu.Unlock()
+	for vmid := range m.pendingProtection {
+		row, err := m.store.Get(vmid)
+		if err != nil || row.State != store.StateQuarantined {
+			m.log.Error("quarantine: pending reservation missing", "vmid", vmid, "err", err)
+			continue
+		}
+		m.protectQuarantineLocked(ctx, row)
+	}
+}
+
+func (m *manager) warnOverdueQuarantines() {
+	m.quarantineMu.Lock()
+	defer m.quarantineMu.Unlock()
+	if m.quarantineReviewLastLog == nil {
+		m.quarantineReviewLastLog = make(map[int]time.Time)
+	}
+	now := time.Now().UTC()
+	for vmid, deadline := range m.quarantineReview {
+		if now.Before(deadline) || now.Sub(m.quarantineReviewLastLog[vmid]) < 30*time.Minute {
+			continue
+		}
+		m.quarantineReviewLastLog[vmid] = now
+		m.log.Warn("quarantine: inspection deadline passed; VM retained until operator action", "vmid", vmid, "review_at", deadline)
+	}
+}
+
+// ForgetQuarantine releases only controller bookkeeping after the operator has
+// separately inspected and removed the VM. It never deletes a VM or its disk.
+func (m *manager) ForgetQuarantine(ctx context.Context, vmid int) error {
+	m.quarantineMu.Lock()
+	defer m.quarantineMu.Unlock()
+	row, err := m.store.Get(vmid)
+	if err != nil {
+		return fmt.Errorf("forget quarantine: lookup: %w", err)
+	}
+	if row.State != store.StateQuarantined {
+		return fmt.Errorf("forget quarantine: VM %d is not quarantined", vmid)
+	}
+	checker, ok := m.prov.(interface {
+		QuarantineVMIDFree(context.Context, int) (bool, error)
+	})
+	if !ok {
+		return errors.New("forget quarantine: cluster-wide VMID check unavailable")
+	}
+	free, err := checker.QuarantineVMIDFree(ctx, vmid)
+	if err != nil {
+		return fmt.Errorf("forget quarantine: cluster-wide VMID check: %w", err)
+	}
+	if !free {
+		return ErrQuarantineVMExists
+	}
+	if m.quarantineJournal != nil {
+		if err := m.quarantineJournal.remove(vmid); err != nil {
+			return err
+		}
+	}
+	if err := m.store.Delete(vmid); err != nil {
+		return fmt.Errorf("forget quarantine: delete bookkeeping: %w", err)
+	}
+	delete(m.pendingProtection, vmid)
+	delete(m.quarantineErrorLastLog, vmid)
+	delete(m.quarantineReview, vmid)
+	delete(m.quarantineReviewLastLog, vmid)
+	m.SignalRefill()
+	return nil
 }
 
 // reconcileOnce is kept as a thin wrapper that delegates to the

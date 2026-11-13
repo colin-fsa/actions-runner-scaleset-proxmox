@@ -79,6 +79,51 @@ type VM struct {
 	Node    string
 	Name    string
 	Profile string
+	// Quarantined is derived from the persistent PVE marker, never guest input.
+	Quarantined bool
+}
+
+// Quarantine protects a stopped VM and marks it for operator inspection.
+// It deliberately does not expose or read JIT configuration or credentials.
+func (p *pmox) Quarantine(ctx context.Context, vm *VM, reviewAt time.Time) error {
+	pvm, err := p.getVM(ctx, vm)
+	if err != nil {
+		return fmt.Errorf("quarantine: resolve vm: %w", err)
+	}
+	if err := pvm.Ping(ctx); err != nil {
+		return fmt.Errorf("quarantine: read config: %w", err)
+	}
+	if pvm.Status != proxmox.StatusVirtualMachineStopped && pvm.Status != proxmox.StatusVirtualMachineRunning {
+		return fmt.Errorf("quarantine: vm %d has unsupported power state %q", vm.VMID, pvm.Status)
+	}
+	cfg := pvm.VirtualMachineConfig
+	if cfg == nil || cfg.Digest == "" {
+		return errors.New("quarantine: missing config digest")
+	}
+	all := tags.Decode(cfg.Tags)
+	// A timed-out request may already have succeeded. Preserve its original
+	// deadline rather than adding another marker or extending the hold.
+	if !tags.HasQuarantine(cfg.Tags) {
+		all = append(all, tags.QuarantineTag(reviewAt.Unix()))
+	}
+	if err := pvm.ConfigSync(ctx,
+		proxmox.VirtualMachineOption{Name: "tags", Value: tags.Encode(all)},
+		proxmox.VirtualMachineOption{Name: "protection", Value: 1},
+		proxmox.VirtualMachineOption{Name: "digest", Value: cfg.Digest},
+	); err != nil {
+		return fmt.Errorf("quarantine: protect and tag: %w", err)
+	}
+	return nil
+}
+
+// QuarantineVMIDFree checks the cluster-wide allocator, not just a node's
+// visible VMs, before an operator can forget a retained slot.
+func (p *pmox) QuarantineVMIDFree(ctx context.Context, vmid int) (bool, error) {
+	cluster, err := p.cli.Cluster(ctx)
+	if err != nil {
+		return false, err
+	}
+	return cluster.CheckID(ctx, vmid)
 }
 
 // CloneOptions are passed to [Provisioner.Clone]. NewVMID is allocated by
@@ -1221,7 +1266,7 @@ func (p *pmox) classifyVM(v *proxmox.VirtualMachine, node string) (*VM, bool) {
 	if owned {
 		profile = tags.ProfileOf(v.Tags)
 	}
-	return &VM{VMID: vmid, Node: node, Name: v.Name, Profile: profile}, true
+	return &VM{VMID: vmid, Node: node, Name: v.Name, Profile: profile, Quarantined: tags.HasQuarantine(v.Tags)}, true
 }
 
 // getVM resolves *VM into the library's *proxmox.VirtualMachine.

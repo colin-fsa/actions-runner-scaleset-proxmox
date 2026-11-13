@@ -613,6 +613,13 @@ type PoolConfig struct {
 	// Default "3s"; must be > 0.
 	PowerPollInterval Duration `yaml:"power_poll_interval"`
 
+	// QuarantineSuspiciousWindows preserves at most one suspicious Windows VM
+	// in Assigned state before a job-start event. Off by default.
+	// The marker includes a review deadline; this version never deletes the evidence.
+	QuarantineSuspiciousWindows bool `yaml:"quarantine_suspicious_windows"`
+	// QuarantineJournalDir must be a durable writable volume shared by leaders.
+	QuarantineJournalDir string `yaml:"quarantine_journal_dir"`
+
 	// VMIDReuseCooldown is the minimum time after a destroy completes
 	// before the allocator may reissue the same VMID. Protects against
 	// PVE-side qmdestroy task settle / lock-file contention when a fresh
@@ -1673,6 +1680,23 @@ func (c *Config) resolveNodeSelector() error {
 
 // resolvePool checks the pool duration knobs and the recycle-mode enum.
 func (c *Config) resolvePool() error {
+	if c.Pool.QuarantineSuspiciousWindows && c.Pool.QuarantineJournalDir == "" {
+		return errors.New("pool.quarantine_journal_dir is required when Windows quarantine is enabled")
+	}
+	if c.Pool.QuarantineSuspiciousWindows {
+		windowsSets := 0
+		for _, set := range c.Scalesets {
+			for _, profile := range set.Profiles {
+				if profile.GuestOS == "windows" {
+					windowsSets++
+					break
+				}
+			}
+		}
+		if windowsSets > 1 {
+			return errors.New("Windows quarantine supports at most one Windows scale set per controller")
+		}
+	}
 	// Duration knobs that must be strictly positive. ApplyDefaults
 	// already substituted defaults for unset fields; the only way to
 	// fail here is an explicit non-positive value in YAML/env (e.g.

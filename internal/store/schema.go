@@ -29,6 +29,8 @@ const (
 	StateDraining   State = "draining"
 	StateDestroying State = "destroying"
 	StatePoison     State = "poison"
+	// StateQuarantined reserves a protected stopped VM for inspection.
+	StateQuarantined State = "quarantined"
 )
 
 // PoolKind is the pool budget a VM counts toward.
@@ -53,6 +55,7 @@ var AllStates = []State{
 	StateDraining,
 	StateDestroying,
 	StatePoison,
+	StateQuarantined,
 }
 
 // VM is a single Proxmox virtual machine the scaleset is managing.

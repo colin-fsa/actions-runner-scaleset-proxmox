@@ -30,6 +30,15 @@ func TestNew_EmptyStore(t *testing.T) {
 	require.Empty(t, rows)
 }
 
+func TestQuarantineReservesBusyCapacity(t *testing.T) {
+	st, err := store.New()
+	require.NoError(t, err)
+	require.NoError(t, st.Insert(newVM(10001, store.StateQuarantined)))
+	require.NoError(t, st.Insert(newVM(10002, store.StateHot)))
+	_, err = st.AcquireHot(42, 1, 0)
+	require.ErrorIs(t, err, store.ErrAtCapacity)
+}
+
 func TestInsert_StampsTimestamps(t *testing.T) {
 	t.Parallel()
 	s, err := store.New()

@@ -46,6 +46,49 @@ type fakePool struct {
 	preemptErr      error
 }
 
+type fakeQuarantinePool struct {
+	*fakePool
+	forgetErr error
+	forgotten int
+	forceErr  error
+}
+
+func (f *fakeQuarantinePool) ForgetQuarantine(_ context.Context, vmid int) error {
+	f.forgotten = vmid
+	return f.forgetErr
+}
+
+func (f *fakeQuarantinePool) ForceDestroy(_ context.Context, _ int, _ string) error {
+	return f.forceErr
+}
+
+func TestForgetQuarantineRefusesExistingVM(t *testing.T) {
+	fp := &fakeQuarantinePool{fakePool: &fakePool{}, forgetErr: pool.ErrQuarantineVMExists}
+	s, err := New(Config{HTTPAddr: "ignored", SharedSecret: "topsecret"}, func() pool.Manager { return fp }, nil, AlwaysLeader{}, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	require.NoError(t, err)
+	router := chi.NewRouter()
+	router.Post("/admin/quarantine/{vmid}/forget", s.handleForgetQuarantine)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/admin/quarantine/10042/forget", nil))
+	require.Equal(t, http.StatusConflict, w.Code)
+	require.Equal(t, 10042, fp.forgotten)
+	fp.forgetErr = nil
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/admin/quarantine/10042/forget", nil))
+	require.Equal(t, http.StatusNoContent, w.Code)
+}
+
+func TestAdminDestroyReportsQuarantineHeld(t *testing.T) {
+	fp := &fakeQuarantinePool{fakePool: &fakePool{}, forceErr: pool.ErrQuarantineHeld}
+	s, err := New(Config{HTTPAddr: "ignored", SharedSecret: "topsecret"}, func() pool.Manager { return fp }, nil, AlwaysLeader{}, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	require.NoError(t, err)
+	router := chi.NewRouter()
+	router.Post("/admin/destroy/{vmid}", s.handleDestroyVM)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/admin/destroy/10042", nil))
+	require.Equal(t, http.StatusConflict, w.Code)
+}
+
 func (f *fakePool) Acquire(_ context.Context, _ int64, _ int) (*pool.VM, error) {
 	return nil, pool.ErrNoneAvailable
 }

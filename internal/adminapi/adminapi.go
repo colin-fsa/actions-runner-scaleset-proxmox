@@ -420,6 +420,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	r.Get("/admin/state", s.handleState)
 	r.Post("/admin/drain", s.handleDrain)
 	r.Post("/admin/destroy/{vmid}", s.handleDestroyVM)
+	r.Post("/admin/quarantine/{vmid}/forget", s.handleForgetQuarantine)
 	r.Post("/admin/preempt/{vmid}", s.handlePreemptVM)
 	r.Post("/admin/template/promote/{profile}", s.handlePromoteTemplate)
 	// Namespaced multi-scaleset paths (issue #1). Drain stays
@@ -427,6 +428,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	// distinct from "shut the orchestrator down".
 	r.Get("/admin/{scaleset}/state", s.handleState)
 	r.Post("/admin/{scaleset}/destroy/{vmid}", s.handleDestroyVM)
+	r.Post("/admin/{scaleset}/quarantine/{vmid}/forget", s.handleForgetQuarantine)
 	r.Post("/admin/{scaleset}/preempt/{vmid}", s.handlePreemptVM)
 	r.Post("/admin/{scaleset}/template/promote/{profile}", s.handlePromoteTemplate)
 
@@ -789,6 +791,10 @@ func (s *Server) handleDestroyVM(w http.ResponseWriter, r *http.Request) {
 	// effect. ForceDestroy is the unconditional drop the endpoint
 	// promises.
 	if err := p.ForceDestroy(r.Context(), vmid, "admin destroy endpoint"); err != nil {
+		if errors.Is(err, pool.ErrQuarantineHeld) {
+			http.Error(w, "VM is quarantined; inspect and remove it separately", http.StatusConflict)
+			return
+		}
 		s.log.Error("admin destroy: force destroy failed", "vmid", vmid, "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -800,4 +806,30 @@ func (s *Server) handleDestroyVM(w http.ResponseWriter, r *http.Request) {
 			"endpoint", "POST /admin/destroy/{vmid}", "vmid", vmid,
 			"remote_addr", r.RemoteAddr, "err", err)
 	}
+}
+
+// handleForgetQuarantine clears bookkeeping only after an operator separately
+// removed the VM. The pool verifies cluster-wide VMID availability first.
+func (s *Server) handleForgetQuarantine(w http.ResponseWriter, r *http.Request) {
+	vmid, p, ok := s.parseVMIDAndPool(w, r)
+	if !ok {
+		return
+	}
+	forgetter, ok := p.(interface {
+		ForgetQuarantine(context.Context, int) error
+	})
+	if !ok {
+		http.Error(w, "quarantine forget unavailable", http.StatusNotImplemented)
+		return
+	}
+	if err := forgetter.ForgetQuarantine(r.Context(), vmid); err != nil {
+		if errors.Is(err, pool.ErrQuarantineVMExists) {
+			http.Error(w, "VM still exists; inspect and remove it separately first", http.StatusConflict)
+			return
+		}
+		s.log.Error("forget quarantine failed", "vmid", vmid, "err", err)
+		http.Error(w, "could not verify or clear quarantine", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }

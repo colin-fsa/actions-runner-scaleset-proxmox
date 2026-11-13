@@ -724,6 +724,31 @@ func TestSweepProxmoxOrphans_RespectsOrphanGrace(t *testing.T) {
 		"past grace, the genuine orphan must be destroyed")
 }
 
+func TestSweepProxmoxOrphansPreservesQuarantineMarker(t *testing.T) {
+	srv := runnersServer(t, []fakeRunner{})
+	defer srv.Close()
+	prov := &stubProv{owned: []*provisioner.VM{{VMID: 4001, Node: "pve1", Name: "gh-runner-test-4001", Quarantined: true}}}
+	r, err := New(baseCfg(), newTestClient(t, srv), &fakeManager{rows: nil}, prov, silentLogger(), nil)
+	require.NoError(t, err)
+	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	r.now = func() time.Time { return t0 }
+	r.sweepProxmoxOrphans(context.Background(), nil)
+	r.now = func() time.Time { return t0.Add(2 * baseCfg().OrphanGrace) }
+	r.sweepProxmoxOrphans(context.Background(), nil)
+	require.Empty(t, prov.destroys)
+}
+
+func TestQuarantinedBusyRunnerIsNotTreatedAsOrphan(t *testing.T) {
+	ghCli, err := github.NewClient()
+	require.NoError(t, err)
+	r, err := New(baseCfg(), ghCli, &fakeManager{}, &stubProv{}, silentLogger(), nil)
+	require.NoError(t, err)
+	r.cleanupOrphanRunners(context.Background(), []pool.RowSnapshot{{Name: "gh-runner-test-1", State: "quarantined"}}, map[string]pool.RunnerInfo{
+		"gh-runner-test-1": {ID: 1, Online: true, Busy: true},
+	}, false)
+	require.NotContains(t, r.orphanFirstSeen, "gh-runner-test-1")
+}
+
 // TestSweepProxmoxOrphans_PreservesEntryWhenDestroyFails: if the
 // destroy call to PVE fails (transient PVE error, locked .conf, etc.),
 // the orphan-first-seen entry must remain so the NEXT tick retries.

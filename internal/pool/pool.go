@@ -47,7 +47,9 @@ var (
 	// so callers can log "we tried but the lowest-weight VM had
 	// already started its job" without conflating it with "the
 	// pool was empty".
-	ErrPreemptRefused = errors.New("pool: preempt refused (vm not in Assigned state)")
+	ErrPreemptRefused     = errors.New("pool: preempt refused (vm not in Assigned state)")
+	ErrQuarantineVMExists = errors.New("pool: cannot forget quarantine while VMID exists")
+	ErrQuarantineHeld     = errors.New("pool: VM is quarantined and cannot be force-destroyed")
 )
 
 // Stats summarises the pool's current population.
@@ -62,12 +64,13 @@ type Stats struct {
 	Draining     int
 	Destroying   int
 	Poison       int
+	Quarantined  int
 }
 
 // Total returns the sum of all non-terminal states.
 func (s Stats) Total() int {
 	return s.Provisioning + s.Warm + s.Booting + s.Hot +
-		s.Assigned + s.Running + s.Recycling + s.Draining + s.Destroying + s.Poison
+		s.Assigned + s.Running + s.Recycling + s.Draining + s.Destroying + s.Poison + s.Quarantined
 }
 
 // Available returns the count of VMs that ARE or WILL BE acquirable from
@@ -81,7 +84,9 @@ func (s Stats) Available() int {
 	return s.Hot + s.Booting
 }
 
-// Busy returns the count of VMs currently serving a job.
+// Busy returns the count of VMs currently assigned or running. Quarantine
+// consumes an admission-cap slot separately, but must not suppress desired
+// pool replenishment as if it were doing useful work.
 func (s Stats) Busy() int {
 	return s.Assigned + s.Running
 }

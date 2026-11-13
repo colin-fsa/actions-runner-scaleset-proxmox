@@ -634,6 +634,15 @@ func (r *Reconciler) promoteToRunning(ctx context.Context, row pool.RowSnapshot,
 func (r *Reconciler) cleanupOrphanRunners(ctx context.Context, rows []pool.RowSnapshot, runners map[string]pool.RunnerInfo, truncated bool) {
 	known := make(map[string]struct{}, len(rows))
 	for _, row := range rows {
+		// A quarantined VM is not eligible to accept another GitHub job.
+		// Let the normal orphan-runner cleanup deregister its runner, but
+		// never remove a runner GitHub currently reports as busy.
+		if row.State == "quarantined" {
+			if runner, ok := runners[row.Name]; ok && runner.Busy {
+				known[row.Name] = struct{}{}
+			}
+			continue
+		}
 		known[row.Name] = struct{}{}
 	}
 	r.pruneOrphanTracking(known, runners, truncated)
@@ -762,6 +771,11 @@ func (r *Reconciler) sweepProxmoxOrphans(ctx context.Context, rows []pool.RowSna
 
 	now := r.now()
 	for _, pv := range pmoxVMs {
+		// Persistent quarantine markers survive an empty in-memory store and
+		// must never be removed by orphan cleanup.
+		if pv.Quarantined {
+			continue
+		}
 		if _, ok := known[pv.VMID]; ok {
 			continue
 		}
@@ -787,6 +801,11 @@ func (r *Reconciler) sweepProxmoxOrphans(ctx context.Context, rows []pool.RowSna
 
 func (r *Reconciler) forceDestroy(ctx context.Context, vmid int, reason, dbState, ghLabel string) {
 	if err := r.pool.ForceDestroy(ctx, vmid, reason); err != nil {
+		if errors.Is(err, pool.ErrQuarantineHeld) {
+			r.log.Info("reconcile: candidate retained for quarantine", "vmid", vmid)
+			r.recordMismatch(dbState, ghLabel, "quarantine")
+			return
+		}
 		r.log.Warn("reconcile: force destroy failed", "vmid", vmid, "err", err)
 		return
 	}
