@@ -180,6 +180,8 @@ build {
       "SHARED_CACHE_TAG=${var.shared_cache_tag}",
       "SHARED_CACHE_MOUNT=${var.shared_cache_mount}",
       "RUNNER_UID=${var.runner_uid}",
+      "PLAYWRIGHT_VERSION=${var.playwright_version}",
+      "PLAYWRIGHT_BROWSERS=${var.playwright_browsers}",
     ]
     scripts = [
       "scripts/provision.sh",

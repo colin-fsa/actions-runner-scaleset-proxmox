@@ -168,3 +168,15 @@ variable "runner_uid" {
   default     = "101000"
   description = "uid/gid of the runner user. virtiofs passes ids through unmapped, so this must equal the host owner of the shared cache (101000 = uid 1000 in the unprivileged LXC runners). Empty = distro default."
 }
+
+variable "playwright_version" {
+  type        = string
+  default     = "1.65.0"
+  description = "Playwright version whose system (apt) dependencies are baked into the template so e2e jobs skip installing them. Browser binaries are not baked. Empty = skip."
+}
+
+variable "playwright_browsers" {
+  type        = string
+  default     = "chromium webkit"
+  description = "Space-separated Playwright browsers to install system dependencies for."
+}
