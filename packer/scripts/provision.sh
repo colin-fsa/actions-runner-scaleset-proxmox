@@ -21,6 +21,8 @@ BUILD_USERNAME="${BUILD_USERNAME:?missing}"
 SHARED_CACHE_TAG="${SHARED_CACHE_TAG:-}"
 SHARED_CACHE_MOUNT="${SHARED_CACHE_MOUNT:-}"
 RUNNER_UID="${RUNNER_UID:-}"
+PLAYWRIGHT_VERSION="${PLAYWRIGHT_VERSION:-}"
+PLAYWRIGHT_BROWSERS="${PLAYWRIGHT_BROWSERS:-chromium webkit}"
 
 STAGE_DIR="/tmp/scaleset-files"
 
@@ -85,6 +87,17 @@ apt-get update
 apt-get install -y --no-install-recommends gh
 node --version && npm --version && gh --version | head -1
 
+# Playwright's OS-level libraries (fonts, GStreamer, GTK, Xvfb, ...), so e2e jobs do not apt-install ~300
+# packages on every ephemeral VM. Browser binaries are NOT installed here: they are cached per version on
+# the shared cache. A later Playwright bump that needs one more library just installs it at job time.
+if [ -n "${PLAYWRIGHT_VERSION}" ]; then
+    log "installing Playwright ${PLAYWRIGHT_VERSION} system dependencies (${PLAYWRIGHT_BROWSERS})"
+    # EGL/GLES/Vulkan loaders that the e2e workflow also installs explicitly.
+    apt-get install -y --no-install-recommends libgbm1 libgl1-mesa-dri mesa-vulkan-drivers
+    # shellcheck disable=SC2086  # PLAYWRIGHT_BROWSERS is a space-separated list
+    DEBIAN_FRONTEND=noninteractive npx --yes "playwright@${PLAYWRIGHT_VERSION}" install-deps ${PLAYWRIGHT_BROWSERS}
+fi
+
 # -----------------------------------------------------------------------------
 # Runner user.
 # -----------------------------------------------------------------------------
@@ -147,6 +160,12 @@ WantedBy=multi-user.target
 EOF
     systemctl enable "${PNPM_UNIT}"
 fi
+
+# -----------------------------------------------------------------------------
+# Speed over durability: these are single-use VMs, so a crash mid-install only fails one CI run.
+# dpkg skips fsync on every file it unpacks (large apt installs in jobs get much faster).
+# -----------------------------------------------------------------------------
+echo "force-unsafe-io" > /etc/dpkg/dpkg.cfg.d/force-unsafe-io
 
 # -----------------------------------------------------------------------------
 # GitHub Actions runner binary.
