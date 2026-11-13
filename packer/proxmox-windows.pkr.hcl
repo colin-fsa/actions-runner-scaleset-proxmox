@@ -44,6 +44,12 @@ source "proxmox-iso" "windows_runner" {
   memory   = var.windows_vm_memory_mb
   machine  = "q35"
   bios     = "ovmf"
+
+  # VirtIO GPU: the default VGA leaves Windows on the Basic Display Adapter, which cannot change resolution
+  # (SetDisplayConfig reports success but the mode never applies). viogpudo is already in the driver store.
+  vga {
+    type = "virtio"
+  }
   efi_config {
     efi_storage_pool  = var.storage_pool
     efi_type          = "4m"
