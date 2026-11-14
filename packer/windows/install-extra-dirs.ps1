@@ -26,9 +26,14 @@ foreach ($d in $dirs.PSObject.Properties) {
         for ($try = 1; $try -le 3; $try++) {
             if ($isAsset) {
                 # curl.exe (ships with Windows) follows the redirect to storage without forwarding the token; the token goes via stdin, not argv.
-                # Leading newline: Windows PowerShell mangles the first line piped to a native program (seen as a dropped header).
-                $cfg = if ($env:EXTRA_DIRS_TOKEN) { "`nheader = `"Authorization: Bearer $env:EXTRA_DIRS_TOKEN`"`n" } else { "`n" }
-                $cfg | & curl.exe --fail --silent --show-error --location --retry 3 -A packer-extra-dirs -H 'Accept: application/octet-stream' --config - --output $archive $d.Value
+                # Config via a BOM-free temp file: Windows PowerShell prefixes text piped to native programs with a
+                # byte-order mark, which curl rejects as an unknown option. The file keeps the token off argv.
+                $cfgFile = Join-Path $work 'curl.cfg'
+                $cfg = 'header = "Accept: application/octet-stream"' + "`n" + 'user-agent = "packer-extra-dirs"' + "`n"
+                if ($env:EXTRA_DIRS_TOKEN) { $cfg += "header = `"Authorization: Bearer $env:EXTRA_DIRS_TOKEN`"`n" }
+                [IO.File]::WriteAllText($cfgFile, $cfg, (New-Object Text.ASCIIEncoding))
+                try { & curl.exe --fail --silent --show-error --location --retry 3 --config $cfgFile --output $archive $d.Value }
+                finally { Remove-Item -LiteralPath $cfgFile -Force -ErrorAction SilentlyContinue }
                 if ($LASTEXITCODE -ne 0) { throw "Downloading $($d.Value) failed (curl exit $LASTEXITCODE)." }
             }
             else { Invoke-WebRequest -UseBasicParsing -Uri $d.Value -Headers $headers -OutFile $archive }
