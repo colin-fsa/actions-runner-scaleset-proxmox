@@ -25,7 +25,7 @@ foreach ($d in $dirs.PSObject.Properties) {
         $isAsset = $d.Value -match '^https://api\.github\.com/repos/[^/]+/[^/]+/releases/assets/\d+$'
         for ($try = 1; $try -le 3; $try++) {
             if ($isAsset) {
-                # curl.exe (ships with Windows) follows the redirect to storage without forwarding the token; the token goes via stdin, not argv.
+                # curl.exe (ships with Windows) follows the redirect to storage without forwarding the token.
                 # Config via a BOM-free temp file: Windows PowerShell prefixes text piped to native programs with a
                 # byte-order mark, which curl rejects as an unknown option. The file keeps the token off argv.
                 $cfgFile = Join-Path $work 'curl.cfg'
