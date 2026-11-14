@@ -181,6 +181,7 @@ build {
   provisioner "powershell" {
     environment_vars = [
       "EXTRA_DIRS_JSON=${jsonencode(var.windows_extra_dirs)}",
+      "EXTRA_DIRS_CHECKS_JSON=${jsonencode(var.windows_extra_dirs_checks)}",
       "EXTRA_DIRS_TOKEN=${var.windows_extra_dirs_token}",
     ]
     inline = ["if ($env:EXTRA_DIRS_JSON -ne '{}') { & C:\\Windows\\Temp\\scaleset\\install-extra-dirs.ps1 }"]

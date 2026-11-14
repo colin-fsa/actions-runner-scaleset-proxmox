@@ -135,6 +135,16 @@ variable "windows_extra_dirs" {
   description = "Archives baked into the image: guest destination path => archive URL (zip or tar), e.g. { \"C:\\\\DelphiCI\" = \"https://api.github.com/repos/org/repo/zipball/ref\" }. A single top-level folder in the archive is flattened into the destination."
 }
 
+variable "windows_extra_dirs_checks" {
+  type = map(object({
+    sha256        = optional(string, "")
+    version       = optional(string, "")
+    require_files = optional(list(string), [])
+  }))
+  default     = {}
+  description = "Per windows_extra_dirs destination: expected archive SHA-256, a version written to <dest>\\.version, and files (relative to dest) that must exist after extraction. Any miss fails the build."
+}
+
 variable "windows_extra_dirs_token" {
   type        = string
   default     = ""
