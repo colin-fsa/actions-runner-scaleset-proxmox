@@ -247,6 +247,20 @@ pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
 log "installing gh-runner.{path,service}"
 install -m 0644 "${STAGE_DIR}/gh-runner.path"    /etc/systemd/system/gh-runner.path
 install -m 0644 "${STAGE_DIR}/gh-runner.service" /etc/systemd/system/gh-runner.service
+# OOM loudly, as the LXC fleet did: cap the runner's job tree below the VM's RAM (no swap) so a runaway job is
+# killed promptly, and OOMPolicy=continue so only the offending process dies and the step fails visibly
+# (exit 137, diagnostics still run) instead of systemd stopping the whole runner, which GitHub reports only as
+# "The operation was canceled." Inside a VM a percentage resolves against the guest's own RAM. Docker service
+# containers run under docker.service and are not covered.
+install -d /etc/systemd/system/gh-runner.service.d
+cat >/etc/systemd/system/gh-runner.service.d/oom.conf <<'EOF'
+[Service]
+MemoryMax=95%
+MemorySwapMax=0
+OOMPolicy=continue
+EOF
+# The workflows' memory diagnostics query github-runner.service (the LXC fleet's unit name).
+ln -sf gh-runner.service /etc/systemd/system/github-runner.service
 systemctl daemon-reload
 # Only the path unit is enabled — it'll start the service when the
 # orchestrator writes the jitconfig file.
