@@ -62,6 +62,8 @@ source "proxmox-iso" "windows_runner" {
     io_thread    = true
     discard      = true
     ssd          = true
+    # Builds are disposable until converted; Windows Update servicing is sync-write bound.
+    cache_mode = "unsafe"
   }
 
   network_adapters {
