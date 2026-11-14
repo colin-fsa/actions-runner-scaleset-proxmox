@@ -24,8 +24,13 @@ foreach ($d in $dirs.PSObject.Properties) {
         $h = $headers + @{ Accept = 'application/octet-stream'; 'User-Agent' = 'packer-extra-dirs' }
         $url = $null
         try { Invoke-WebRequest -UseBasicParsing -Uri $d.Value -Headers $h -MaximumRedirection 0 -OutFile $archive | Out-Null }
-        catch { $url = $_.Exception.Response.Headers['Location'] }
-        if (-not $url) { throw "No redirect from $($d.Value); check the token's access to the asset." }
+        catch {
+            $r = $_.Exception.Response
+            if (-not $r) { throw "Asset request to $($d.Value) failed: $($_.Exception.Message)" }
+            $url = $r.Headers['Location']
+            if (-not $url) { throw "Asset request returned HTTP $([int]$r.StatusCode) without a redirect: $($_.Exception.Message)" }
+        }
+        if (-not $url) { throw "Asset request to $($d.Value) returned no redirect (file written directly?)." }
         Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $archive   # pre-signed storage URL: must not carry the token
     }
     else { Invoke-WebRequest -UseBasicParsing -Uri $d.Value -Headers $headers -OutFile $archive }
