@@ -41,8 +41,8 @@ variable "template_vm_id" {
 }
 
 variable "template_name" {
-  type        = string
-  default     = "ubuntu-2604-runner-template"
+  type    = string
+  default = "ubuntu-2604-runner-template"
 }
 
 variable "vm_cores" {
@@ -147,4 +147,48 @@ variable "build_password" {
   type      = string
   default   = "ubuntu"
   sensitive = true
+}
+
+# ---------- Shared cache (optional) ----------
+
+variable "shared_cache_mount" {
+  type        = string
+  default     = "/srv/shared/linux-runners-shared"
+  description = "Guest path where a host directory shared over virtiofs is mounted (e.g. /srv/shared/linux-runners-shared); also points the runner user's pnpm store at it. Empty disables. After the build, attach the share to the template: qm set <vmid> --virtiofs0 <shared_cache_tag>."
+}
+
+variable "shared_cache_tag" {
+  type        = string
+  default     = "linux-runners-shared"
+  description = "Proxmox directory-mapping ID of the shared directory; also the virtiofs tag the guest mounts."
+}
+
+variable "runner_uid" {
+  type        = string
+  default     = "101000"
+  description = "uid/gid of the runner user. virtiofs passes ids through unmapped, so this must equal the host owner of the shared cache (101000 = uid 1000 in the unprivileged LXC runners). Empty = distro default."
+}
+
+variable "playwright_version" {
+  type        = string
+  default     = "1.65.0"
+  description = "Playwright version whose system (apt) dependencies are baked into the template so e2e jobs skip installing them. Browser binaries are not baked. Empty = skip."
+}
+
+variable "playwright_browsers" {
+  type        = string
+  default     = "chromium webkit"
+  description = "Space-separated Playwright browsers to install system dependencies for."
+}
+
+variable "toolcache_python_versions" {
+  type        = string
+  default     = "3.14.6"
+  description = "Space-separated Python versions seeded into the runner tool cache for actions/setup-python (match the workflows' python-version)."
+}
+
+variable "prepull_docker_images" {
+  type        = string
+  default     = "postgres:17"
+  description = "Space-separated images pulled into the template so service containers start from local layers."
 }

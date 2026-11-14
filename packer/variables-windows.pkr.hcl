@@ -11,6 +11,17 @@ variable "windows_template_vm_id" {
   description = "VMID the resulting template gets. Must NOT overlap the orchestrator's vmid_range."
 }
 
+variable "windows_base_vm_id" {
+  type        = number
+  default     = 9200
+  description = "VMID of the patched base template the layered build (proxmox-clone.windows_layer) clones."
+}
+
+variable "windows_base_template_name" {
+  type    = string
+  default = "Windows-Base-Patched"
+}
+
 variable "windows_template_name" {
   type    = string
   default = "windows-runner-template"
@@ -125,4 +136,37 @@ variable "interactive_password" {
   default     = ""
   sensitive   = true
   description = "Password for interactive_user. Stored in plaintext in the Winlogon registry key of the template (required by Windows auto-logon): use a dedicated account."
+}
+
+# ---------- Extra directories ----------
+
+variable "windows_extra_dirs" {
+  type        = map(string)
+  default     = {}
+  description = "Archives baked into the image: guest destination path => archive URL (zip or tar), e.g. { \"C:\\\\DelphiCI\" = \"https://api.github.com/repos/org/repo/zipball/ref\" }. A single top-level folder in the archive is flattened into the destination."
+}
+
+variable "windows_extra_dirs_checks" {
+  type = map(object({
+    sha256        = optional(string, "")
+    version       = optional(string, "")
+    require_files = optional(list(string), [])
+  }))
+  default     = {}
+  description = "Per windows_extra_dirs destination: expected archive SHA-256, a version written to <dest>\\.version, and files (relative to dest) that must exist after extraction. Any miss fails the build."
+}
+
+variable "windows_extra_dirs_token" {
+  type        = string
+  default     = ""
+  sensitive   = true
+  description = "Bearer token sent when downloading windows_extra_dirs (e.g. a GitHub token for private repositories). Only used during the build."
+}
+
+# ---------- Docker ----------
+
+variable "docker_version" {
+  type        = string
+  default     = ""
+  description = "Docker Engine version to install in the Windows template (e.g. 28.0.4); empty installs the newest published on download.docker.com. Windows containers only."
 }

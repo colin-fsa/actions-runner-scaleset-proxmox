@@ -177,6 +177,13 @@ build {
       "RUNNER_ARCH=${var.runner_arch}",
       "RUNNER_USER=${var.runner_user}",
       "BUILD_USERNAME=${var.build_username}",
+      "SHARED_CACHE_TAG=${var.shared_cache_tag}",
+      "SHARED_CACHE_MOUNT=${var.shared_cache_mount}",
+      "RUNNER_UID=${var.runner_uid}",
+      "PLAYWRIGHT_VERSION=${var.playwright_version}",
+      "PLAYWRIGHT_BROWSERS=${var.playwright_browsers}",
+      "TOOLCACHE_PYTHON_VERSIONS=${var.toolcache_python_versions}",
+      "PREPULL_DOCKER_IMAGES=${var.prepull_docker_images}",
     ]
     scripts = [
       "scripts/provision.sh",

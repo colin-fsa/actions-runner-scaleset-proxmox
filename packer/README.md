@@ -104,6 +104,23 @@ security updates land — ephemeral VMs deliberately have no
   ISO URL/checksum to the arm64 release; ensure your Proxmox node supports
   arm64 emulation (or runs on arm64 hardware).
 
+## Shared cache (Linux)
+
+By default the template mounts the host directory `/srv/shared/linux-runners-shared` (the same path
+the LXC runners use) over virtiofs. The runner user is created with uid/gid `runner_uid` (default
+101000, the host id of the LXC runners' uid 1000), because virtiofs passes ids through unmapped and
+the existing caches are owned by that id. pnpm's store is SQLite and virtiofs locks are not coherent
+between guests, so `<mount>/pnpm-store` is bind-mounted from a per-runner local directory
+(`/var/lib/pnpm-store`); pip and ESLint caches stay shared. Set
+`shared_cache_mount=""` to disable. Packer cannot attach virtiofs, so after the build:
+
+```
+pvesh create /cluster/mapping/dir --id linux-runners-shared --map node=<node>,path=/srv/shared/linux-runners-shared  # once
+qm set <template_vm_id> --virtiofs0 linux-runners-shared
+```
+
+Clones inherit the device and mount it at boot (`nofail`, so they still boot without it).
+
 ## Windows template
 
 `proxmox-windows.pkr.hcl` builds a Windows Server 2022 template using the same scripts as
