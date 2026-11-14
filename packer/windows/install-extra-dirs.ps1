@@ -21,17 +21,11 @@ foreach ($d in $dirs.PSObject.Properties) {
     $archive = Join-Path $work 'archive'
     if (Test-Path -LiteralPath $d.Value -PathType Leaf) { $archive = $d.Value }   # local file (e.g. from an attached ISO)
     elseif ($d.Value -match '^https://api\.github\.com/repos/[^/]+/[^/]+/releases/assets/\d+$') {
-        $h = $headers + @{ Accept = 'application/octet-stream'; 'User-Agent' = 'packer-extra-dirs' }
-        $url = $null
-        try { Invoke-WebRequest -UseBasicParsing -Uri $d.Value -Headers $h -MaximumRedirection 0 -OutFile $archive | Out-Null }
-        catch {
-            $r = $_.Exception.Response
-            if (-not $r) { throw "Asset request to $($d.Value) failed: $($_.Exception.Message)" }
-            $url = $r.Headers['Location']
-            if (-not $url) { throw "Asset request returned HTTP $([int]$r.StatusCode) without a redirect: $($_.Exception.Message)" }
-        }
-        if (-not $url) { throw "Asset request to $($d.Value) returned no redirect (file written directly?)." }
-        Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $archive   # pre-signed storage URL: must not carry the token
+        # curl.exe (ships with Windows) follows the redirect to storage without forwarding the token; the token goes via stdin, not argv.
+        $cfg = "header = `"Accept: application/octet-stream`"`nuser-agent = `"packer-extra-dirs`""
+        if ($env:EXTRA_DIRS_TOKEN) { $cfg += "`nheader = `"Authorization: Bearer $env:EXTRA_DIRS_TOKEN`"" }
+        $cfg | & curl.exe --fail --silent --show-error --location --retry 3 --config - --output $archive $d.Value
+        if ($LASTEXITCODE -ne 0) { throw "Downloading $($d.Value) failed (curl exit $LASTEXITCODE)." }
     }
     else { Invoke-WebRequest -UseBasicParsing -Uri $d.Value -Headers $headers -OutFile $archive }
     $chk = if ($checks) { $checks.PSObject.Properties[$dest].Value } else { $null }
