@@ -154,6 +154,7 @@ build {
       "windows/install-extra-dirs.ps1",
       "windows/install-docker.ps1",
       "windows/install-tools.ps1",
+      "windows/optimize.ps1",
       "windows/finalize.ps1",
     ]
     destination = "C:\\Windows\\Temp\\scaleset\\"
@@ -194,6 +195,11 @@ build {
       "exclude:$_.Title -like '*Preview*'",
       "include:$true",
     ]
+  }
+
+  # After the update round (it must run before Windows Update is disabled).
+  provisioner "powershell" {
+    inline = ["& C:\\Windows\\Temp\\scaleset\\optimize.ps1"]
   }
 
   provisioner "powershell" {
