@@ -182,6 +182,8 @@ build {
       "RUNNER_UID=${var.runner_uid}",
       "PLAYWRIGHT_VERSION=${var.playwright_version}",
       "PLAYWRIGHT_BROWSERS=${var.playwright_browsers}",
+      "TOOLCACHE_PYTHON_VERSIONS=${var.toolcache_python_versions}",
+      "PREPULL_DOCKER_IMAGES=${var.prepull_docker_images}",
     ]
     scripts = [
       "scripts/provision.sh",

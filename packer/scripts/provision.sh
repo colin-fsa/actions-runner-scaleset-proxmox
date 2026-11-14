@@ -23,6 +23,8 @@ SHARED_CACHE_MOUNT="${SHARED_CACHE_MOUNT:-}"
 RUNNER_UID="${RUNNER_UID:-}"
 PLAYWRIGHT_VERSION="${PLAYWRIGHT_VERSION:-}"
 PLAYWRIGHT_BROWSERS="${PLAYWRIGHT_BROWSERS:-chromium webkit}"
+TOOLCACHE_PYTHON_VERSIONS="${TOOLCACHE_PYTHON_VERSIONS:-}"
+PREPULL_DOCKER_IMAGES="${PREPULL_DOCKER_IMAGES:-}"
 
 STAGE_DIR="/tmp/scaleset-files"
 
@@ -190,6 +192,54 @@ log "installing runner OS dependencies"
 # The orchestrator writes the JIT config as a systemd env file at this
 # path on each clone. The path itself must NOT exist in the template.
 test ! -e /opt/actions-runner/jitconfig.env
+
+# -----------------------------------------------------------------------------
+# Pre-seeded job dependencies: saves per-job downloads on ephemeral clones.
+# -----------------------------------------------------------------------------
+# actions/setup-python looks in the runner tool cache (<runner>/_work/_tool) before downloading;
+# seed it with the exact builds it would fetch (actions/python-versions) for this Ubuntu release.
+TOOL_CACHE=/opt/actions-runner/_work/_tool
+install -d -o "${RUNNER_USER}" -g "${RUNNER_USER}" /opt/actions-runner/_work "${TOOL_CACHE}"
+. /etc/os-release
+for v in ${TOOLCACHE_PYTHON_VERSIONS}; do
+    log "seeding setup-python tool cache: Python ${v} (ubuntu ${VERSION_ID})"
+    url=$(curl -fsSL https://raw.githubusercontent.com/actions/python-versions/main/versions-manifest.json | python3 -c '
+import json, sys
+v, pv = sys.argv[1], sys.argv[2]
+print(next(f["download_url"] for r in json.load(sys.stdin) if r["version"] == v
+           for f in r["files"] if f["platform"] == "linux" and f["arch"] == "x64" and f["platform_version"] == pv))' "${v}" "${VERSION_ID}")
+    d=$(mktemp -d)
+    curl -fsSL "${url}" | tar -xz -C "${d}"
+    # The build has no rpath for its libpython; without LD_LIBRARY_PATH it would load Ubuntu's same-version
+    # libpython (Debian install scheme) and pip lands where this Python never looks. setup-python sets the
+    # same variable at job time.
+    lib="${TOOL_CACHE}/Python/${v}/x64/lib"
+    (cd "${d}" && RUNNER_TOOL_CACHE="${TOOL_CACHE}" AGENT_TOOLSDIRECTORY="${TOOL_CACHE}" LD_LIBRARY_PATH="${lib}" bash ./setup.sh)
+    rm -rf "${d}"
+    test -e "${TOOL_CACHE}/Python/${v}/x64.complete"
+    LD_LIBRARY_PATH="${lib}" "${TOOL_CACHE}/Python/${v}/x64/bin/python3" -m pip --version
+done
+chown -R "${RUNNER_USER}:${RUNNER_USER}" /opt/actions-runner/_work
+
+# Service-container images: the runner still checks the registry per job, but layers are already local.
+systemctl start docker
+for img in ${PREPULL_DOCKER_IMAGES}; do
+    log "pre-pulling ${img}"
+    docker pull --quiet "${img}"
+done
+
+# PowerShell 7 (pwsh), on PATH like the GitHub-hosted images. The release tarball avoids the .deb's
+# pinned libicu versions (this Ubuntu ships a newer ICU).
+log "installing PowerShell 7 (pwsh)"
+url=$(curl -fsSL https://api.github.com/repos/PowerShell/PowerShell/releases/latest | python3 -c '
+import json, sys
+print(next(a["browser_download_url"] for a in json.load(sys.stdin)["assets"]
+           if a["name"].endswith("-linux-x64.tar.gz") and "musl" not in a["name"]))')
+install -d /opt/microsoft/powershell/7
+curl -fsSL "${url}" | tar -xz -C /opt/microsoft/powershell/7
+chmod +x /opt/microsoft/powershell/7/pwsh
+ln -sf /opt/microsoft/powershell/7/pwsh /usr/bin/pwsh
+pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
 
 # -----------------------------------------------------------------------------
 # systemd units.

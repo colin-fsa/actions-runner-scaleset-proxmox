@@ -180,3 +180,15 @@ variable "playwright_browsers" {
   default     = "chromium webkit"
   description = "Space-separated Playwright browsers to install system dependencies for."
 }
+
+variable "toolcache_python_versions" {
+  type        = string
+  default     = "3.14.6"
+  description = "Space-separated Python versions seeded into the runner tool cache for actions/setup-python (match the workflows' python-version)."
+}
+
+variable "prepull_docker_images" {
+  type        = string
+  default     = "postgres:17"
+  description = "Space-separated images pulled into the template so service containers start from local layers."
+}
