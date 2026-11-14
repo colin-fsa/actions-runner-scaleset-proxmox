@@ -26,7 +26,8 @@ foreach ($d in $dirs.PSObject.Properties) {
         for ($try = 1; $try -le 3; $try++) {
             if ($isAsset) {
                 # curl.exe (ships with Windows) follows the redirect to storage without forwarding the token; the token goes via stdin, not argv.
-                $cfg = if ($env:EXTRA_DIRS_TOKEN) { "header = `"Authorization: Bearer $env:EXTRA_DIRS_TOKEN`"" } else { '' }
+                # Leading newline: Windows PowerShell mangles the first line piped to a native program (seen as a dropped header).
+                $cfg = if ($env:EXTRA_DIRS_TOKEN) { "`nheader = `"Authorization: Bearer $env:EXTRA_DIRS_TOKEN`"`n" } else { "`n" }
                 $cfg | & curl.exe --fail --silent --show-error --location --retry 3 -A packer-extra-dirs -H 'Accept: application/octet-stream' --config - --output $archive $d.Value
                 if ($LASTEXITCODE -ne 0) { throw "Downloading $($d.Value) failed (curl exit $LASTEXITCODE)." }
             }
