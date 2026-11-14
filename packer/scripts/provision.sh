@@ -344,13 +344,20 @@ rm -f /swap.img /swapfile
 # builds; the guest runs one job then is destroyed, and the host keeps its own mitigations.
 # Subiquity also leaves its "autoinstall ds=nocloud" arguments on the command line.
 log "kernel command line: no crashkernel, mitigations=off, no boot menu wait"
-apt-get purge -y kdump-tools kexec-tools lxd-installer || true
+# kdump-tools is a dependency of the ubuntu-server metapackage: pin what that metapackage pulled in as manually
+# installed first, so the autoremove below cannot strip the server package set when the metapackage goes.
+apt-mark manual $(apt-cache depends --installed ubuntu-server 2>/dev/null | awk '/(Depends|Recommends):/ && $2 !~ /^</ {print $2}') >/dev/null 2>&1 || true
+apt-get purge -y kdump-tools kexec-tools || true
+# lxd-installer is masked, not purged: purging it drops the ubuntu-server metapackage and autoremove below
+# would then strip everything that metapackage pulled in.
+systemctl disable lxd-installer.socket 2>/dev/null || true
+systemctl mask lxd-installer.socket 2>/dev/null || true
 sed -i -E \
     -e 's/^GRUB_CMDLINE_LINUX=.*/GRUB_CMDLINE_LINUX=""/' \
     -e 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="mitigations=off"/' \
     -e 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=0/' \
     /etc/default/grub
-grep -rl crashkernel /etc/default/grub.d/ 2>/dev/null | xargs -r rm -f
+grep -rl crashkernel /etc/default/grub.d/ 2>/dev/null | xargs -r rm -f || true
 update-grub
 # No access-time writes on the root filesystem.
 awk '$2 == "/" && $4 !~ /noatime/ { $4 = $4 ",noatime" } { print }' /etc/fstab > /etc/fstab.new && mv /etc/fstab.new /etc/fstab
