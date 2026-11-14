@@ -19,20 +19,26 @@ foreach ($d in $dirs.PSObject.Properties) {
     $work = Join-Path $env:TEMP ('extra-' + [guid]::NewGuid())
     New-Item -ItemType Directory -Path $work | Out-Null
     $archive = Join-Path $work 'archive'
-    if (Test-Path -LiteralPath $d.Value -PathType Leaf) { $archive = $d.Value }   # local file (e.g. from an attached ISO)
-    elseif ($d.Value -match '^https://api\.github\.com/repos/[^/]+/[^/]+/releases/assets/\d+$') {
-        # curl.exe (ships with Windows) follows the redirect to storage without forwarding the token; the token goes via stdin, not argv.
-        $cfg = "header = `"Accept: application/octet-stream`"`nuser-agent = `"packer-extra-dirs`""
-        if ($env:EXTRA_DIRS_TOKEN) { $cfg += "`nheader = `"Authorization: Bearer $env:EXTRA_DIRS_TOKEN`"" }
-        $cfg | & curl.exe --fail --silent --show-error --location --retry 3 --config - --output $archive $d.Value
-        if ($LASTEXITCODE -ne 0) { throw "Downloading $($d.Value) failed (curl exit $LASTEXITCODE)." }
-    }
-    else { Invoke-WebRequest -UseBasicParsing -Uri $d.Value -Headers $headers -OutFile $archive }
     $chk = if ($checks) { $checks.PSObject.Properties[$dest].Value } else { $null }
-    if ($chk -and $chk.sha256) {
-        $got = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
-        if ($got -ne $chk.sha256.ToUpper()) { throw "SHA-256 of $($d.Value) is $got, expected $($chk.sha256)." }
-        Write-Host "SHA-256 verified for $dest"
+    if (Test-Path -LiteralPath $d.Value -PathType Leaf) { $archive = $d.Value }   # local file (e.g. from an attached ISO)
+    else {
+        $isAsset = $d.Value -match '^https://api\.github\.com/repos/[^/]+/[^/]+/releases/assets/\d+$'
+        for ($try = 1; $try -le 3; $try++) {
+            if ($isAsset) {
+                # curl.exe (ships with Windows) follows the redirect to storage without forwarding the token; the token goes via stdin, not argv.
+                $cfg = "header = `"Accept: application/octet-stream`"`nuser-agent = `"packer-extra-dirs`""
+                if ($env:EXTRA_DIRS_TOKEN) { $cfg += "`nheader = `"Authorization: Bearer $env:EXTRA_DIRS_TOKEN`"" }
+                $cfg | & curl.exe --fail --silent --show-error --location --retry 3 --config - --output $archive $d.Value
+                if ($LASTEXITCODE -ne 0) { throw "Downloading $($d.Value) failed (curl exit $LASTEXITCODE)." }
+            }
+            else { Invoke-WebRequest -UseBasicParsing -Uri $d.Value -Headers $headers -OutFile $archive }
+            if (-not ($chk -and $chk.sha256)) { break }
+            $got = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
+            if ($got -eq $chk.sha256.ToUpper()) { Write-Host "SHA-256 verified for $dest"; break }
+            Write-Host "SHA-256 mismatch for $dest on attempt ${try}: got $got ($((Get-Item -LiteralPath $archive).Length) bytes), expected $($chk.sha256)"
+            if ($try -eq 3) { throw "SHA-256 of $($d.Value) never matched $($chk.sha256)." }
+            Remove-Item -LiteralPath $archive -Force
+        }
     }
     $out = Join-Path $work 'out'
     New-Item -ItemType Directory -Path $out | Out-Null
