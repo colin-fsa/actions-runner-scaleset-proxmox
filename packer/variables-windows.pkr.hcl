@@ -11,6 +11,17 @@ variable "windows_template_vm_id" {
   description = "VMID the resulting template gets. Must NOT overlap the orchestrator's vmid_range."
 }
 
+variable "windows_base_vm_id" {
+  type        = number
+  default     = 9200
+  description = "VMID of the patched base template the layered build (proxmox-clone.windows_layer) clones."
+}
+
+variable "windows_base_template_name" {
+  type    = string
+  default = "windows-base-updated"
+}
+
 variable "windows_template_name" {
   type    = string
   default = "windows-runner-template"
