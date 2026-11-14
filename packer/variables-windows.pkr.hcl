@@ -19,7 +19,7 @@ variable "windows_base_vm_id" {
 
 variable "windows_base_template_name" {
   type    = string
-  default = "windows-base-updated"
+  default = "Windows-Base-Patched"
 }
 
 variable "windows_template_name" {
