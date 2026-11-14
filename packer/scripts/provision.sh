@@ -337,6 +337,25 @@ sed -i.bak -E '/(^|\s)swap(\s|$)/d' /etc/fstab
 rm -f /swap.img /swapfile
 
 # -----------------------------------------------------------------------------
+# Speed over hardening for one-job VMs.
+# -----------------------------------------------------------------------------
+# kdump-tools reserves 512 MB+ (crashkernel=) in every clone; nobody reads a runner's crash dump.
+# mitigations=off: Skylake-class hosts pay heavily for CPU-vulnerability mitigations on syscall/IO-heavy
+# builds; the guest runs one job then is destroyed, and the host keeps its own mitigations.
+# Subiquity also leaves its "autoinstall ds=nocloud" arguments on the command line.
+log "kernel command line: no crashkernel, mitigations=off, no boot menu wait"
+apt-get purge -y kdump-tools kexec-tools lxd-installer || true
+sed -i -E \
+    -e 's/^GRUB_CMDLINE_LINUX=.*/GRUB_CMDLINE_LINUX=""/' \
+    -e 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="mitigations=off"/' \
+    -e 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=0/' \
+    /etc/default/grub
+grep -rl crashkernel /etc/default/grub.d/ 2>/dev/null | xargs -r rm -f
+update-grub
+# No access-time writes on the root filesystem.
+awk '$2 == "/" && $4 !~ /noatime/ { $4 = $4 ",noatime" } { print }' /etc/fstab > /etc/fstab.new && mv /etc/fstab.new /etc/fstab
+
+# -----------------------------------------------------------------------------
 # Cleanup for template conversion.
 # -----------------------------------------------------------------------------
 log "cleaning apt + tmp + logs"
