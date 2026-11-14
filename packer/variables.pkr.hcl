@@ -41,8 +41,8 @@ variable "template_vm_id" {
 }
 
 variable "template_name" {
-  type        = string
-  default     = "ubuntu-2604-runner-template"
+  type    = string
+  default = "ubuntu-2604-runner-template"
 }
 
 variable "vm_cores" {
