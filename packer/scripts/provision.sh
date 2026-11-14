@@ -210,9 +210,14 @@ print(next(f["download_url"] for r in json.load(sys.stdin) if r["version"] == v
            for f in r["files"] if f["platform"] == "linux" and f["arch"] == "x64" and f["platform_version"] == pv))' "${v}" "${VERSION_ID}")
     d=$(mktemp -d)
     curl -fsSL "${url}" | tar -xz -C "${d}"
-    (cd "${d}" && RUNNER_TOOL_CACHE="${TOOL_CACHE}" AGENT_TOOLSDIRECTORY="${TOOL_CACHE}" bash ./setup.sh)
+    # The build has no rpath for its libpython; without LD_LIBRARY_PATH it would load Ubuntu's same-version
+    # libpython (Debian install scheme) and pip lands where this Python never looks. setup-python sets the
+    # same variable at job time.
+    lib="${TOOL_CACHE}/Python/${v}/x64/lib"
+    (cd "${d}" && RUNNER_TOOL_CACHE="${TOOL_CACHE}" AGENT_TOOLSDIRECTORY="${TOOL_CACHE}" LD_LIBRARY_PATH="${lib}" bash ./setup.sh)
     rm -rf "${d}"
-    test -x "${TOOL_CACHE}/Python/${v}/x64/bin/python3" && test -e "${TOOL_CACHE}/Python/${v}/x64.complete"
+    test -e "${TOOL_CACHE}/Python/${v}/x64.complete"
+    LD_LIBRARY_PATH="${lib}" "${TOOL_CACHE}/Python/${v}/x64/bin/python3" -m pip --version
 done
 chown -R "${RUNNER_USER}:${RUNNER_USER}" /opt/actions-runner/_work
 
