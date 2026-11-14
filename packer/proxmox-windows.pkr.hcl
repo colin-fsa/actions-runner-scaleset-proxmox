@@ -31,6 +31,7 @@ source "proxmox-iso" "windows_runner" {
   token                    = var.proxmox_token
   insecure_skip_tls_verify = var.proxmox_insecure_skip_tls_verify
   node                     = var.proxmox_node
+  task_timeout             = "10m" # full clones of the 80 GB base take over a minute
 
   os       = "win11" # Proxmox OS type for Windows 11 / Server 2022+ guests
   cpu_type = "host"
@@ -141,6 +142,7 @@ source "proxmox-clone" "windows_layer" {
   token                    = var.proxmox_token
   insecure_skip_tls_verify = var.proxmox_insecure_skip_tls_verify
   node                     = var.proxmox_node
+  task_timeout             = "10m" # full clones of the 80 GB base take over a minute
 
   clone_vm_id          = var.windows_base_vm_id
   full_clone           = true
