@@ -261,6 +261,11 @@ OOMPolicy=continue
 EOF
 # The workflows' memory diagnostics query github-runner.service (the LXC fleet's unit name).
 ln -sf gh-runner.service /etc/systemd/system/github-runner.service
+# /tmp on disk, as on the LXC fleet. Ubuntu 26.04 mounts /tmp as tmpfs (RAM, half of memory) by default; the
+# E2E Playwright config passes --disable-dev-shm-usage, which moves Chrome's renderer shared memory into /tmp
+# on the assumption that /tmp is disk-backed. On a tmpfs /tmp that memory is pinned RAM (no swap), invisible
+# to the RSS sampler, and capped at the tmpfs size.
+systemctl mask tmp.mount
 systemctl daemon-reload
 # Only the path unit is enabled — it'll start the service when the
 # orchestrator writes the jitconfig file.
