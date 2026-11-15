@@ -53,6 +53,10 @@ func TestAdoptStoppedLXC(t *testing.T) {
 		destroy bool
 	}{
 		{"clean", []byte{}, nil, false},
+		// ReadJITConfig returns only the ACTIONS_RUNNER_JIT_CONFIG entry,
+		// so a template-inherited env such as NEXT_TELEMETRY_DISABLED=1
+		// reads back empty and the container is reused.
+		{"unrelated env only", nil, nil, false},
 		{"used", []byte("jit"), nil, true},
 		{"unreadable", nil, errors.New("config unavailable"), true},
 	} {

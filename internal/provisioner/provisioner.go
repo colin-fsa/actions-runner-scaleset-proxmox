@@ -1106,7 +1106,7 @@ func (p *pmox) Destroy(ctx context.Context, vm *VM) error {
 		if isNotFound(err) {
 			return nil
 		}
-		return fmt.Errorf("delete vm: %w", classifyProxmoxError(err))
+		return fmt.Errorf("delete vm: %w", errIfProtected(classifyProxmoxError(err), "vm", vm.VMID))
 	}
 	if err := awaitTask(ctx, task, 120); err != nil {
 		// Mid-task 404 → idempotent success (VM disappeared while we
@@ -1116,7 +1116,7 @@ func (p *pmox) Destroy(ctx context.Context, vm *VM) error {
 			p.recentlyDestroyed.Set(vm.VMID, time.Now(), ttlcache.DefaultTTL)
 			return nil
 		}
-		return fmt.Errorf("await delete: %w", classified)
+		return fmt.Errorf("await delete: %w", errIfProtected(classified, "vm", vm.VMID))
 	}
 	// PVE has finished the qmdestroy task. Record the timestamp so the
 	// pool's allocateVMID skips this VMID until the configured cooldown

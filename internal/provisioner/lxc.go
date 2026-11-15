@@ -611,7 +611,7 @@ func (p *pmox) destroyLXC(ctx context.Context, vm *VM) error {
 		if isNotFound(err) {
 			return nil
 		}
-		return fmt.Errorf("delete ct: %w", classifyProxmoxError(err))
+		return fmt.Errorf("delete ct: %w", errIfProtected(classifyProxmoxError(err), "ct", vm.VMID))
 	}
 	if err := awaitTask(ctx, proxmox.NewTask(upid, p.cli), 120); err != nil {
 		classified := classifyProxmoxError(err)
@@ -619,7 +619,7 @@ func (p *pmox) destroyLXC(ctx context.Context, vm *VM) error {
 			p.recentlyDestroyed.Set(vm.VMID, time.Now(), ttlcache.DefaultTTL)
 			return nil
 		}
-		return fmt.Errorf("await delete ct: %w", classified)
+		return fmt.Errorf("await delete ct: %w", errIfProtected(classified, "ct", vm.VMID))
 	}
 	p.recentlyDestroyed.Set(vm.VMID, time.Now(), ttlcache.DefaultTTL)
 	return nil
@@ -689,6 +689,33 @@ func validateLXCEnvValue(v string) error {
 	return nil
 }
 
+// mergeLXCJITEnv returns the env option value with jit set: the existing
+// NUL-separated entries in their original order minus any previous
+// ACTIONS_RUNNER_JIT_CONFIG entry (and empty entries), then the new one.
+func mergeLXCJITEnv(existing, jit string) string {
+	var out []string
+	for _, kv := range strings.Split(existing, "\x00") {
+		if kv == "" || strings.HasPrefix(kv, lxcJITEnvKey+"=") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	out = append(out, lxcJITEnvKey+"="+jit)
+	return strings.Join(out, "\x00")
+}
+
+// errIfProtected adds an actionable message when PVE refused to delete a
+// guest because its protection flag is set (typically inherited from a
+// template carrying protection: 1). Protection is never cleared
+// automatically: an operator set it, and it may be guarding a guest that
+// is not ours.
+func errIfProtected(err error, kind string, vmid int) error {
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "protection") {
+		return fmt.Errorf("%s %d has protection enabled; clear it on the guest (and on its template, so clones do not inherit it) before it can be destroyed: %w", kind, vmid, err)
+	}
+	return err
+}
+
 // redactJIT strips the JIT from an error that might echo request data.
 func redactJIT(err error, jit string) error {
 	if err == nil {
@@ -729,7 +756,15 @@ func (p *pmox) injectLXCJIT(ctx context.Context, vm *VM, jit string) error {
 			return fmt.Errorf("inject jit: ensure firewall on ct %d: %w", vm.VMID, err)
 		}
 	}
-	body := map[string]any{"env": lxcJITEnvKey + "=" + jit}
+	// PVE's env option replaces the whole NUL-separated list, so merge:
+	// keep the container's (template-inherited) variables in order, drop
+	// any previous JIT entry and append the new one.
+	var ctCfg map[string]any
+	if err := p.cli.Get(ctx, lxcPath(vm.Node, vm.VMID, "/config"), &ctCfg); err != nil {
+		return fmt.Errorf("inject jit: read config of ct %d: %w", vm.VMID, classifyProxmoxError(err))
+	}
+	existing, _ := ctCfg["env"].(string)
+	body := map[string]any{"env": mergeLXCJITEnv(existing, jit)}
 	if err := p.cli.Put(ctx, lxcPath(vm.Node, vm.VMID, "/config"), body, nil); err != nil {
 		return fmt.Errorf("inject jit: set env on ct %d: %w", vm.VMID, redactJIT(classifyProxmoxError(err), jit))
 	}
