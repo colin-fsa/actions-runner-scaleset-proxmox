@@ -257,6 +257,13 @@ type profileState struct {
 	// speculating that this tick's dispatches will fail. Only hot
 	// matters — warm is pool warmth, not a queued job.
 	capacityDeferredHot atomic.Bool
+
+	// capacityDeferredPromote records that a warm-to-hot promotion was
+	// refused by the capacity gate during the current pass. Promotion
+	// admission is synchronous, so the same pass reads (and clears) it
+	// to hold warm refill; unlike capacityDeferredHot it never arms
+	// eviction.
+	capacityDeferredPromote atomic.Bool
 }
 
 // parkedReservation is a capacity claim taken on behalf of a profile
@@ -1635,10 +1642,12 @@ func (m *manager) reconcileProfileOnce(ctx context.Context, profile string) {
 		m.kickClone(ctx, profile, store.PoolKindHot, true)
 	}
 	// Warm refill is pool warmth, not a queued job. While the capacity
-	// gate is still turning this profile's hot demand away (flag set by
-	// a previous pass), a warm clone would compete for the same memory,
-	// so hold it until the hot demand has been admitted.
-	if needWarm > 0 && ps.capacityDeferredHot.Load() {
+	// gate is turning this profile's hot demand away — a promotion
+	// refused in this pass, or a hot clone refused in the previous one —
+	// a warm clone would compete for the same memory, so hold it until
+	// the hot demand has been admitted.
+	promoteRefused := ps.capacityDeferredPromote.Swap(false)
+	if needWarm > 0 && (promoteRefused || ps.capacityDeferredHot.Load()) {
 		m.log.Debug("reconcile: holding warm refill while hot demand is capacity-deferred",
 			"profile", profile, "need_warm", needWarm)
 		needWarm = 0
@@ -2119,7 +2128,15 @@ func (m *manager) promoteN(ctx context.Context, profile string, n int) {
 		// ctx is for the reconcile tick, not the boot lifetime.
 		go func() { //nolint:contextcheck // boot outlives the reconcile-tick ctx
 			defer m.wg.Done()
-			defer func() { m.logRecoveredPanic("promote", row.VMID, recover()) }()
+			defer func() {
+				if r := recover(); r != nil {
+					// Whether or not the VM started, nothing will retire this
+					// claim on purpose now; hand it back rather than hold the
+					// memory for the TTL.
+					claim.release()
+					m.logRecoveredPanic("promote", row.VMID, r)
+				}
+			}()
 			defer m.bootSem.Release(1)
 			m.runBoot(row, claim)
 		}()
@@ -2207,6 +2224,11 @@ type clonePrep struct {
 	// the completion of, which would withhold the memory for the whole
 	// reservation TTL every time a clone fails.
 	releaseCapacity func()
+
+	// expectPoweredOff marks the clone's reservation as staying powered
+	// off (warm), so it retires on observation. No-op when admission is
+	// disabled.
+	expectPoweredOff func()
 }
 
 // runClone is the body of an async clone goroutine. The caller
@@ -2320,13 +2342,14 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 		return
 	}
 
-	if !prep.poweredOn && m.cfg.Capacity != nil && m.cfg.Capacity.RetiresOnlyWhenPowered() {
+	if !prep.poweredOn {
 		// A warm clone consumes no host memory or CPU while it stays
-		// powered off, but in these modes its reservation would only
-		// retire on power-on — so it would sit at full size until the
-		// TTL, starving hot demand of memory nobody is using. Release it
-		// now; promoting the VM later reserves again (admitPromotion).
-		prep.releaseCapacity()
+		// powered off. In host_available / host_usage modes its
+		// reservation would otherwise only retire on a power-on that
+		// never comes, holding its full shape until the TTL and starving
+		// hot demand of memory nobody is using. Retire it once the row is
+		// observed instead; promoting the VM later reserves again.
+		prep.expectPoweredOff()
 	}
 
 	if prep.poweredOn {
@@ -2431,7 +2454,8 @@ func (m *manager) prepareClone(profile string, kind store.PoolKind, poweredOn bo
 		kind:          kind,
 		poweredOn:     poweredOn,
 
-		releaseCapacity: claim.release,
+		releaseCapacity:  claim.release,
+		expectPoweredOff: claim.expectPoweredOff,
 	}
 
 	// Allocate a static IP (if the profile's IPAM is non-noop)

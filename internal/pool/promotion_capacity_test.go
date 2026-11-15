@@ -63,8 +63,8 @@ func TestPromote_AdmittedOnlyWithinCapacity(t *testing.T) {
 	require.Equal(t, uint64(5*gib), adm.snapshotFree("pve1"), "two promotions hold 20 GiB")
 	require.Len(t, prov.starts, 2, "only admitted VMs are started")
 	require.Equal(t, store.StateWarm, stateOf(t, st, 10003), "the refused VM stays warm")
-	require.True(t, m.profileOf("linux").capacityDeferredHot.Load(),
-		"a refused promotion is unmet hot demand, like a refused hot clone")
+	require.True(t, m.profileOf("linux").capacityDeferredPromote.Load(),
+		"a refused promotion is recorded as unmet hot demand")
 	require.Equal(t, float64(1), testutil.ToFloat64(
 		m.metrics.CloneDeferredCapacity.WithLabelValues("test", "linux", "pve1", "hot")))
 }
@@ -119,27 +119,43 @@ func TestPromote_SuccessKeepsClaim(t *testing.T) {
 	require.Equal(t, 10001, adm.lastExisting, "the claim is bound to the promoted VM")
 }
 
-// TestPromote_LostCASReleasesClaim: if the row left Warm between the
-// list and the CAS (e.g. a concurrent shrink), the claim is released.
+// TestPromote_LostCASReleasesClaim: if the row leaves Warm between the
+// list and the CAS (e.g. a concurrent shrink), promoteN hands the claim
+// back and does not start the VM.
 func TestPromote_LostCASReleasesClaim(t *testing.T) {
 	t.Parallel()
 	adm := newFakeAdmitter(map[string]uint64{"pve1": 16 * gib})
+	prov := &fakeProv{}
+	m, st := promotionManager(t, adm, prov)
+	seedWarmRow(t, st, 10001, "linux")
+	adm.onReserveExisting = func(vmid int) {
+		_, err := st.Update(vmid, func(v *store.VM) { v.State = store.StateDraining })
+		require.NoError(t, err)
+	}
+
+	m.promoteN(context.Background(), "linux", 1)
+	m.wg.Wait()
+
+	require.Empty(t, prov.starts, "a lost CAS must not start the VM")
+	require.Equal(t, uint64(16*gib), adm.snapshotFree("pve1"), "and must release its claim")
+	require.Equal(t, 1, adm.released)
+}
+
+// TestPromote_RefusalDoesNotArmEviction: eviction would destroy this
+// profile's own stopped warm VMs, which free no host memory; a refused
+// promotion only holds warm refill.
+func TestPromote_RefusalDoesNotArmEviction(t *testing.T) {
+	t.Parallel()
+	adm := newFakeAdmitter(map[string]uint64{"pve1": 4 * gib})
 	m, st := promotionManager(t, adm, &fakeProv{})
 	seedWarmRow(t, st, 10001, "linux")
 
-	// Admit, then lose the race exactly as promoteN would.
-	row, err := st.Get(10001)
-	require.NoError(t, err)
-	claim, ok := m.admitPromotion(context.Background(), row)
-	require.True(t, ok)
-	_, err = st.Update(10001, func(v *store.VM) { v.State = store.StateDraining })
-	require.NoError(t, err)
-	won, err := st.UpdateState(10001, store.StateWarm, store.StateBooting, nil)
-	require.NoError(t, err)
-	require.False(t, won)
-	claim.release()
+	m.promoteN(context.Background(), "linux", 1)
+	m.wg.Wait()
 
-	require.Equal(t, uint64(16*gib), adm.snapshotFree("pve1"))
+	ps := m.profileOf("linux")
+	require.False(t, ps.capacityDeferredHot.Load(), "must not arm idle eviction")
+	require.True(t, ps.capacityDeferredPromote.Load(), "must hold warm refill")
 }
 
 // TestPromote_UnknownCapacityDefers: no snapshot means no promise; the
@@ -173,16 +189,14 @@ func TestPromote_DisabledAdmissionUnchanged(t *testing.T) {
 	require.Equal(t, []int{10001}, prov.starts)
 }
 
-// TestClone_WarmReleasesClaimWhenOnlyPoweredRetires: in host_available /
-// host_usage modes a powered-off warm clone's reservation would only
-// retire on power-on, i.e. never — so it would hold its full shape for
-// the TTL and starve hot demand. The pool releases it once the clone
-// exists; promotion reserves again.
-func TestClone_WarmReleasesClaimWhenOnlyPoweredRetires(t *testing.T) {
+// TestClone_WarmClaimRetiresOnObservation: a powered-off warm clone keeps
+// its claim (no early release — that would undercount until the snapshot
+// shows the row) but marks it to retire on observation rather than on a
+// power-on that never comes.
+func TestClone_WarmClaimRetiresOnObservation(t *testing.T) {
 	t.Parallel()
 	st := newTestStore(t)
 	adm := newFakeAdmitter(map[string]uint64{"pve1": 32 * gib})
-	adm.poweredOnlyRetire = true
 	m := newTestManager(t, st, &fakeProv{}, Config{
 		Capacity: adm,
 		Profiles: []ProfileSettings{{Name: "p", MemoryMB: 8192, MaxConcurrentRunners: 10}},
@@ -190,17 +204,16 @@ func TestClone_WarmReleasesClaimWhenOnlyPoweredRetires(t *testing.T) {
 
 	m.runClone("p", store.PoolKindWarm, false, nil, func() {})
 
-	require.Equal(t, uint64(32*gib), adm.snapshotFree("pve1"), "a stopped warm clone holds nothing")
-	require.Equal(t, 1, adm.released)
+	require.Equal(t, 1, adm.expectedOff, "the warm clone's claim is marked powered-off")
+	require.Zero(t, adm.released, "and is not released early")
 }
 
-// TestClone_HotKeepsClaimWhenOnlyPoweredRetires: a powered-on clone keeps
-// its claim in those modes; the accountant retires it on observation.
-func TestClone_HotKeepsClaimWhenOnlyPoweredRetires(t *testing.T) {
+// TestClone_HotClaimNotMarkedPoweredOff: a powered-on clone's claim keeps
+// the normal retire-on-power rule.
+func TestClone_HotClaimNotMarkedPoweredOff(t *testing.T) {
 	t.Parallel()
 	st := newTestStore(t)
 	adm := newFakeAdmitter(map[string]uint64{"pve1": 32 * gib})
-	adm.poweredOnlyRetire = true
 	m := newTestManager(t, st, &fakeProv{}, Config{
 		Capacity: adm,
 		Profiles: []ProfileSettings{{Name: "p", MemoryMB: 8192, MaxConcurrentRunners: 10}},
@@ -208,33 +221,48 @@ func TestClone_HotKeepsClaimWhenOnlyPoweredRetires(t *testing.T) {
 
 	m.runClone("p", store.PoolKindHot, true, nil, func() {})
 
-	require.Equal(t, uint64(24*gib), adm.snapshotFree("pve1"))
+	require.Zero(t, adm.expectedOff)
 	require.Zero(t, adm.released)
 }
 
 // TestReconcile_WarmRefillHeldWhileHotDeferred: warm refill must not
-// compete for memory with hot demand the gate is still refusing.
+// compete for memory with hot demand the gate refused — a hot clone in
+// the previous pass, or a promotion in this one — and resumes on the next
+// pass once nothing was refused.
 func TestReconcile_WarmRefillHeldWhileHotDeferred(t *testing.T) {
 	t.Parallel()
-	st := newTestStore(t)
-	prov := &fakeProv{}
-	adm := newFakeAdmitter(map[string]uint64{"pve1": 64 * gib})
-	m := newTestManager(t, st, prov, Config{
-		Capacity: adm,
-		Profiles: []ProfileSettings{{Name: "p", MemoryMB: 4096, MaxConcurrentRunners: 10, HotSize: 0, WarmSize: 3}},
-	})
-	ps := m.profileOf("p")
-	ps.capacityDeferredHot.Store(true)
+	for _, tc := range []struct {
+		name string
+		arm  func(ps *profileState)
+	}{
+		{"hot clone refused last pass", func(ps *profileState) { ps.capacityDeferredHot.Store(true) }},
+		{"promotion refused this pass", func(ps *profileState) { ps.capacityDeferredPromote.Store(true) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			st := newTestStore(t)
+			prov := &fakeProv{}
+			adm := newFakeAdmitter(map[string]uint64{"pve1": 64 * gib})
+			m := newTestManager(t, st, prov, Config{
+				Capacity: adm,
+				Profiles: []ProfileSettings{{Name: "p", MemoryMB: 4096, MaxConcurrentRunners: 10, HotSize: 0, WarmSize: 3}},
+			})
+			tc.arm(m.profileOf("p"))
 
-	m.reconcileProfileOnce(context.Background(), "p")
-	m.wg.Wait()
-	require.Empty(t, prov.clones, "no warm refill while hot demand is deferred")
+			m.reconcileProfileOnce(context.Background(), "p")
+			m.wg.Wait()
+			prov.mu.Lock()
+			held := len(prov.clones)
+			prov.mu.Unlock()
+			require.Zero(t, held, "no warm refill in the pass that saw the refusal")
 
-	ps.capacityDeferredHot.Store(false)
-	m.reconcileProfileOnce(context.Background(), "p")
-	require.Eventually(t, func() bool {
-		prov.mu.Lock()
-		defer prov.mu.Unlock()
-		return len(prov.clones) == 3
-	}, 5*time.Second, 10*time.Millisecond, "refill resumes once hot demand is satisfied")
+			// Nothing armed the flags again: the next pass refills.
+			m.reconcileProfileOnce(context.Background(), "p")
+			require.Eventually(t, func() bool {
+				prov.mu.Lock()
+				defer prov.mu.Unlock()
+				return len(prov.clones) == 3
+			}, 5*time.Second, 10*time.Millisecond, "refill resumes once nothing is refused")
+		})
+	}
 }

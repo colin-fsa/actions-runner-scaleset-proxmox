@@ -104,6 +104,17 @@ type Reservation interface {
 	// a sync.OnceFunc and a defer, so the failure paths and the panic
 	// guard can all call it.
 	Release()
+
+	// ExpectPoweredOff declares that the bound VM was created to stay
+	// powered off (the warm tier). Such a VM consumes no host memory or
+	// CPU, so the reservation retires as soon as the snapshot carries
+	// the VM's row at full size, whatever the mode — instead of waiting
+	// for a power-on that will not come and holding the full shape until
+	// the TTL (host_available memory / host_usage CPU). The row itself
+	// covers the VM where the mode counts stopped owned guests
+	// (allocated), so there is no window in which it is counted by
+	// neither. Starting the VM later reserves again.
+	ExpectPoweredOff()
 }
 
 // Options configures an Accountant.
@@ -348,6 +359,9 @@ type reservation struct {
 	expires  time.Time
 	released bool
 	acct     *Accountant
+	// poweredOff marks a reservation for a VM that stays powered off;
+	// it retires on observation alone (see ExpectPoweredOff).
+	poweredOff bool
 }
 
 func (r *reservation) Bind(vmid int) {
@@ -364,6 +378,12 @@ func (r *reservation) Release() {
 	}
 	r.released = true
 	delete(r.acct.res, r.id)
+}
+
+func (r *reservation) ExpectPoweredOff() {
+	r.acct.mu.Lock()
+	defer r.acct.mu.Unlock()
+	r.poweredOff = true
 }
 
 // New constructs an Accountant over the given Proxmox client.
@@ -486,8 +506,10 @@ func (a *Accountant) ReserveFreeing(ctx context.Context, node string, shape Shap
 //   - host_available mode counts nothing for a powered-off guest, so the
 //     full shape must fit in the node's free memory right now.
 //
-// A VM that is already powered on is admitted without a check: its
-// memory is already in every reading.
+// The check is made even if the cached snapshot shows the VM powered on:
+// that reading can be stale (a snapshot-recycled VM is back at Warm and
+// stopped), and admitting on it would start the VM unchecked. For a VM
+// that really is running this is merely conservative.
 func (a *Accountant) ReserveExisting(ctx context.Context, node string, shape Shape, vmid int) (Reservation, bool, error) {
 	snap, err := a.resources(ctx)
 	if err != nil {
@@ -496,7 +518,7 @@ func (a *Accountant) ReserveExisting(ctx context.Context, node string, shape Sha
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.sweepLocked(snap)
-	if !snap.guestPowered[vmid] && !a.fitsSelfLocked(snap, node, shape, vmid) {
+	if !a.fitsSelfLocked(snap, node, shape, vmid) {
 		return nil, false, nil
 	}
 	a.nextRes++
@@ -512,14 +534,15 @@ func (a *Accountant) ReserveExisting(ctx context.Context, node string, shape Sha
 	return r, true, nil
 }
 
-// RetiresOnlyWhenPowered reports whether a reservation in this mode is
-// only retired once its guest is powered on (host_available memory or
-// host_usage CPU). A clone that is deliberately left powered off — the
-// warm tier — would then hold its full shape until the reservation TTL
-// although it consumes nothing; the pool releases such a claim itself
-// once the powered-off clone exists, and re-reserves when it promotes it.
-func (a *Accountant) RetiresOnlyWhenPowered() bool {
-	return a.isHostMode() || a.cpuUsageMode()
+// freeingCreditLocked is the memory a VM committed to destruction gives
+// back. In host_available mode only a powered-on guest is in the node's
+// live reading, so destroying a stopped one frees nothing admissible;
+// crediting its configured size would admit memory that does not exist.
+func (a *Accountant) freeingCreditLocked(snap *snapshot, vmid int) uint64 {
+	if a.isHostMode() && !snap.guestPowered[vmid] {
+		return 0
+	}
+	return snap.guestMem[vmid]
 }
 
 // fitsSelfLocked is fitsLocked for a VM that already exists on node:
@@ -553,7 +576,7 @@ func (a *Accountant) fitsLocked(snap *snapshot, node string, shape Shape, extraF
 	credit := uint64(0)
 	vcpuCredit := 0
 	for _, vmid := range extraFreeing {
-		credit += snap.guestMem[vmid]
+		credit += a.freeingCreditLocked(snap, vmid)
 		if !a.cpuUsageMode() {
 			vcpuCredit += snap.guestVCPU[vmid]
 		}
@@ -733,7 +756,7 @@ func (a *Accountant) holdsAndCreditsLocked(snap *snapshot, node string) (holds, 
 			holds += want - observed
 		}
 		for _, v := range r.freeing {
-			credit += snap.guestMem[v]
+			credit += a.freeingCreditLocked(snap, v)
 		}
 	}
 	return holds, credit
@@ -867,7 +890,7 @@ func (a *Accountant) sweepLocked(snap *snapshot) {
 			continue
 		}
 		retired := r.vmid != 0 && snap.guestMem[r.vmid] >= r.shape.MemoryBytes
-		if a.isHostMode() || a.cpuUsageMode() {
+		if (a.isHostMode() || a.cpuUsageMode()) && !r.poweredOff {
 			// In host mode the node's live available-memory reading absorbs a
 			// reservation's RAM only once its guest is actually powered on.
 			// A powered-off guest's configured RAM never reached that reading,

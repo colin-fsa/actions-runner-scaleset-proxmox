@@ -44,8 +44,11 @@ type fakeAdmitter struct {
 	// lastExisting records the VMID of the most recent one.
 	existingCalls int
 	lastExisting  int
-	// poweredOnlyRetire is what RetiresOnlyWhenPowered reports.
-	poweredOnlyRetire bool
+	// expectedOff counts reservations marked ExpectPoweredOff.
+	expectedOff int
+	// onReserveExisting, when set, runs inside ReserveExisting after
+	// admission — lets a test change the row under promoteN (lost CAS).
+	onReserveExisting func(vmid int)
 	// vmSizes is the allocated memory of each VM the fake knows about,
 	// so ReserveFreeing can credit a victim by its real size — the same
 	// arithmetic the accountant does against the cluster snapshot.
@@ -72,6 +75,12 @@ func (r *fakeReservation) Bind(vmid int) {
 	r.a.mu.Lock()
 	defer r.a.mu.Unlock()
 	r.vmid = vmid
+}
+
+func (r *fakeReservation) ExpectPoweredOff() {
+	r.a.mu.Lock()
+	defer r.a.mu.Unlock()
+	r.a.expectedOff++
 }
 
 func (r *fakeReservation) Release() {
@@ -121,14 +130,11 @@ func (a *fakeAdmitter) ReserveExisting(_ context.Context, node string, shape nod
 	res, ok, err := a.reserve(node, shape, nil)
 	if ok {
 		res.Bind(vmid)
+		if a.onReserveExisting != nil {
+			a.onReserveExisting(vmid)
+		}
 	}
 	return res, ok, err
-}
-
-func (a *fakeAdmitter) RetiresOnlyWhenPowered() bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.poweredOnlyRetire
 }
 
 func (a *fakeAdmitter) reserve(node string, shape nodecap.Shape, freeing []int) (nodecap.Reservation, bool, error) {

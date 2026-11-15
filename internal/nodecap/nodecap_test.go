@@ -113,6 +113,20 @@ func (rs *resourceServer) setNodeStatus(node string, free, total uint64) {
 	}
 }
 
+// setNodeCPU adds a measured CPU-usage reading (0..1) to a node's
+// /status payload, for host_usage CPU mode.
+func (rs *resourceServer) setNodeCPU(node string, cpu float64) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if rs.nodeStatus == nil {
+		rs.nodeStatus = map[string]map[string]any{}
+	}
+	if rs.nodeStatus[node] == nil {
+		rs.nodeStatus[node] = map[string]any{}
+	}
+	rs.nodeStatus[node]["cpu"] = cpu
+}
+
 func (rs *resourceServer) setRows(rows []map[string]any) {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
@@ -1206,9 +1220,10 @@ func TestReserveExistingAllocatedModeChargesOnce(t *testing.T) {
 	require.False(t, ok, "the node is genuinely full")
 }
 
-// TestReserveExistingPoweredVMIsAdmitted: a VM that is somehow already
-// running is in every reading; admitting it must not need fresh room.
-func TestReserveExistingPoweredVMIsAdmitted(t *testing.T) {
+// TestReserveExistingChecksEvenWhenPowered: a cached "powered" reading
+// can be stale (a snapshot-recycled VM is back at Warm and stopped), so
+// the check is never skipped.
+func TestReserveExistingChecksEvenWhenPowered(t *testing.T) {
 	t.Parallel()
 	rs := newResourceServer(t, []map[string]any{
 		nodeRow("pve1", 32*gib, 16),
@@ -1221,16 +1236,104 @@ func TestReserveExistingPoweredVMIsAdmitted(t *testing.T) {
 	})
 	_, ok, err := a.ReserveExisting(context.Background(), "pve1", Shape{MemoryBytes: 8 * gib}, 10001)
 	require.NoError(t, err)
-	require.True(t, ok)
+	require.False(t, ok, "no free memory, no start — whatever the cached power state says")
 }
 
-// TestRetiresOnlyWhenPowered pins the mode rule the pool relies on to
-// release a powered-off warm clone's claim.
-func TestRetiresOnlyWhenPowered(t *testing.T) {
+// TestExpectPoweredOffRetiresOnObservation: a warm clone's claim in
+// host_available + host_usage modes retires once its stopped row is
+// observed, instead of holding its full shape until the TTL.
+func TestExpectPoweredOffRetiresOnObservation(t *testing.T) {
 	t.Parallel()
 	rs := newResourceServer(t, []map[string]any{nodeRow("pve1", 32*gib, 16)})
 	rs.setNodeStatus("pve1", 32*gib, 32*gib)
-	require.False(t, newAccountant(t, rs, nil).RetiresOnlyWhenPowered(), "allocated mode retires on observation")
-	require.True(t, newAccountant(t, rs, func(o *Options) { o.MemoryMode = MemoryModeHostAvailable }).RetiresOnlyWhenPowered())
-	require.True(t, newAccountant(t, rs, func(o *Options) { o.CPUMode = CPUModeHostUsage; o.CPUUsageLimit = 0.8 }).RetiresOnlyWhenPowered())
+	rs.setNodeCPU("pve1", 0)
+	a := newAccountant(t, rs, func(o *Options) {
+		o.MemoryMode = MemoryModeHostAvailable
+		o.CPUMode = CPUModeHostUsage
+		o.CPUUsageLimit = 0.8
+		o.ReserveBytes = 0
+	})
+	ctx := context.Background()
+
+	res, ok, err := a.Reserve(ctx, "pve1", Shape{MemoryBytes: 16 * gib, VCPUs: 4})
+	require.NoError(t, err)
+	require.True(t, ok)
+	res.Bind(10001)
+	res.ExpectPoweredOff()
+
+	rs.setRows([]map[string]any{nodeRow("pve1", 32*gib, 16), stoppedGuestRow(10001, "pve1", 16*gib, 4)})
+	settle()
+	states, err := a.Snapshot(ctx)
+	require.NoError(t, err)
+	require.Equal(t, uint64(32*gib), states["pve1"].AvailableBytes,
+		"the observed stopped warm VM holds nothing in host mode")
+
+	// A plain (to-be-powered) clone claim in the same position is still held.
+	res2, ok, err := a.Reserve(ctx, "pve1", Shape{MemoryBytes: 16 * gib, VCPUs: 4})
+	require.NoError(t, err)
+	require.True(t, ok)
+	res2.Bind(10002)
+	rs.setRows([]map[string]any{nodeRow("pve1", 32*gib, 16),
+		stoppedGuestRow(10001, "pve1", 16*gib, 4), stoppedGuestRow(10002, "pve1", 16*gib, 4)})
+	settle()
+	states, err = a.Snapshot(ctx)
+	require.NoError(t, err)
+	require.Equal(t, uint64(16*gib), states["pve1"].AvailableBytes,
+		"a hot clone not yet powered on keeps withholding its shape")
+}
+
+// TestExpectPoweredOffAllocatedModeNoUndercount: in allocated mode the
+// claim is kept until the row is observed, so there is no window where
+// the warm VM is counted by neither (the early-release bug).
+func TestExpectPoweredOffAllocatedModeNoUndercount(t *testing.T) {
+	t.Parallel()
+	rs := newResourceServer(t, []map[string]any{nodeRow("pve1", 16*gib, 16)})
+	rs.setNodeStatus("pve1", 16*gib, 16*gib)
+	rs.setNodeCPU("pve1", 0)
+	a := newAccountant(t, rs, func(o *Options) {
+		o.ReserveBytes = 0
+		o.CPUMode = CPUModeHostUsage
+		o.CPUUsageLimit = 0.8
+		o.Refresh = time.Minute // the snapshot does not see the new row yet
+	})
+	ctx := context.Background()
+
+	res, ok, err := a.Reserve(ctx, "pve1", Shape{MemoryBytes: 8 * gib, VCPUs: 2})
+	require.NoError(t, err)
+	require.True(t, ok)
+	res.Bind(10001)
+	res.ExpectPoweredOff()
+
+	_, ok, err = a.Reserve(ctx, "pve1", Shape{MemoryBytes: 8 * gib, VCPUs: 2})
+	require.NoError(t, err)
+	require.True(t, ok)
+	_, ok, err = a.Reserve(ctx, "pve1", Shape{MemoryBytes: 8 * gib, VCPUs: 2})
+	require.NoError(t, err)
+	require.False(t, ok, "16 GiB holds two 8 GiB VMs, never three")
+}
+
+// TestHostModeFreeingStoppedVMGivesNoCredit: destroying a powered-off VM
+// frees no host memory in host_available mode, so eviction must not be
+// able to reserve against it.
+func TestHostModeFreeingStoppedVMGivesNoCredit(t *testing.T) {
+	t.Parallel()
+	rs := newResourceServer(t, []map[string]any{
+		nodeRow("pve1", 32*gib, 16),
+		stoppedGuestRow(10001, "pve1", 8*gib, 4),
+		guestRow(10002, "pve1", 8*gib, 4),
+	})
+	rs.setNodeStatus("pve1", 4*gib, 32*gib)
+	a := newAccountant(t, rs, func(o *Options) {
+		o.MemoryMode = MemoryModeHostAvailable
+		o.ReserveBytes = 0
+		o.Refresh = time.Minute
+	})
+	ctx := context.Background()
+
+	_, ok, err := a.ReserveFreeing(ctx, "pve1", Shape{MemoryBytes: 8 * gib}, []int{10001})
+	require.NoError(t, err)
+	require.False(t, ok, "a stopped victim frees nothing")
+	_, ok, err = a.ReserveFreeing(ctx, "pve1", Shape{MemoryBytes: 8 * gib}, []int{10002})
+	require.NoError(t, err)
+	require.True(t, ok, "a running victim frees its memory")
 }
