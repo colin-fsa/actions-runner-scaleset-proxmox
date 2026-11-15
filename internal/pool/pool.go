@@ -307,6 +307,11 @@ type CapacityAdmitter interface {
 	// path, which has just committed those VMs to destruction.
 	ReserveFreeing(ctx context.Context, node string, shape nodecap.Shape, freeing []int) (nodecap.Reservation, bool, error)
 
+	// ReserveExisting claims shape on node for an existing powered-off VM
+	// about to be started (warm-to-hot promotion), charging the VM
+	// exactly once. The reservation is already bound to vmid.
+	ReserveExisting(ctx context.Context, node string, shape nodecap.Shape, vmid int) (nodecap.Reservation, bool, error)
+
 	// Snapshot returns per-node capacity, for gauges and eviction
 	// planning.
 	Snapshot(ctx context.Context) (map[string]nodecap.NodeState, error)

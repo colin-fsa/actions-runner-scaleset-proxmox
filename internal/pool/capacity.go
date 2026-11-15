@@ -55,6 +55,15 @@ func (c capacityClaim) bind(vmid int) {
 	}
 }
 
+// expectPoweredOff marks the claim's VM as staying powered off (a warm
+// clone), so the accountant retires it on observation; see
+// nodecap.Reservation.ExpectPoweredOff.
+func (c capacityClaim) expectPoweredOff() {
+	if c.res != nil {
+		c.res.ExpectPoweredOff()
+	}
+}
+
 // admitClone decides where one clone of ps goes and claims the capacity
 // for it. It is the whole admission decision for a dispatch: a false
 // bool means "not now", and the caller abandons the dispatch before
@@ -280,6 +289,48 @@ func (m *manager) profileTemplateNode(ctx context.Context, ps *profileState) (st
 	return m.cfg.TemplateNode, true
 }
 
+// admitPromotion claims capacity for starting the warm VM w. It is the
+// promotion counterpart of admitClone: the same shared accountant, so a
+// promotion competes for memory with every clone and promotion of every
+// profile, and concurrent promotions cannot claim the same in-flight
+// capacity twice (see nodecap.ReserveExisting for what that excludes).
+//
+// A refusal is counted like a deferred hot clone but deliberately does
+// NOT arm idle eviction: eviction would pick this profile's own stopped
+// warm VMs — destroying the very VMs that could not be started — and a
+// stopped VM frees no host memory to admit against. It only holds warm
+// refill for the pass (capacityDeferredPromote).
+//
+// The VM's own profile sets the shape. A row whose profile is gone from
+// config is still admitted against the default profile's shape rather
+// than started unchecked.
+func (m *manager) admitPromotion(ctx context.Context, w *store.VM) (capacityClaim, bool) {
+	if m.cfg.Capacity == nil {
+		return capacityClaim{release: func() {}}, true
+	}
+	ps := m.profileOf(w.Profile)
+	if ps == nil {
+		ps = m.profileOf(m.defaultProfile())
+	}
+	if ps == nil {
+		m.log.Warn("promote: no profile to size the VM; deferring", "vmid", w.VMID, "profile", w.Profile)
+		return capacityClaim{}, false
+	}
+	res, ok, err := m.cfg.Capacity.ReserveExisting(ctx, w.Node, shapeOf(ps.settings), w.VMID)
+	if err != nil {
+		m.recordPromotionDeferral(ps, w.Node)
+		m.log.Warn("promote: capacity unknown; deferring", "profile", ps.settings.Name, "vmid", w.VMID, "node", w.Node, "err", err)
+		return capacityClaim{}, false
+	}
+	if !ok {
+		m.recordPromotionDeferral(ps, w.Node)
+		m.log.Debug("promote: deferred, node is at capacity",
+			"profile", ps.settings.Name, "vmid", w.VMID, "node", w.Node, "memory_mb", ps.settings.MemoryMB)
+		return capacityClaim{}, false
+	}
+	return claimFor(res), true
+}
+
 // reserveCapacity claims capacity for one clone of ps on node.
 //
 // The returned bool is the admission decision: false means "no room
@@ -315,6 +366,18 @@ func (m *manager) reserveCapacity(ctx context.Context, ps *profileState, node st
 
 func claimFor(res nodecap.Reservation) capacityClaim {
 	return capacityClaim{res: res, release: sync.OnceFunc(res.Release)}
+}
+
+// recordPromotionDeferral counts one warm promotion the capacity gate
+// turned away. It shares the clone-deferral metric (kind=hot: it is
+// unmet job demand) but not the eviction trigger; see admitPromotion.
+func (m *manager) recordPromotionDeferral(ps *profileState, node string) {
+	ps.capacityDeferredPromote.Store(true)
+	if m.metrics == nil {
+		return
+	}
+	m.metrics.CloneDeferredCapacity.
+		WithLabelValues(m.cfg.ScaleSetName, metricsProfile(ps.settings.Name), node, string(store.PoolKindHot)).Inc()
 }
 
 // recordCapacityDeferral counts one clone the capacity gate turned away
