@@ -75,7 +75,11 @@ container, `InjectJITConfig` does the following:
 
 1. Checks the JIT. It must be base64 and decode to a JSON object, and it must
    not contain NUL, newline or other control characters.
-2. `PUT /lxc/{id}/config env=ACTIONS_RUNNER_JIT_CONFIG=<jit>`. On a running
+2. Sets `ACTIONS_RUNNER_JIT_CONFIG=<jit>` in the container's `env` option.
+   Proxmox replaces the whole NUL-separated list when `env` is written, so the
+   orchestrator reads the current list first. Other variables inherited from
+   the template (e.g. `NEXT_TELEMETRY_DISABLED=1`) are kept in order, any
+   earlier JIT entry is removed, and the new entry is appended. On a running
    container, Proxmox stores the change as pending.
 3. `POST /lxc/{id}/status/reboot`, or `status/start` if the container is
    stopped. Proxmox stops the container, applies the pending change and starts
@@ -164,8 +168,14 @@ over-counts what idle containers actually use. Bound the worst case with
    installed somewhere else,
    `RUNNER_USER=runner`), set them in `/etc/default/lxc-runner-bootstrap`.
 4. Shut the container down and check that the template is clean:
-   - `pct config <id>` must have **no `env:` line**. Clones inherit the config,
-     and a JIT there would mark every clone as used.
+   - The `env:` line in `pct config <id>` must have **no
+     `ACTIONS_RUNNER_JIT_CONFIG` entry**. Clones inherit the config, and a JIT
+     there would mark every clone as used. Other variables are fine and are
+     kept when the JIT is set.
+   - Prefer **no `protection: 1`**. Clones inherit it; the orchestrator clears
+     it on each clone, but a clone whose setup failed before that step keeps
+     it. Destroy then fails with an error naming protection, and the
+     orchestrator never clears protection on its own.
    - It must have **no orchestrator owner tags**. Clones get their tags from
      the orchestrator.
    - There must be no runner registration state in the runner directory

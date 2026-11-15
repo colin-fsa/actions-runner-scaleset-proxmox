@@ -737,3 +737,54 @@ func TestLXC_InjectJITConfigEnsuresFirewall(t *testing.T) {
 		"group rule, options and NIC flag land before the env is set and the container boots")
 	require.Equal(t, "name=eth0,bridge=vmbr0,firewall=1", f.cts[10090].Config["net0"])
 }
+
+// PVE's env option replaces the whole list. Template variables (e.g.
+// NEXT_TELEMETRY_DISABLED=1 on real templates) must survive, in order,
+// and a previous JIT entry must be replaced rather than duplicated.
+func TestLXC_InjectJITConfigMergesExistingEnv(t *testing.T) {
+	t.Parallel()
+	f, srv := newLXCFake(t)
+	f.cts[10095] = &lxcCT{Name: "c", Running: true, Config: map[string]any{
+		"env": "NEXT_TELEMETRY_DISABLED=1\x00ACTIONS_RUNNER_JIT_CONFIG=old\x00TZ=UTC",
+	}}
+	p := newLXCProvisioner(t, srv)
+	jit := validJIT(t)
+	require.NoError(t, p.InjectJITConfig(context.Background(), &VM{VMID: 10095, Node: "pve1", GuestType: config.GuestTypeLXC}, jit))
+	put := f.find(http.MethodPut, "/nodes/pve1/lxc/10095/config")
+	require.Len(t, put, 1)
+	require.Equal(t, "NEXT_TELEMETRY_DISABLED=1\x00TZ=UTC\x00ACTIONS_RUNNER_JIT_CONFIG="+jit, put[0].Body["env"])
+
+	got, err := p.ReadJITConfig(context.Background(), &VM{VMID: 10095, Node: "pve1", GuestType: config.GuestTypeLXC})
+	require.NoError(t, err)
+	require.Equal(t, jit, string(got))
+
+	require.Equal(t, "ACTIONS_RUNNER_JIT_CONFIG=x", mergeLXCJITEnv("", "x"))
+	require.Equal(t, "A=1\x00ACTIONS_RUNNER_JIT_CONFIG=x", mergeLXCJITEnv("A=1\x00\x00ACTIONS_RUNNER_JIT_CONFIG=y", "x"))
+}
+
+// A container whose env carries only unrelated variables has not been
+// handed a job: ReadJITConfig (which adoption relies on) reports empty.
+func TestLXC_ReadJITConfigIgnoresUnrelatedEnv(t *testing.T) {
+	t.Parallel()
+	f, srv := newLXCFake(t)
+	f.cts[10096] = &lxcCT{Name: "c", Config: map[string]any{"env": "NEXT_TELEMETRY_DISABLED=1"}}
+	p := newLXCProvisioner(t, srv)
+	got, err := p.ReadJITConfig(context.Background(), &VM{VMID: 10096, Node: "pve1", GuestType: config.GuestTypeLXC})
+	require.NoError(t, err)
+	require.Empty(t, got)
+}
+
+// A protected guest is not destroyed and the error says why.
+func TestLXC_DestroyProtectedGuestExplains(t *testing.T) {
+	t.Parallel()
+	f, srv := newLXCFake(t)
+	f.cts[10097] = &lxcCT{Name: "c", Config: map[string]any{"protection": 1}}
+	f.failPath["DELETE /nodes/pve1/lxc/10097"] = "can't remove CT 10097 - protection mode enabled"
+	p := newLXCProvisioner(t, srv)
+	err := p.Destroy(context.Background(), &VM{VMID: 10097, Node: "pve1", GuestType: config.GuestTypeLXC})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "ct 10097 has protection enabled")
+	require.Contains(t, f.cts, 10097)
+	require.Empty(t, f.find(http.MethodPut, "/nodes/pve1/lxc/10097/config"), "protection is never cleared automatically")
+	require.NoError(t, errIfProtected(nil, "vm", 1))
+}
