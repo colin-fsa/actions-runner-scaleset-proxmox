@@ -66,6 +66,10 @@ type ProfileSettings struct {
 	Name    string
 	GuestOS string
 
+	// GuestType is config.GuestTypeQEMU (default when empty) or
+	// config.GuestTypeLXC; passed through to provisioner.CloneOptions.
+	GuestType string
+
 	// HotSize / WarmSize / MaxConcurrentRunners / BootMaxAttempts
 	// override the top-level Config fields when > 0.
 	HotSize              int
@@ -1208,8 +1212,12 @@ func (m *manager) adoptOne(ctx context.Context, pv *provisioner.VM, runners map[
 	if unknownProfile {
 		m.log.Warn("adopt: unknown profile; destroying inherited vm", "vmid", pv.VMID, "profile", pv.Profile)
 		state = store.StateDestroying
-	} else if ps := m.profileOf(profile); ps != nil && ps.settings.GuestOS == "windows" {
-		if state == store.StateWarm && !m.snapshotRecycle() {
+	} else if ps := m.profileOf(profile); ps != nil && (ps.settings.GuestOS == "windows" || ps.settings.GuestType == config.GuestTypeLXC) {
+		// Windows and LXC guests both expose whether a JIT config was
+		// already handed over (agent file / container env). A Hot row
+		// that already holds one is serving a job: re-injecting into an
+		// LXC container would reboot it mid-job.
+		if state == store.StateWarm && ps.settings.GuestOS == "windows" && !m.snapshotRecycle() {
 			state = store.StateDestroying
 		} else if state == store.StateHot {
 			readCtx, cancel := context.WithTimeout(ctx, adoptPowerStateTimeoutPerVM)
@@ -2270,6 +2278,7 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 		Name:          prep.name,
 		Linked:        m.cfg.LinkedClones,
 		PoweredOn:     cloneStartsVM,
+		GuestType:     prep.ps.settings.GuestType,
 		Profile:       prep.profileName,
 		TemplateVMID:  prep.templateVMID,
 		TemplateClass: prep.templateClass,
