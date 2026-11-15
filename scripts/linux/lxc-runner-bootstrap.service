@@ -1,0 +1,23 @@
+[Unit]
+Description=GitHub Actions JIT runner for LXC (one job, then poweroff)
+Documentation=https://github.com/jeffresc/actions-runner-scaleset-proxmox/blob/main/docs/lxc-runners.md
+# The runner must reach github.com.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Runs as root to read /proc/1/environ; the runner itself is started as the
+# unprivileged runner user by the script. Without a JIT config in the
+# container environment the script exits 0 and the container idles.
+Type=simple
+ExecStart=/usr/local/sbin/lxc-runner-bootstrap
+Restart=no
+TimeoutStartSec=0
+# Keep the runner's job processes in this unit so stopping it stops them.
+KillMode=control-group
+# Never echo the environment or arguments into the journal.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
