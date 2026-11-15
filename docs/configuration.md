@@ -62,6 +62,11 @@ startup error rather than a runtime surprise. Notable rules:
 - Every profile must advertise exactly its scale set's labels. Profiles in a
   scale set must use the same `guest_os`; separate Linux and Windows into
   different scale sets. See [Windows runners](windows-runners.md).
+- `guest_type` is `qemu` (default) or `lxc`. An `lxc` profile must be Linux,
+  must set its own `template_vmid`, and cannot have a `network:` block. It
+  cannot share a scale set with `qemu` profiles under
+  `pool.recycle_mode: snapshot_rollback`. A scale set made only of LXC
+  profiles always uses destroy recycling. See [LXC runners](lxc-runners.md).
 - `nodes.affinity` rules naming an undeclared profile or node are rejected.
 - With more than one scale set declared, every entry must carry its own
   `vmid_range` and the ranges must be pairwise disjoint.

@@ -167,6 +167,7 @@ Full walkthrough, including GitHub App auth and verification steps:
 | --- | --- |
 | [Getting started](docs/getting-started.md) | End-to-end first run: template, tokens, config, verification, troubleshooting |
 | [Architecture](docs/architecture.md) | Job lifecycle, VM state machine, control loops, crash recovery, package map |
+| [LXC runners](docs/lxc-runners.md) | Linux runners as unprivileged Proxmox containers: `guest_type: lxc`, env-based JIT delivery, template build |
 | [Windows runners](docs/windows-runners.md) | Windows templates (Packer, `prepare-windows-template`, manual), session modes, mixed OS configuration, validation |
 | [Configuration](docs/configuration.md) | Config blocks, env-var overrides, validation rules, GHES |
 | [Profiles and scaling](docs/profiles-and-scaling.md) | Hot/warm pools, profiles, where labels are matched, networking, schedules, canaries, quotas |
