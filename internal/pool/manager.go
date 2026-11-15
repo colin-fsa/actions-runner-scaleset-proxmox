@@ -65,6 +65,10 @@ type ProfileSettings struct {
 	// "default" profile when the slice is empty.
 	Name string
 
+	// GuestType is config.GuestTypeQEMU (default when empty) or
+	// config.GuestTypeLXC; passed through to provisioner.CloneOptions.
+	GuestType string
+
 	// HotSize / WarmSize / MaxConcurrentRunners / BootMaxAttempts
 	// override the top-level Config fields when > 0.
 	HotSize              int
@@ -1202,6 +1206,17 @@ func (m *manager) adoptOne(ctx context.Context, pv *provisioner.VM, runners map[
 		}
 		profile = m.defaultProfile()
 	}
+	// A Hot LXC container whose env already holds a JIT config is
+	// serving a job: re-injecting would reboot it mid-job, so adopt it
+	// as Assigned (also when the config cannot be read).
+	if ps := m.profileOf(profile); ps != nil && ps.settings.GuestType == config.GuestTypeLXC && state == store.StateHot {
+		readCtx, cancel := context.WithTimeout(ctx, adoptPowerStateTimeoutPerVM)
+		jit, err := m.prov.ReadJITConfig(readCtx, &provisioner.VM{VMID: pv.VMID, Node: pv.Node, Name: pv.Name, Profile: profile})
+		cancel()
+		if err != nil || len(jit) != 0 {
+			state = store.StateAssigned
+		}
+	}
 	// Snapshot-rollback mode: a stopped VM found at startup may carry a
 	// dirty disk (the previous leader crashed mid-job or between the
 	// job and the rollback). Adopt it into Recycling and queue a
@@ -2203,6 +2218,7 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 		Name:          prep.name,
 		Linked:        m.cfg.LinkedClones,
 		PoweredOn:     cloneStartsVM,
+		GuestType:     prep.ps.settings.GuestType,
 		Profile:       prep.profileName,
 		TemplateVMID:  prep.templateVMID,
 		TemplateClass: prep.templateClass,

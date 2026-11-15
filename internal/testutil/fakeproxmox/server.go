@@ -230,6 +230,10 @@ func (s *Server) routes() http.Handler {
 	r.Get("/nodes", s.handleListNodes)
 	r.Get("/nodes/{node}/status", s.handleNodeStatus)
 	r.Get("/nodes/{node}/qemu", s.handleListVMs)
+	// The fake models QEMU guests only; the container index is always
+	// empty so the provisioner's ListOwnedVMs (which lists both kinds)
+	// sees a well-formed, empty LXC listing.
+	r.Get("/nodes/{node}/lxc", s.handleListContainers)
 	r.Get("/nodes/{node}/qemu/{vmid}/status/current", s.handleVMStatus)
 	r.Get("/nodes/{node}/qemu/{vmid}/config", s.handleVMConfig)
 	r.Post("/nodes/{node}/qemu/{vmid}/clone", s.handleClone)
@@ -439,6 +443,10 @@ func (s *Server) handleListVMs(w http.ResponseWriter, r *http.Request) {
 		out = append(out, vmJSON(v))
 	}
 	writeData(w, out)
+}
+
+func (s *Server) handleListContainers(w http.ResponseWriter, _ *http.Request) {
+	writeData(w, []map[string]any{})
 }
 
 // handleVMConfig returns the VM's qemu config. go-proxmox's

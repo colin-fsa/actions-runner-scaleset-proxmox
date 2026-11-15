@@ -741,7 +741,7 @@ func runOneScaleset(leaderCtx context.Context, deps runOneScalesetDeps, entry co
 		MaxConcurrentRunners: effectiveMaxConcurrent(entry.MaxConcurrentRunners),
 		ReconcileInterval:    cfg.Pool.ReconcileInterval.D(),
 		PowerPollInterval:    cfg.Pool.PowerPollInterval.D(),
-		RecycleMode:          cfg.Pool.RecycleMode,
+		RecycleMode:          cfg.RecycleModeFor(entry),
 		VMMaxAge:             cfg.Pool.VMMaxAge.D(),
 		DrainTimeout:         cfg.Pool.DrainTimeout.D(),
 		BootMaxAttempts:      cfg.Pool.BootMaxAttempts,
@@ -890,6 +890,7 @@ func initScalesetStates(ctx context.Context, cfg *config.Config, log *slog.Logge
 	for _, s := range cfg.Scalesets {
 		vmPrefix := fmt.Sprintf("gh-runner-%s-", s.Name)
 		prov, err := provisioner.New(ctx, cfg.Proxmox, s.Name, vmPrefix, provisioner.Options{
+			Profiles:             s.Profiles,
 			CloneInflightTTL:     cfg.Pool.CloneInflightGrace.D(),
 			RecentlyDestroyedTTL: cfg.Pool.VMIDReuseCooldown.D() * 4,
 		}, log)
@@ -1474,6 +1475,7 @@ func profileSettingsForScaleset(ss config.ScaleSetEntry, cfg *config.Config) []p
 	for _, p := range ss.Profiles {
 		out = append(out, pool.ProfileSettings{
 			Name:                 p.Name,
+			GuestType:            p.GuestTypeOrDefault(),
 			HotSize:              p.HotSizeOrDefault(cfg.Pool.HotSize),
 			WarmSize:             p.WarmSizeOrDefault(cfg.Pool.WarmSize),
 			MaxConcurrentRunners: effectiveMaxConcurrent(p.MaxConcurrentRunnersOrDefault(ss.MaxConcurrentRunners)),

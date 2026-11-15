@@ -74,11 +74,18 @@ var (
 // the empty string when no profile tag is present, which Adopt then
 // treats as the default profile). Other call sites that construct VM
 // without a profile context can leave it empty.
+//
+// GuestType is "qemu" or "lxc" (config.GuestTypeQEMU / GuestTypeLXC).
+// Clone and ListOwnedVMs populate it. Call sites that construct a VM
+// from a store row may leave it empty: the provisioner then resolves it
+// from the row's profile (see resolveGuestType), so the store does not
+// need to persist the guest type.
 type VM struct {
-	VMID    int
-	Node    string
-	Name    string
-	Profile string
+	VMID      int
+	Node      string
+	Name      string
+	Profile   string
+	GuestType string
 }
 
 // CloneOptions are passed to [Provisioner.Clone]. NewVMID is allocated by
@@ -101,6 +108,11 @@ type CloneOptions struct {
 	Name      string
 	Linked    bool
 	PoweredOn bool
+
+	// GuestType selects a QEMU VM ("qemu", the default when empty) or an
+	// LXC container ("lxc") clone. Empty falls back to the profile's
+	// configured guest_type.
+	GuestType string
 
 	Profile      string
 	TemplateVMID int
@@ -230,6 +242,11 @@ type pmox struct {
 	templateNode string
 	log          *slog.Logger
 
+	// profiles are this scale set's runner profiles by name. The
+	// provisioner reads only their guest type and template VMIDs, to
+	// route each call to the qemu or lxc API (see resolveGuestType).
+	profiles map[string]config.ProfileConfig
+
 	// inFlightClones tracks VMIDs currently inside Clone() between the
 	// PVE qmclone task returning and the follow-up qmconfig that applies
 	// our owner tags. ListOwnedVMs consults this so the brief untagged
@@ -253,11 +270,22 @@ type pmox struct {
 	// (typically shorter) cooldown. Set via the constructor from
 	// pool.vmid_reuse_cooldown × 4; zero falls back to a 10m default.
 	recentlyDestroyed *ttlcache.Cache[int, time.Time]
+
+	// jitRestarts tracks LXC containers currently being restarted by
+	// InjectJITConfig so the new runtime environment reaches init.
+	// PowerState reports such a container as "running" so the pool's
+	// power poller does not read the transient stop inside the reboot
+	// as job completion. The TTL bounds an entry if the restart hangs.
+	jitRestarts *ttlcache.Cache[int, time.Time]
 }
 
 // Options configures Provisioner trackers separate from the static
 // Proxmox connection settings. Zero values fall back to safe defaults.
 type Options struct {
+	// Profiles are the scale set's runner profiles, used to resolve each
+	// guest's type (qemu or lxc) from its profile.
+	Profiles []config.ProfileConfig
+
 	// CloneInflightTTL bounds how long an in-flight clone entry may
 	// live before the background sweep prunes it. Protects against
 	// a Clone() that hangs and never reaches its defer-Delete.
@@ -305,6 +333,11 @@ func New(ctx context.Context, cfg config.ProxmoxConfig, scaleSetName, vmNamePref
 		log:               log,
 		inFlightClones:    newTracker(opts.CloneInflightTTL),
 		recentlyDestroyed: newTracker(opts.RecentlyDestroyedTTL),
+		jitRestarts:       newTracker(lxcJITRestartTTL),
+		profiles:          make(map[string]config.ProfileConfig, len(opts.Profiles)),
+	}
+	for _, profile := range opts.Profiles {
+		p.profiles[profile.Name] = profile
 	}
 	if err := p.discoverTemplateNode(ctx); err != nil {
 		return nil, err
@@ -319,10 +352,12 @@ func New(ctx context.Context, cfg config.ProxmoxConfig, scaleSetName, vmNamePref
 	// the configured ceiling.
 	go p.inFlightClones.Start()
 	go p.recentlyDestroyed.Start()
+	go p.jitRestarts.Start()
 	go func() {
 		<-ctx.Done()
 		p.inFlightClones.Stop()
 		p.recentlyDestroyed.Stop()
+		p.jitRestarts.Stop()
 	}()
 	log.Info("provisioner ready", "template_vmid", cfg.TemplateVMID, "template_node", p.templateNode)
 	return p, nil
@@ -459,6 +494,12 @@ func (p *pmox) discoverTemplateNode(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("provisioner: list nodes: %w", err)
 	}
+	// A scale set made only of LXC profiles may have no QEMU template at
+	// all: discover the first profile's container template instead (LXC
+	// profiles always name one explicitly).
+	if lxcVMID, ok := p.allLXCTemplate(); ok {
+		return p.discoverLXCTemplateNode(ctx, statuses, lxcVMID)
+	}
 	var nonTemplateHits []string
 	for _, ns := range statuses {
 		nodeCtx, cancel := context.WithTimeout(ctx, templateDiscoveryTimeoutPerNode)
@@ -532,7 +573,7 @@ func isTemplate(vm *proxmox.VirtualMachine) bool {
 // qmclone task returning and the follow-up qmconfig that applies our
 // owner tags. The entry is removed on any return path (success or error).
 func (p *pmox) Clone(ctx context.Context, opts CloneOptions) (*VM, error) {
-	if opts.Linked && opts.Node != p.templateNode {
+	if opts.Linked && opts.Node != p.templateNode && p.cloneGuestType(opts) != config.GuestTypeLXC {
 		return nil, fmt.Errorf("%w: requested node=%s template_node=%s", ErrLinkedCloneCrossNode, opts.Node, p.templateNode)
 	}
 	p.inFlightClones.Set(opts.NewVMID, time.Now(), ttlcache.DefaultTTL)
@@ -542,6 +583,13 @@ func (p *pmox) Clone(ctx context.Context, opts CloneOptions) (*VM, error) {
 	templateNodeName, err := p.resolveTemplateNode(ctx, opts)
 	if err != nil {
 		return nil, err
+	}
+
+	if p.cloneGuestType(opts) == config.GuestTypeLXC {
+		if opts.Linked && opts.Node != templateNodeName {
+			return nil, fmt.Errorf("%w: requested node=%s template_node=%s", ErrLinkedCloneCrossNode, opts.Node, templateNodeName)
+		}
+		return p.cloneLXC(ctx, opts, templateVMID, templateNodeName)
 	}
 
 	templateNode, err := p.cli.Node(ctx, templateNodeName)
@@ -632,7 +680,7 @@ func (p *pmox) Clone(ctx context.Context, opts CloneOptions) (*VM, error) {
 		}
 	}
 
-	return &VM{VMID: newID, Node: resultNode, Name: opts.Name}, nil
+	return &VM{VMID: newID, Node: resultNode, Name: opts.Name, GuestType: config.GuestTypeQEMU}, nil
 }
 
 // applyFirewall attaches the configured datacenter security group to a
@@ -790,6 +838,9 @@ func (p *pmox) locateTemplate(ctx context.Context, templateVMID int) (string, er
 	if err != nil {
 		return "", fmt.Errorf("list nodes: %w", err)
 	}
+	if p.templateGuestType(templateVMID) == config.GuestTypeLXC {
+		return p.locateLXCTemplate(ctx, statuses, templateVMID)
+	}
 	for _, ns := range statuses {
 		nodeCtx, cancel := context.WithTimeout(ctx, templateDiscoveryTimeoutPerNode)
 		node, err := p.cli.Node(nodeCtx, ns.Node)
@@ -831,6 +882,9 @@ func (p *pmox) locateTemplate(ctx context.Context, templateVMID int) (string, er
 // no NIC, re-applying only the firewall options — an idempotent PUT —
 // so a duplicate group rule never accumulates across starts.
 func (p *pmox) Start(ctx context.Context, vm *VM) error {
+	if p.resolveGuestType(ctx, vm) == config.GuestTypeLXC {
+		return p.startLXC(ctx, vm)
+	}
 	pVM, err := p.getVM(ctx, vm)
 	if err != nil {
 		return err
@@ -930,6 +984,9 @@ func (p *pmox) startInternal(ctx context.Context, pVM *proxmox.VirtualMachine) e
 // Stop attempts a graceful Shutdown first; if that doesn't settle within
 // 60s it falls back to a hard Stop.
 func (p *pmox) Stop(ctx context.Context, vm *VM) error {
+	if p.resolveGuestType(ctx, vm) == config.GuestTypeLXC {
+		return p.stopLXC(ctx, vm)
+	}
 	pVM, err := p.getVM(ctx, vm)
 	if err != nil {
 		if isNotFound(err) {
@@ -975,6 +1032,9 @@ func (p *pmox) stopInternal(ctx context.Context, pVM *proxmox.VirtualMachine) er
 // Destroy stops (if needed) and deletes a VM. Idempotent: a missing VM is
 // treated as success.
 func (p *pmox) Destroy(ctx context.Context, vm *VM) error {
+	if p.resolveGuestType(ctx, vm) == config.GuestTypeLXC {
+		return p.destroyLXC(ctx, vm)
+	}
 	pVM, err := p.getVM(ctx, vm)
 	if err != nil {
 		if isNotFound(err) {
@@ -1019,6 +1079,9 @@ func (p *pmox) Destroy(ctx context.Context, vm *VM) error {
 // The 300s task budget mirrors Start's: snapshotting a stopped VM is
 // normally seconds, but slow storage under load deserves headroom.
 func (p *pmox) SnapshotCreate(ctx context.Context, vm *VM, name string) error {
+	if p.resolveGuestType(ctx, vm) == config.GuestTypeLXC {
+		return ErrLXCSnapshotUnsupported
+	}
 	pVM, err := p.getVM(ctx, vm)
 	if err != nil {
 		return classifyProxmoxError(err)
@@ -1039,6 +1102,9 @@ func (p *pmox) SnapshotCreate(ctx context.Context, vm *VM, name string) error {
 // snapshot surfaces as an error (wrapped ErrVMNotFound via the "does
 // not exist" classifier) so the caller's destroy fallback fires.
 func (p *pmox) SnapshotRollback(ctx context.Context, vm *VM, name string) error {
+	if p.resolveGuestType(ctx, vm) == config.GuestTypeLXC {
+		return ErrLXCSnapshotUnsupported
+	}
 	pVM, err := p.getVM(ctx, vm)
 	if err != nil {
 		return classifyProxmoxError(err)
@@ -1060,6 +1126,9 @@ func (p *pmox) PowerState(ctx context.Context, vm *VM) (string, error) {
 	if vm == nil {
 		return "", fmt.Errorf("power state: nil vm")
 	}
+	if p.resolveGuestType(ctx, vm) == config.GuestTypeLXC {
+		return p.powerStateLXC(ctx, vm)
+	}
 	pVM, err := p.getVM(ctx, vm)
 	if err != nil {
 		if isNotFound(err) {
@@ -1074,7 +1143,13 @@ func (p *pmox) PowerState(ctx context.Context, vm *VM) (string, error) {
 // or the timeout elapses. Errors are routed through classifyProxmoxError
 // so callers can errors.Is against ErrVMNotFound / ErrGuestAgentNotReady
 // regardless of which library internal raised the underlying failure.
+//
+// For an LXC container there is no guest agent: ready means the
+// container's status is "running" (see waitReadyLXC).
 func (p *pmox) WaitReady(ctx context.Context, vm *VM, timeout time.Duration) error {
+	if p.resolveGuestType(ctx, vm) == config.GuestTypeLXC {
+		return p.waitReadyLXC(ctx, vm, timeout)
+	}
 	pVM, err := p.getVM(ctx, vm)
 	if err != nil {
 		return classifyProxmoxError(err)
@@ -1119,13 +1194,28 @@ func (p *pmox) ListOwnedVMs(ctx context.Context) ([]*VM, error) {
 			continue
 		}
 		vms, err := node.VirtualMachines(nodeCtx)
-		cancel()
 		if err != nil {
+			cancel()
 			p.log.Warn("list-owned: list vms failed; skipping", "node", ns.Node, "err", err)
 			continue
 		}
 		for _, v := range vms {
 			if vm, keep := p.classifyVM(v, ns.Node); keep {
+				out = append(out, vm)
+			}
+		}
+		// Containers are listed on every scale set, not only ones with
+		// an LXC profile, so containers left behind after a profile is
+		// switched back to qemu are still found and reaped. A failure
+		// here keeps the node's VMs (partial results, as above).
+		cts, err := p.listContainers(nodeCtx, ns.Node)
+		cancel()
+		if err != nil {
+			p.log.Warn("list-owned: list containers failed; skipping containers", "node", ns.Node, "err", err)
+			continue
+		}
+		for _, ct := range cts {
+			if vm, keep := p.classifyGuest(int(ct.VMID), ct.Name, ct.Tags, ns.Node, config.GuestTypeLXC); keep { // #nosec G115 -- VMIDs are bounded well below MaxInt.
 				out = append(out, vm)
 			}
 		}
@@ -1140,13 +1230,20 @@ func (p *pmox) ListOwnedVMs(ctx context.Context) ([]*VM, error) {
 // ListOwnedVMs so the node→VM sweep reads linearly.
 func (p *pmox) classifyVM(v *proxmox.VirtualMachine, node string) (*VM, bool) {
 	vmid := int(v.VMID) // #nosec G115 -- VMIDs are bounded by VMIDRange (typically 10000..19999); overflow unreachable.
-	owned := tags.IsOwnedBy(v.Tags, p.scaleSetName)
+	return p.classifyGuest(vmid, v.Name, v.Tags, node, config.GuestTypeQEMU)
+}
+
+// classifyGuest is the guest-type-agnostic core of classifyVM, shared
+// by the QEMU and LXC listings so both are matched by the same owner
+// tag / name-prefix + VMID-range rules.
+func (p *pmox) classifyGuest(vmid int, name, guestTags, node, guestType string) (*VM, bool) {
+	owned := tags.IsOwnedBy(guestTags, p.scaleSetName)
 	// Untagged orphan detection — both predicates must hold so
 	// we never reap a human-created VM that just happens to
 	// sit in our range.
 	untaggedOrphan := !owned &&
 		p.vmNamePrefix != "" &&
-		strings.HasPrefix(v.Name, p.vmNamePrefix) &&
+		strings.HasPrefix(name, p.vmNamePrefix) &&
 		vmid >= p.cfg.VMIDRange.Min &&
 		vmid <= p.cfg.VMIDRange.Max
 	if !owned && !untaggedOrphan {
@@ -1160,10 +1257,10 @@ func (p *pmox) classifyVM(v *proxmox.VirtualMachine, node string) (*VM, bool) {
 		// observation is expected, not anomalous.
 		if p.inFlightClones.Has(vmid) {
 			p.log.Debug("list-owned: vm seen mid-clone; tag-apply pending",
-				"vmid", vmid, "node", node, "name", v.Name)
+				"vmid", vmid, "node", node, "name", name)
 		} else {
 			p.log.Warn("list-owned: untagged orphan detected (likely crash mid-clone)",
-				"vmid", vmid, "node", node, "name", v.Name)
+				"vmid", vmid, "node", node, "name", name)
 		}
 	}
 	// Decode the profile tag now so the adoption path can
@@ -1172,9 +1269,9 @@ func (p *pmox) classifyVM(v *proxmox.VirtualMachine, node string) (*VM, bool) {
 	// the default profile via tags.ProfileOf semantics.
 	profile := ""
 	if owned {
-		profile = tags.ProfileOf(v.Tags)
+		profile = tags.ProfileOf(guestTags)
 	}
-	return &VM{VMID: vmid, Node: node, Name: v.Name, Profile: profile}, true
+	return &VM{VMID: vmid, Node: node, Name: name, Profile: profile, GuestType: guestType}, true
 }
 
 // getVM resolves *VM into the library's *proxmox.VirtualMachine.

@@ -574,6 +574,27 @@ const (
 	RecycleModeSnapshotRollback = "snapshot_rollback"
 )
 
+// Guest types accepted by profiles[].guest_type. See
+// ProfileConfig.GuestType.
+const (
+	// GuestTypeQEMU clones a QEMU virtual machine (the default).
+	GuestTypeQEMU = "qemu"
+
+	// GuestTypeLXC clones an LXC container. The JIT config is delivered
+	// through the container's runtime environment rather than a guest
+	// agent.
+	GuestTypeLXC = "lxc"
+)
+
+// GuestTypeOrDefault returns the profile's guest type, defaulting an
+// empty value to GuestTypeQEMU.
+func (p ProfileConfig) GuestTypeOrDefault() string {
+	if p.GuestType == "" {
+		return GuestTypeQEMU
+	}
+	return p.GuestType
+}
+
 // PoolConfig configures pool sizes and timing.
 //
 // Pool-level HotSize / WarmSize / BootMaxAttempts / VMMaxAge are
@@ -711,6 +732,14 @@ type ProfileConfig struct {
 	// scaler's routing decisions. Must be unique across Profiles and
 	// match the sanitised-tag character set [a-z0-9-].
 	Name string `yaml:"name" validate:"required"`
+
+	// GuestType selects the Proxmox guest kind cloned for this profile:
+	// "qemu" (the default when empty) for a full VM, or "lxc" for an
+	// unprivileged container. LXC profiles need an explicit template_vmid
+	// naming a container template, cannot use the QEMU-only network
+	// block (NIC model strings and cloud-init ipconfig0) and are always
+	// recycled by destroy. See docs/lxc-runners.md.
+	GuestType string `yaml:"guest_type,omitempty"`
 
 	// Labels are the GitHub Actions labels this profile satisfies.
 	// The router (issue #7) picks a profile whose Labels are a
@@ -2226,6 +2255,9 @@ func (c *Config) validateProfiles() error {
 		}
 		seen := make(map[string]int, len(s.Profiles))
 		for i, p := range s.Profiles {
+			if err := c.validateProfileGuestType(si, s, i, p); err != nil {
+				return err
+			}
 			if !profileNameRE.MatchString(p.Name) {
 				return fmt.Errorf("scalesets[%d] %q.profiles[%d].name %q must match %s",
 					si, s.Name, i, p.Name, profileNameRE.String())
@@ -2290,6 +2322,70 @@ func (c *Config) validateProfiles() error {
 			c.Pool.GlobalMax, sumMax)
 	}
 	return nil
+}
+
+// validateProfileGuestType enforces the guest_type enum and the
+// constraints an LXC profile carries:
+//
+//   - containers are always recycled by destroy (snapshot rollback is
+//     implemented for QEMU VMs only). pool.recycle_mode is fleet-wide, so
+//     a scale set whose profiles are all LXC simply runs in destroy mode
+//     (see RecycleModeFor) while QEMU scale sets keep snapshot_rollback;
+//     mixing LXC and QEMU profiles in one scale set under
+//     snapshot_rollback is rejected because the QEMU profiles would
+//     silently lose snapshot recycling.
+//   - template_vmid must be explicit: the global proxmox.template_vmid is
+//     a QEMU template, and the provisioner locates templates per guest
+//     type, so an LXC profile must name its own container template.
+//   - no network block: profile NIC overrides render QEMU net<N> strings
+//     (NIC model, no interface name) and IPAM stamps the QEMU cloud-init
+//     ipconfig0 key, neither of which applies to a container. LXC clones
+//     keep the template's network interfaces.
+func (c *Config) validateProfileGuestType(si int, s *ScaleSetEntry, pi int, p ProfileConfig) error {
+	prefix := fmt.Sprintf("scalesets[%d] %q.profiles[%d] %q", si, s.Name, pi, p.Name)
+	switch p.GuestType {
+	case "", GuestTypeQEMU:
+		return nil
+	case GuestTypeLXC:
+	default:
+		return fmt.Errorf("%s: guest_type %q is not supported (must be %q or %q)", prefix, p.GuestType, GuestTypeQEMU, GuestTypeLXC)
+	}
+	if c.Pool.RecycleMode == RecycleModeSnapshotRollback && !s.allProfilesLXC() {
+		return fmt.Errorf("%s: guest_type lxc cannot share a scale set with qemu profiles under pool.recycle_mode %q (containers are always recycled by destroy); put the LXC profiles in their own scale set or use recycle_mode %q",
+			prefix, RecycleModeSnapshotRollback, RecycleModeDestroy)
+	}
+	if p.TemplateVMID <= 0 {
+		return fmt.Errorf("%s: guest_type lxc requires an explicit template_vmid naming an LXC container template", prefix)
+	}
+	if p.Network != nil {
+		return fmt.Errorf("%s: guest_type lxc does not support the network block (QEMU NIC overrides and cloud-init ipconfig0); configure the container template's interfaces instead", prefix)
+	}
+	return nil
+}
+
+// allProfilesLXC reports whether every profile of the scale set clones
+// LXC containers.
+func (e ScaleSetEntry) allProfilesLXC() bool {
+	if len(e.Profiles) == 0 {
+		return false
+	}
+	for _, p := range e.Profiles {
+		if p.GuestTypeOrDefault() != GuestTypeLXC {
+			return false
+		}
+	}
+	return true
+}
+
+// RecycleModeFor returns the recycle mode the pool manager of one scale
+// set runs with: pool.recycle_mode, except that a scale set of LXC
+// profiles always uses RecycleModeDestroy because snapshot rollback is
+// not implemented for containers.
+func (c *Config) RecycleModeFor(e ScaleSetEntry) string {
+	if e.allProfilesLXC() {
+		return RecycleModeDestroy
+	}
+	return c.Pool.RecycleMode
 }
 
 // validateProfileLabels enforces that a profile advertises exactly the
