@@ -21,7 +21,7 @@ scalesets:
         template_vmid: 9200    # an LXC container template; required for lxc
         cpu: 4                 # container cores
         memory_mb: 8192        # hard memory limit; swap is always set to 0
-        disk_gb: 40            # optional absolute rootfs resize
+        disk_gb: 40            # optional; must be LARGER than the template's rootfs
         hot_size: 1
 ```
 
@@ -88,9 +88,36 @@ the power poller from treating the brief stop as job completion.
 On restart, the bootstrap in the container reads the variable from
 `/proc/1/environ`, runs the runner once, and powers the container off. The
 power poller sees `stopped` and destroys the container. `ReadJITConfig` reads
-the value back from the container config. During adoption, a Hot container
-whose `env` already contains a JIT is classified as Assigned, so it never gets
-a second JIT (that would reboot it during a job).
+the value back from the container config. The `env` option is never cleared,
+because containers are destroyed rather than recycled. Adoption after a restart
+or leader change uses it like this:
+
+- A **stopped** container whose `env` contains a JIT has already been given a
+  job. It probably powered off before the power poller destroyed it. Its JIT
+  is used up and its filesystem is dirty, so it is **destroyed** and never
+  adopted as Warm.
+- A **running** container whose `env` contains a JIT is in its one runner
+  session. It is adopted as **Assigned**, so it never gets a second JIT (that
+  would reboot it during a job). It is destroyed when it powers off.
+- If the config can't be read, the stopped case is destroyed and the running
+  case is treated as Assigned.
+
+Before every container boot (`Start`, and the start or reboot that delivers
+the JIT), the firewall sandbox is checked again, as for QEMU VMs.
+
+Clones of one container template run one at a time. Unlike QEMU, Proxmox
+locks the source template (`lock: disk`) for the whole clone, so a second
+concurrent clone would fail with "CT is locked (disk)". If the template is
+locked by something else (another orchestrator, a manual clone), the clone
+is retried with backoff. A burst of N clones from one template therefore
+takes about N times one clone's time. Linked clones keep each one short.
+
+When a call doesn't say whether a guest is a VM or a container, and its
+profile doesn't either (for example the pool's destroy path), the provisioner
+asks the container API. If that check fails for any reason other than
+"does not exist", the operation returns an error and is retried later. It
+does not assume a QEMU VM, which would let a container be reported as
+already destroyed and leak.
 
 Security notes:
 
@@ -107,9 +134,12 @@ Security notes:
 ### Warm and hot pools
 
 A container starts in seconds, so warm pools matter much less than for VMs.
-A small `hot_size` (or none) is usually enough. Capacity admission counts LXC
-rows like VMs. A container's `memory` is a limit, not a reservation, so
-admission is conservative for containers.
+A small `hot_size` (or none) is usually enough.
+
+Capacity admission counts LXC rows like VMs, at each container's full
+`memory`. A container's `memory` is a limit, not a reservation, so this
+over-counts what idle containers actually use. Bound the worst case with
+`max_concurrent_runners` and `pool.capacity.reserve_memory_mb`.
 
 ## Building an LXC template
 
@@ -130,11 +160,24 @@ admission is conservative for containers.
    systemctl enable lxc-runner-bootstrap.service
    ```
 
-   To change the defaults (`RUNNER_DIR=/opt/actions-runner`,
+   To change the defaults (`RUNNER_DIR=/opt/actions-runner`, for a runner
+   installed somewhere else,
    `RUNNER_USER=runner`), set them in `/etc/default/lxc-runner-bootstrap`.
-4. Shut the container down, check that `pct config <id>` has no `env:` line,
-   and convert it to a template (`pct template <id>`). Use its VMID as the
+4. Shut the container down and check that the template is clean:
+   - `pct config <id>` must have **no `env:` line**. Clones inherit the config,
+     and a JIT there would mark every clone as used.
+   - It must have **no orchestrator owner tags**. Clones get their tags from
+     the orchestrator.
+   - There must be no runner registration state in the runner directory
+     (`.runner`, `.credentials`, `.credentials_rsaparams`).
+
+   Then convert it to a template (`pct template <id>`) and use its VMID as the
    profile's `template_vmid`.
+
+`disk_gb` resizes the clone's `rootfs` to an absolute size. Proxmox cannot
+shrink a container volume, and it errors when asked for the current size.
+So either leave `disk_gb` out (keep the template's size) or make it larger
+than the template's rootfs. Otherwise every clone fails.
 
 When the container boots without the variable, the bootstrap exits right away
 and the container idles. This is the hot/warm state.

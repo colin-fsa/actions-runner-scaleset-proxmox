@@ -53,17 +53,28 @@ type lxcFake struct {
 	failPath map[string]string // "METHOD path" -> 500 status text
 	rules    map[int][]map[string]any
 	tasks    int
+
+	// Source-template lock model: PVE holds `lock: disk` on the source
+	// container for the whole clone. A clone POST against a locked
+	// template is rejected; the lock is released when the clone task's
+	// status is read (the fake's tasks complete on first poll).
+	locked         map[int]bool
+	taskLocks      map[string]int
+	lockRejections int
+	forceLocked    int // reject this many clone POSTs as locked regardless
 }
 
 func newLXCFake(t *testing.T) (*lxcFake, *httptest.Server) {
 	t.Helper()
 	f := &lxcFake{
-		t:        t,
-		node:     "pve1",
-		cts:      map[int]*lxcCT{},
-		qemu:     `[]`,
-		failPath: map[string]string{},
-		rules:    map[int][]map[string]any{},
+		t:         t,
+		node:      "pve1",
+		cts:       map[int]*lxcCT{},
+		qemu:      `[]`,
+		failPath:  map[string]string{},
+		rules:     map[int][]map[string]any{},
+		locked:    map[int]bool{},
+		taskLocks: map[string]int{},
 	}
 	srv := httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(srv.Close)
@@ -143,6 +154,10 @@ func (f *lxcFake) serve(w http.ResponseWriter, r *http.Request) {
 		writeJSONData(w, out)
 		return
 	case len(parts) == 5 && parts[2] == "tasks":
+		if tmpl, ok := f.taskLocks[parts[3]]; ok {
+			delete(f.taskLocks, parts[3])
+			f.locked[tmpl] = false
+		}
 		writeJSONData(w, map[string]any{"upid": parts[3], "status": "stopped", "exitstatus": "OK"})
 		return
 	}
@@ -160,6 +175,14 @@ func (f *lxcFake) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method + " " + rest {
 	case "POST clone":
+		if f.forceLocked > 0 || f.locked[vmid] {
+			if f.forceLocked > 0 {
+				f.forceLocked--
+			}
+			f.lockRejections++
+			badRequest(w, fmt.Sprintf("CT %d is locked (disk)", vmid))
+			return
+		}
 		newID := int(body["newid"].(float64))
 		cfg := map[string]any{}
 		for k, v := range ct.Config {
@@ -167,7 +190,10 @@ func (f *lxcFake) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		delete(cfg, "template")
 		f.cts[newID] = &lxcCT{Name: fmt.Sprint(body["hostname"]), Config: cfg}
-		writeJSONData(w, f.newUPID("vzclone", vmid))
+		upid := f.newUPID("vzclone", vmid)
+		f.locked[vmid] = true
+		f.taskLocks[upid] = vmid
+		writeJSONData(w, upid)
 	case "GET config":
 		cfg := map[string]any{}
 		for k, v := range ct.Config {
@@ -545,17 +571,24 @@ func TestResolveGuestType(t *testing.T) {
 	// A QEMU-only scale set never probes.
 	qp := newTestProvisioner(t, srv, "pve1")
 	qp.profiles = map[string]config.ProfileConfig{"default": {Name: "default"}}
-	require.Equal(t, config.GuestTypeQEMU, qp.resolveGuestType(context.Background(), &VM{VMID: 10070, Node: "pve1"}))
+	resolve := func(p *pmox, vm *VM) string {
+		t.Helper()
+		gt, err := p.resolveGuestType(context.Background(), vm)
+		require.NoError(t, err)
+		return gt
+	}
+	require.Equal(t, config.GuestTypeQEMU, resolve(qp, &VM{VMID: 10070, Node: "pve1"}))
 	require.Empty(t, f.requests())
 
 	p := newLXCProvisioner(t, srv)
-	require.Equal(t, config.GuestTypeLXC, p.resolveGuestType(context.Background(), &VM{VMID: 1, Node: "pve1", GuestType: config.GuestTypeLXC}))
-	require.Equal(t, config.GuestTypeQEMU, p.resolveGuestType(context.Background(), &VM{VMID: 1, Node: "pve1", Profile: "vm"}))
-	require.Equal(t, config.GuestTypeLXC, p.resolveGuestType(context.Background(), &VM{VMID: 1, Node: "pve1", Profile: "ct"}))
+	require.Equal(t, config.GuestTypeLXC, resolve(p, &VM{VMID: 1, Node: "pve1", GuestType: config.GuestTypeLXC}))
+	require.Equal(t, config.GuestTypeQEMU, resolve(p, &VM{VMID: 1, Node: "pve1", Profile: "vm"}))
+	require.Equal(t, config.GuestTypeLXC, resolve(p, &VM{VMID: 1, Node: "pve1", Profile: "ct"}))
 	require.Empty(t, f.requests(), "explicit type and known profile resolve without API calls")
-	// No profile: probe.
-	require.Equal(t, config.GuestTypeLXC, p.resolveGuestType(context.Background(), &VM{VMID: 10070, Node: "pve1"}))
-	require.Equal(t, config.GuestTypeQEMU, p.resolveGuestType(context.Background(), &VM{VMID: 10071, Node: "pve1"}))
+	// No profile: probe. A container answers; "does not exist" means qemu
+	// (or absent from both).
+	require.Equal(t, config.GuestTypeLXC, resolve(p, &VM{VMID: 10070, Node: "pve1"}))
+	require.Equal(t, config.GuestTypeQEMU, resolve(p, &VM{VMID: 10071, Node: "pve1"}))
 
 	require.Equal(t, config.GuestTypeLXC, p.templateGuestType(9100))
 	require.Equal(t, config.GuestTypeQEMU, p.templateGuestType(9000))
@@ -587,4 +620,120 @@ func TestLXCTemplateDiscovery(t *testing.T) {
 	node, err := p.locateTemplate(context.Background(), 9100)
 	require.NoError(t, err)
 	require.Equal(t, "pve1", node)
+}
+
+// A transient failure of the guest-type probe must not be read as "this
+// is a qemu VM": the qemu lookup would say "does not exist", Destroy
+// would report success, and the container would leak.
+func TestLXC_DestroyFailsWhenGuestTypeUnknown(t *testing.T) {
+	t.Parallel()
+	f, srv := newLXCFake(t)
+	f.cts[10080] = &lxcCT{Name: "c", Running: true, Config: map[string]any{}}
+	f.failPath["GET /nodes/pve1/lxc/10080/status/current"] = "proxy timeout"
+	p := newLXCProvisioner(t, srv)
+
+	err := p.Destroy(context.Background(), &VM{VMID: 10080, Node: "pve1"})
+	require.ErrorIs(t, err, ErrGuestTypeUnknown)
+	require.Contains(t, f.cts, 10080, "the container must not be reported destroyed")
+	for _, r := range f.requests() {
+		require.NotContains(t, r.Path, "/qemu/", "an undetermined guest must not fall through to the qemu path")
+		require.NotEqual(t, http.MethodDelete, r.Method)
+	}
+	_, err = p.PowerState(context.Background(), &VM{VMID: 10080, Node: "pve1"})
+	require.ErrorIs(t, err, ErrGuestTypeUnknown)
+
+	// Once the probe works again the container is destroyed.
+	f.mu.Lock()
+	delete(f.failPath, "GET /nodes/pve1/lxc/10080/status/current")
+	f.mu.Unlock()
+	require.NoError(t, p.Destroy(context.Background(), &VM{VMID: 10080, Node: "pve1"}))
+	require.NotContains(t, f.cts, 10080)
+}
+
+// PVE locks the SOURCE container template for the whole clone, so
+// concurrent clones of one template must be serialised by the
+// provisioner rather than fail with "CT is locked (disk)".
+func TestLXCClone_ConcurrentClonesOfOneTemplateSerialize(t *testing.T) {
+	t.Parallel()
+	f, srv := newLXCFake(t)
+	f.cts[9100] = &lxcCT{Name: "tmpl", Template: true, Config: map[string]any{}}
+	p := newLXCProvisioner(t, srv)
+
+	const n = 6
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = p.Clone(context.Background(), CloneOptions{
+				NewVMID: 10100 + i, Node: "pve1", Name: fmt.Sprintf("n%d", i), Linked: true,
+				Profile: "ct", TemplateVMID: 9100,
+			})
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		require.NoError(t, err, "clone %d", i)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	require.Zero(t, f.lockRejections, "serialised clones must never hit the template lock")
+	for i := 0; i < n; i++ {
+		require.Contains(t, f.cts, 10100+i)
+	}
+}
+
+// A lock held by someone else (another orchestrator, a manual clone) is
+// retried with backoff; a persistent lock eventually fails the clone.
+func TestLXCClone_LockedTemplateRetried(t *testing.T) {
+	prevBase, prevMax := lxcCloneRetryBase, lxcCloneMaxAttempts
+	lxcCloneRetryBase, lxcCloneMaxAttempts = time.Millisecond, 4
+	t.Cleanup(func() { lxcCloneRetryBase, lxcCloneMaxAttempts = prevBase, prevMax })
+
+	f, srv := newLXCFake(t)
+	f.cts[9100] = &lxcCT{Name: "tmpl", Template: true, Config: map[string]any{}}
+	f.forceLocked = 2
+	p := newLXCProvisioner(t, srv)
+	_, err := p.Clone(context.Background(), CloneOptions{NewVMID: 10200, Node: "pve1", Name: "n", Linked: true, Profile: "ct", TemplateVMID: 9100})
+	require.NoError(t, err)
+	require.Len(t, f.find(http.MethodPost, "/nodes/pve1/lxc/9100/clone"), 3, "two locked attempts, then success")
+
+	f.mu.Lock()
+	f.forceLocked = 100
+	f.mu.Unlock()
+	_, err = p.Clone(context.Background(), CloneOptions{NewVMID: 10201, Node: "pve1", Name: "m", Linked: true, Profile: "ct", TemplateVMID: 9100})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "is locked")
+	require.Len(t, f.find(http.MethodPost, "/nodes/pve1/lxc/9100/clone"), 3+4, "bounded by lxcCloneMaxAttempts")
+
+	// Non-lock errors are not retried.
+	f.mu.Lock()
+	f.forceLocked = 0
+	f.failPath["POST /nodes/pve1/lxc/9100/clone"] = "storage full"
+	f.mu.Unlock()
+	_, err = p.Clone(context.Background(), CloneOptions{NewVMID: 10202, Node: "pve1", Name: "o", Linked: true, Profile: "ct", TemplateVMID: 9100})
+	require.Error(t, err)
+	require.Len(t, f.find(http.MethodPost, "/nodes/pve1/lxc/9100/clone"), 3+4+1)
+}
+
+// Starting a stopped container for its JIT is a boot like Start: the
+// firewall sandbox is verified first.
+func TestLXC_InjectJITConfigEnsuresFirewall(t *testing.T) {
+	t.Parallel()
+	f, srv := newLXCFake(t)
+	f.cts[10090] = &lxcCT{Name: "c", Config: map[string]any{"net0": "name=eth0,bridge=vmbr0"}}
+	p := newLXCProvisioner(t, srv)
+	p.cfg.Firewall = config.FirewallConfig{Enabled: true, SecurityGroup: "runners"}
+	require.NoError(t, p.InjectJITConfig(context.Background(), &VM{VMID: 10090, Node: "pve1", GuestType: config.GuestTypeLXC}, validJIT(t)))
+
+	var order []string
+	for _, r := range f.requests() {
+		if r.Method != http.MethodGet {
+			order = append(order, r.Method+" "+strings.TrimPrefix(r.Path, "/nodes/pve1/lxc/10090/"))
+		}
+	}
+	require.Equal(t, []string{"POST firewall/rules", "PUT firewall/options", "PUT config", "PUT config", "POST status/start"}, order,
+		"group rule, options and NIC flag land before the env is set and the container boots")
+	require.Equal(t, "name=eth0,bridge=vmbr0,firewall=1", f.cts[10090].Config["net0"])
 }

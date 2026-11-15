@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jellydator/ttlcache/v3"
@@ -160,37 +161,51 @@ func (p *pmox) cloneGuestType(opts CloneOptions) string {
 	return config.GuestTypeQEMU
 }
 
+// ErrGuestTypeUnknown is returned when a guest's type (qemu or lxc) has
+// to be probed and the probe fails for a reason other than "no such
+// container". Callers must treat it as retryable: assuming qemu here
+// would let Destroy report a container as already gone (the qemu lookup
+// says "does not exist") and leak it.
+var ErrGuestTypeUnknown = errors.New("provisioner: cannot determine guest type")
+
 // resolveGuestType decides whether vm is a QEMU VM or an LXC container:
 //
 //  1. vm.GuestType when set (Clone and ListOwnedVMs populate it);
 //  2. qemu when no profile of this scale set is LXC (no probing, so
 //     QEMU-only deployments are unaffected);
 //  3. the type of vm.Profile when it names a known profile;
-//  4. otherwise a probe: GET /lxc/{vmid}/status/current succeeding means
-//     a container, anything else means qemu. Only reached for call sites
-//     that carry no profile (e.g. the pool's destroy path).
+//  4. otherwise a probe of GET /lxc/{vmid}/status/current: success means
+//     a container, "does not exist" means qemu (or absent from both — the
+//     qemu path then reports it as already gone), and any other failure
+//     returns ErrGuestTypeUnknown. Only reached for call sites that carry
+//     no profile (e.g. the pool's destroy path).
 //
 // VMIDs are unique across QEMU and LXC cluster-wide, so the probe cannot
 // confuse two guests.
-func (p *pmox) resolveGuestType(ctx context.Context, vm *VM) string {
+func (p *pmox) resolveGuestType(ctx context.Context, vm *VM) (string, error) {
 	if vm == nil {
-		return config.GuestTypeQEMU
+		return config.GuestTypeQEMU, nil
 	}
 	if vm.GuestType != "" {
-		return vm.GuestType
+		return vm.GuestType, nil
 	}
 	if !p.hasLXCProfile() {
-		return config.GuestTypeQEMU
+		return config.GuestTypeQEMU, nil
 	}
 	if vm.Profile != "" {
 		if t, ok := p.profileGuestType(vm.Profile); ok {
-			return t
+			return t, nil
 		}
 	}
-	if _, err := p.lxcStatus(ctx, vm.Node, vm.VMID); err == nil {
-		return config.GuestTypeLXC
+	_, err := p.lxcStatus(ctx, vm.Node, vm.VMID)
+	switch {
+	case err == nil:
+		return config.GuestTypeLXC, nil
+	case isNotFound(err):
+		return config.GuestTypeQEMU, nil
+	default:
+		return "", fmt.Errorf("%w for vmid %d on %s: %w", ErrGuestTypeUnknown, vm.VMID, vm.Node, classifyProxmoxError(err))
 	}
-	return config.GuestTypeQEMU
 }
 
 // ---------------------------------------------------------------------------
@@ -336,13 +351,8 @@ func lxcNICFirewallPatches(ctCfg map[string]any) map[string]string {
 // path: clone, tags + overrides, disk resize, firewall, then the
 // optional start — the sandbox is in place before first boot.
 func (p *pmox) cloneLXC(ctx context.Context, opts CloneOptions, templateVMID int, templateNodeName string) (*VM, error) {
-	var upid proxmox.UPID
-	if err := p.cli.Post(ctx, lxcPath(templateNodeName, templateVMID, "/clone"),
-		buildLXCCloneParams(p.scaleSetName, opts, templateNodeName), &upid); err != nil {
-		return nil, fmt.Errorf("issue lxc clone: %w", err)
-	}
-	if err := awaitTask(ctx, proxmox.NewTask(upid, p.cli), 600); err != nil {
-		return nil, fmt.Errorf("await lxc clone task: %w", err)
+	if err := p.cloneLXCFromTemplate(ctx, opts, templateVMID, templateNodeName); err != nil {
+		return nil, err
 	}
 
 	resultNode := opts.Node
@@ -390,6 +400,68 @@ func (p *pmox) cloneLXC(ctx context.Context, opts CloneOptions, templateVMID int
 		}
 	}
 	return vm, nil
+}
+
+// lxcCloneMaxAttempts / lxcCloneRetryBase bound the retry of a container
+// clone that fails because the source template is locked. Variables so
+// tests can compress them.
+var (
+	lxcCloneMaxAttempts = 6
+	lxcCloneRetryBase   = 2 * time.Second
+)
+
+// lxcTemplateLock returns the mutex serialising clones of one container
+// template.
+func (p *pmox) lxcTemplateLock(templateVMID int) *sync.Mutex {
+	p.lxcCloneMu.Lock()
+	defer p.lxcCloneMu.Unlock()
+	if p.lxcCloneLocks == nil {
+		p.lxcCloneLocks = map[int]*sync.Mutex{}
+	}
+	mu, ok := p.lxcCloneLocks[templateVMID]
+	if !ok {
+		mu = &sync.Mutex{}
+		p.lxcCloneLocks[templateVMID] = mu
+	}
+	return mu
+}
+
+// isLockedError recognises PVE's "CT is locked (disk)" family.
+func isLockedError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "is locked")
+}
+
+// cloneLXCFromTemplate issues the clone and waits for its task.
+//
+// Unlike qemu, PVE holds `lock: disk` on the SOURCE container template
+// for the whole clone, so a second concurrent clone of the same template
+// dies with "CT is locked (disk)". Clones of one template are therefore
+// serialised by a per-template mutex (held across issue + wait), and a
+// lock error — e.g. from another orchestrator or a manual clone — is
+// retried with bounded exponential backoff. Other errors fail at once.
+func (p *pmox) cloneLXCFromTemplate(ctx context.Context, opts CloneOptions, templateVMID int, templateNodeName string) error {
+	mu := p.lxcTemplateLock(templateVMID)
+	mu.Lock()
+	defer mu.Unlock()
+	params := buildLXCCloneParams(p.scaleSetName, opts, templateNodeName)
+	delay := lxcCloneRetryBase
+	for attempt := 1; ; attempt++ {
+		err := p.postLXCTask(ctx, &VM{VMID: templateVMID, Node: templateNodeName}, "/clone", params, 600)
+		if err == nil {
+			return nil
+		}
+		if !isLockedError(err) || attempt >= lxcCloneMaxAttempts {
+			return fmt.Errorf("lxc clone of template %d: %w", templateVMID, err)
+		}
+		p.log.Info("lxc clone: source template locked; retrying",
+			"template_vmid", templateVMID, "new_vmid", opts.NewVMID, "attempt", attempt, "backoff", delay)
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("lxc clone of template %d: %w", templateVMID, ctx.Err())
+		case <-time.After(delay):
+		}
+		delay *= 2
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -663,6 +735,14 @@ func (p *pmox) injectLXCJIT(ctx context.Context, vm *VM, jit string) error {
 	if p.jitRestarts != nil {
 		p.jitRestarts.Set(vm.VMID, time.Now(), ttlcache.DefaultTTL)
 		defer p.jitRestarts.Delete(vm.VMID)
+	}
+	// Re-verify the sandbox before the restart, exactly as Start does: the
+	// stopped-container branch below boots the container, and the reboot
+	// branch is the boot that actually runs the job.
+	if p.cfg.Firewall.Enabled {
+		if err := p.ensureFirewallLXC(ctx, vm); err != nil {
+			return fmt.Errorf("inject jit: ensure firewall on ct %d: %w", vm.VMID, err)
+		}
 	}
 	body := map[string]any{"env": lxcJITEnvKey + "=" + jit}
 	if err := p.cli.Put(ctx, lxcPath(vm.Node, vm.VMID, "/config"), body, nil); err != nil {
