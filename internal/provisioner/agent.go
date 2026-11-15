@@ -136,7 +136,11 @@ func (p *pmox) InjectJITConfig(ctx context.Context, vm *VM, jitConfig string) er
 		attribute.Int("jit.bytes", len(jitConfig)),
 	))
 	defer span.End()
-	if p.resolveGuestType(ctx, vm) == config.GuestTypeLXC {
+	guestType, gtErr := p.resolveGuestType(ctx, vm)
+	if gtErr != nil {
+		return gtErr
+	}
+	if guestType == config.GuestTypeLXC {
 		err := p.injectLXCJIT(ctx, vm, jitConfig)
 		if err != nil {
 			span.RecordError(err)
@@ -315,7 +319,11 @@ func (p *pmox) ReadJITConfig(ctx context.Context, vm *VM) ([]byte, error) {
 	if vm == nil {
 		return nil, fmt.Errorf("read jit config: nil vm")
 	}
-	if p.resolveGuestType(ctx, vm) == config.GuestTypeLXC {
+	guestType, gtErr := p.resolveGuestType(ctx, vm)
+	if gtErr != nil {
+		return nil, gtErr
+	}
+	if guestType == config.GuestTypeLXC {
 		return p.readLXCJIT(ctx, vm)
 	}
 	os, path, err := p.guestJITSettings(vm)

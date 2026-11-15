@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hashicorp/go-retryablehttp"
@@ -278,6 +279,12 @@ type pmox struct {
 	// power poller does not read the transient stop inside the reboot
 	// as job completion. The TTL bounds an entry if the restart hangs.
 	jitRestarts *ttlcache.Cache[int, time.Time]
+
+	// lxcCloneLocks serialises clones per LXC source template (PVE locks
+	// the source container for the whole clone); see
+	// cloneLXCFromTemplate. Guarded by lxcCloneMu.
+	lxcCloneMu    sync.Mutex
+	lxcCloneLocks map[int]*sync.Mutex
 }
 
 // Options configures Provisioner trackers separate from the static
@@ -913,7 +920,11 @@ func (p *pmox) locateTemplate(ctx context.Context, templateVMID int) (string, er
 // no NIC, re-applying only the firewall options — an idempotent PUT —
 // so a duplicate group rule never accumulates across starts.
 func (p *pmox) Start(ctx context.Context, vm *VM) error {
-	if p.resolveGuestType(ctx, vm) == config.GuestTypeLXC {
+	guestType, gtErr := p.resolveGuestType(ctx, vm)
+	if gtErr != nil {
+		return gtErr
+	}
+	if guestType == config.GuestTypeLXC {
 		return p.startLXC(ctx, vm)
 	}
 	pVM, err := p.getVM(ctx, vm)
@@ -1017,7 +1028,11 @@ func (p *pmox) startInternal(ctx context.Context, pVM *proxmox.VirtualMachine) e
 // Stop attempts a graceful Shutdown first; if that doesn't settle within
 // 60s it falls back to a hard Stop.
 func (p *pmox) Stop(ctx context.Context, vm *VM) error {
-	if p.resolveGuestType(ctx, vm) == config.GuestTypeLXC {
+	guestType, gtErr := p.resolveGuestType(ctx, vm)
+	if gtErr != nil {
+		return gtErr
+	}
+	if guestType == config.GuestTypeLXC {
 		return p.stopLXC(ctx, vm)
 	}
 	pVM, err := p.getVM(ctx, vm)
@@ -1065,7 +1080,11 @@ func (p *pmox) stopInternal(ctx context.Context, pVM *proxmox.VirtualMachine) er
 // Destroy stops (if needed) and deletes a VM. Idempotent: a missing VM is
 // treated as success.
 func (p *pmox) Destroy(ctx context.Context, vm *VM) error {
-	if p.resolveGuestType(ctx, vm) == config.GuestTypeLXC {
+	guestType, gtErr := p.resolveGuestType(ctx, vm)
+	if gtErr != nil {
+		return gtErr
+	}
+	if guestType == config.GuestTypeLXC {
 		return p.destroyLXC(ctx, vm)
 	}
 	pVM, err := p.getVM(ctx, vm)
@@ -1112,7 +1131,11 @@ func (p *pmox) Destroy(ctx context.Context, vm *VM) error {
 // The 300s task budget mirrors Start's: snapshotting a stopped VM is
 // normally seconds, but slow storage under load deserves headroom.
 func (p *pmox) SnapshotCreate(ctx context.Context, vm *VM, name string) error {
-	if p.resolveGuestType(ctx, vm) == config.GuestTypeLXC {
+	guestType, gtErr := p.resolveGuestType(ctx, vm)
+	if gtErr != nil {
+		return gtErr
+	}
+	if guestType == config.GuestTypeLXC {
 		return ErrLXCSnapshotUnsupported
 	}
 	pVM, err := p.getVM(ctx, vm)
@@ -1135,7 +1158,11 @@ func (p *pmox) SnapshotCreate(ctx context.Context, vm *VM, name string) error {
 // snapshot surfaces as an error (wrapped ErrVMNotFound via the "does
 // not exist" classifier) so the caller's destroy fallback fires.
 func (p *pmox) SnapshotRollback(ctx context.Context, vm *VM, name string) error {
-	if p.resolveGuestType(ctx, vm) == config.GuestTypeLXC {
+	guestType, gtErr := p.resolveGuestType(ctx, vm)
+	if gtErr != nil {
+		return gtErr
+	}
+	if guestType == config.GuestTypeLXC {
 		return ErrLXCSnapshotUnsupported
 	}
 	pVM, err := p.getVM(ctx, vm)
@@ -1159,7 +1186,11 @@ func (p *pmox) PowerState(ctx context.Context, vm *VM) (string, error) {
 	if vm == nil {
 		return "", fmt.Errorf("power state: nil vm")
 	}
-	if p.resolveGuestType(ctx, vm) == config.GuestTypeLXC {
+	guestType, gtErr := p.resolveGuestType(ctx, vm)
+	if gtErr != nil {
+		return "", gtErr
+	}
+	if guestType == config.GuestTypeLXC {
 		return p.powerStateLXC(ctx, vm)
 	}
 	pVM, err := p.getVM(ctx, vm)
@@ -1180,7 +1211,11 @@ func (p *pmox) PowerState(ctx context.Context, vm *VM) (string, error) {
 // For an LXC container there is no guest agent: ready means the
 // container's status is "running" (see waitReadyLXC).
 func (p *pmox) WaitReady(ctx context.Context, vm *VM, timeout time.Duration) error {
-	if p.resolveGuestType(ctx, vm) == config.GuestTypeLXC {
+	guestType, gtErr := p.resolveGuestType(ctx, vm)
+	if gtErr != nil {
+		return gtErr
+	}
+	if guestType == config.GuestTypeLXC {
 		return p.waitReadyLXC(ctx, vm, timeout)
 	}
 	pVM, err := p.getVM(ctx, vm)

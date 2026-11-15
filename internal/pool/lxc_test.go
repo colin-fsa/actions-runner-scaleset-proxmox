@@ -39,17 +39,38 @@ func TestAdoptLXCJITReadback(t *testing.T) {
 	}
 }
 
-// Unlike Windows, a stopped LXC container is adopted as Warm: its disk
-// was never booted with a JIT (a consumed container powers itself off
-// and is destroyed by the power poller).
-func TestAdoptStoppedLXCStaysWarm(t *testing.T) {
-	st := newTestStore(t)
-	fp := &fakeProv{powerStateBy: map[int]string{10001: "stopped"}}
-	mgr := newTestManager(t, st, fp, Config{Profiles: []ProfileSettings{{Name: "ct", GuestType: config.GuestTypeLXC, MaxConcurrentRunners: 10}}})
-	mgr.adoptOne(context.Background(), &provisioner.VM{VMID: 10001, Node: "pve1", Name: "runner", Profile: "ct"}, nil)
-	row, err := st.Get(10001)
-	require.NoError(t, err)
-	require.Equal(t, store.StateWarm, row.State)
+// A stopped LXC container is reused (adopted Warm) only when its env
+// carries no JIT config. One that holds a JIT already ran or was handed a
+// job and powered off before the power poller destroyed it (crash or
+// leader handover in between): its JIT is consumed and its filesystem
+// dirty, so it must be destroyed, never promoted. An unreadable config
+// fails safe the same way.
+func TestAdoptStoppedLXC(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		jit     []byte
+		err     error
+		destroy bool
+	}{
+		{"clean", []byte{}, nil, false},
+		{"used", []byte("jit"), nil, true},
+		{"unreadable", nil, errors.New("config unavailable"), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newTestStore(t)
+			fp := &adoptWindowsProv{fakeProv: &fakeProv{powerStateBy: map[int]string{10001: "stopped"}}, jit: tc.jit, readErr: tc.err}
+			mgr := newTestManager(t, st, fp, Config{Profiles: []ProfileSettings{{Name: "ct", GuestType: config.GuestTypeLXC, MaxConcurrentRunners: 10}}})
+			mgr.adoptOne(context.Background(), &provisioner.VM{VMID: 10001, Node: "pve1", Name: "runner", Profile: "ct", GuestType: config.GuestTypeLXC}, nil)
+			if !tc.destroy {
+				row, err := st.Get(10001)
+				require.NoError(t, err)
+				require.Equal(t, store.StateWarm, row.State)
+				return
+			}
+			require.Eventually(t, func() bool { fp.mu.Lock(); defer fp.mu.Unlock(); return len(fp.destroys) > 0 }, time.Second, time.Millisecond,
+				"a used or unverifiable stopped container must be destroyed")
+		})
+	}
 }
 
 func TestCloneCarriesProfileGuestType(t *testing.T) {

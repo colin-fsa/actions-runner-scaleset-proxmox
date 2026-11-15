@@ -1199,6 +1199,43 @@ func (m *manager) Adopt(ctx context.Context) error {
 	return nil
 }
 
+// adoptLXCState refines the adoption state of an inherited LXC container
+// by reading its env option, which records whether a JIT config was ever
+// handed to it (the orchestrator never clears it; containers are
+// destroyed, not recycled):
+//
+//   - stopped (Warm) with a JIT: the container already ran (or was handed)
+//     a job and powered off before the power poller destroyed it — e.g. a
+//     crash or leader handover in between. Its JIT is consumed and its
+//     filesystem dirty, so it is destroyed, never promoted.
+//   - running (Hot) with a JIT: the container is inside its single runner
+//     session (the bootstrap powers it off when the runner exits), so it
+//     is adopted as Assigned and the power poller destroys it once it
+//     stops. Leaving it Hot would let the scaler hand it a second JIT and
+//     reboot it mid-job.
+//
+// A config that cannot be read fails safe the same way (Warm → destroy,
+// Hot → Assigned). Other classifications are left unchanged.
+func (m *manager) adoptLXCState(ctx context.Context, pv *provisioner.VM, profile string, state store.State) store.State {
+	if state != store.StateWarm && state != store.StateHot {
+		return state
+	}
+	readCtx, cancel := context.WithTimeout(ctx, adoptPowerStateTimeoutPerVM)
+	jit, err := m.prov.ReadJITConfig(readCtx, &provisioner.VM{
+		VMID: pv.VMID, Node: pv.Node, Name: pv.Name, Profile: profile, GuestType: pv.GuestType,
+	})
+	cancel()
+	if err == nil && len(jit) == 0 {
+		return state
+	}
+	if state == store.StateWarm {
+		m.log.Warn("adopt: stopped container already holds a JIT config (or its config is unreadable); destroying",
+			"vmid", pv.VMID, "read_err", err)
+		return store.StateDestroying
+	}
+	return store.StateAssigned
+}
+
 // adoptOne classifies a single inherited VM and inserts it into the
 // store. Extracted so the per-VM error paths can `return` cleanly
 // without leaking the loop control structure into the classification.
@@ -1212,12 +1249,10 @@ func (m *manager) adoptOne(ctx context.Context, pv *provisioner.VM, runners map[
 	if unknownProfile {
 		m.log.Warn("adopt: unknown profile; destroying inherited vm", "vmid", pv.VMID, "profile", pv.Profile)
 		state = store.StateDestroying
-	} else if ps := m.profileOf(profile); ps != nil && (ps.settings.GuestOS == "windows" || ps.settings.GuestType == config.GuestTypeLXC) {
-		// Windows and LXC guests both expose whether a JIT config was
-		// already handed over (agent file / container env). A Hot row
-		// that already holds one is serving a job: re-injecting into an
-		// LXC container would reboot it mid-job.
-		if state == store.StateWarm && ps.settings.GuestOS == "windows" && !m.snapshotRecycle() {
+	} else if ps := m.profileOf(profile); ps != nil && ps.settings.GuestType == config.GuestTypeLXC {
+		state = m.adoptLXCState(ctx, pv, profile, state)
+	} else if ps != nil && ps.settings.GuestOS == "windows" {
+		if state == store.StateWarm && !m.snapshotRecycle() {
 			state = store.StateDestroying
 		} else if state == store.StateHot {
 			readCtx, cancel := context.WithTimeout(ctx, adoptPowerStateTimeoutPerVM)
