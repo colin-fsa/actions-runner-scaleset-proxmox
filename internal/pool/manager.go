@@ -1634,6 +1634,15 @@ func (m *manager) reconcileProfileOnce(ctx context.Context, profile string) {
 	for range needHot {
 		m.kickClone(ctx, profile, store.PoolKindHot, true)
 	}
+	// Warm refill is pool warmth, not a queued job. While the capacity
+	// gate is still turning this profile's hot demand away (flag set by
+	// a previous pass), a warm clone would compete for the same memory,
+	// so hold it until the hot demand has been admitted.
+	if needWarm > 0 && ps.capacityDeferredHot.Load() {
+		m.log.Debug("reconcile: holding warm refill while hot demand is capacity-deferred",
+			"profile", profile, "need_warm", needWarm)
+		needWarm = 0
+	}
 	for range needWarm {
 		m.kickClone(ctx, profile, store.PoolKindWarm, false)
 	}
@@ -2051,7 +2060,14 @@ func (m *manager) sweepStuckRows() {
 // first so warm VMs near max-age recycle get used before the
 // recycler reaps them. An empty profile name selects warms across
 // every profile (used only by legacy code paths in tests).
-func (m *manager) promoteN(_ context.Context, profile string, n int) {
+//
+// Starting a warm VM spends host memory exactly like a clone does, so
+// with capacity admission enabled each promotion passes the same
+// accountant gate first (admitPromotion). A refused promotion leaves the
+// row Warm and is retried next tick; it also counts as deferred hot
+// demand, which suppresses warm refill and arms idle eviction exactly as
+// a refused hot clone would.
+func (m *manager) promoteN(ctx context.Context, profile string, n int) {
 	var warms []*store.VM
 	var err error
 	if profile == "" {
@@ -2081,11 +2097,19 @@ func (m *manager) promoteN(_ context.Context, profile string, n int) {
 			m.log.Debug("promote: bootSem saturated, deferring to next tick", "vmid", w.VMID)
 			continue
 		}
-		// CAS warm -> booting; if lost, release the slot we just took.
+		// Capacity before the CAS, so a refusal leaves nothing to roll
+		// back: the row stays Warm and the next tick retries.
+		claim, admitted := m.admitPromotion(ctx, w)
+		if !admitted {
+			m.bootSem.Release(1)
+			continue
+		}
+		// CAS warm -> booting; if lost, hand back the slot and the claim.
 		ok, err := m.store.UpdateState(w.VMID, store.StateWarm, store.StateBooting, func(v *store.VM) {
 			v.PoolKind = store.PoolKindHot // promoted to hot budget
 		})
 		if err != nil || !ok {
+			claim.release()
 			m.bootSem.Release(1)
 			continue
 		}
@@ -2097,7 +2121,7 @@ func (m *manager) promoteN(_ context.Context, profile string, n int) {
 			defer m.wg.Done()
 			defer func() { m.logRecoveredPanic("promote", row.VMID, recover()) }()
 			defer m.bootSem.Release(1)
-			m.runBoot(row)
+			m.runBoot(row, claim)
 		}()
 	}
 }
@@ -2294,6 +2318,15 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 		}
 		m.log.Warn("clone: update row state failed", "vmid", prep.vmid, "err", err)
 		return
+	}
+
+	if !prep.poweredOn && m.cfg.Capacity != nil && m.cfg.Capacity.RetiresOnlyWhenPowered() {
+		// A warm clone consumes no host memory or CPU while it stays
+		// powered off, but in these modes its reservation would only
+		// retire on power-on — so it would sit at full size until the
+		// TTL, starving hot demand of memory nobody is using. Release it
+		// now; promoting the VM later reserves again (admitPromotion).
+		prep.releaseCapacity()
 	}
 
 	if prep.poweredOn {
@@ -2499,8 +2532,12 @@ func (m *manager) handleCloneFailure(prep *clonePrep, err error, op string) {
 	m.destroyOrSyncFallback(prep.vmid, prep.node, prep.profileName)
 }
 
-// runBoot is the body of a warm->hot promotion goroutine.
-func (m *manager) runBoot(row *store.VM) {
+// runBoot is the body of a warm->hot promotion goroutine. claim is the
+// promotion's capacity reservation (inert when admission is disabled).
+// A successful start keeps it — the accountant retires it once the
+// powered-on guest shows up in its reading — while a failed start
+// releases it, because the VM never consumed the memory.
+func (m *manager) runBoot(row *store.VM, claim capacityClaim) {
 	ctx, cancel := context.WithTimeout(m.workerCtx, 5*time.Minute)
 	defer cancel()
 	pv := &provisioner.VM{VMID: row.VMID, Node: row.Node, Name: row.Name, Profile: row.Profile}
@@ -2511,6 +2548,7 @@ func (m *manager) runBoot(row *store.VM) {
 	}
 	if err != nil {
 		m.log.Warn("boot: start failed", "vmid", row.VMID, "err", err)
+		claim.release()
 		m.markPoisonOrDestroy(row)
 		return
 	}

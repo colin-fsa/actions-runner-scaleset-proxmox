@@ -40,6 +40,12 @@ type fakeAdmitter struct {
 	// destroy, so a test can assert the plan it committed to.
 	lastFreeing []int
 	released    int
+	// existingCalls counts ReserveExisting (warm promotion) calls and
+	// lastExisting records the VMID of the most recent one.
+	existingCalls int
+	lastExisting  int
+	// poweredOnlyRetire is what RetiresOnlyWhenPowered reports.
+	poweredOnlyRetire bool
 	// vmSizes is the allocated memory of each VM the fake knows about,
 	// so ReserveFreeing can credit a victim by its real size — the same
 	// arithmetic the accountant does against the cluster snapshot.
@@ -103,6 +109,26 @@ func (a *fakeAdmitter) ReserveFreeing(_ context.Context, node string, shape node
 	a.lastFreeing = append([]int(nil), freeing...)
 	a.mu.Unlock()
 	return a.reserve(node, shape, freeing)
+}
+
+// ReserveExisting models host_available mode: a powered-off warm VM is
+// charged its full shape from the node's free bytes.
+func (a *fakeAdmitter) ReserveExisting(_ context.Context, node string, shape nodecap.Shape, vmid int) (nodecap.Reservation, bool, error) {
+	a.mu.Lock()
+	a.existingCalls++
+	a.lastExisting = vmid
+	a.mu.Unlock()
+	res, ok, err := a.reserve(node, shape, nil)
+	if ok {
+		res.Bind(vmid)
+	}
+	return res, ok, err
+}
+
+func (a *fakeAdmitter) RetiresOnlyWhenPowered() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.poweredOnlyRetire
 }
 
 func (a *fakeAdmitter) reserve(node string, shape nodecap.Shape, freeing []int) (nodecap.Reservation, bool, error) {

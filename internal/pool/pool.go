@@ -307,6 +307,16 @@ type CapacityAdmitter interface {
 	// path, which has just committed those VMs to destruction.
 	ReserveFreeing(ctx context.Context, node string, shape nodecap.Shape, freeing []int) (nodecap.Reservation, bool, error)
 
+	// ReserveExisting claims shape on node for an existing powered-off VM
+	// about to be started (warm-to-hot promotion), charging the VM
+	// exactly once. The reservation is already bound to vmid.
+	ReserveExisting(ctx context.Context, node string, shape nodecap.Shape, vmid int) (nodecap.Reservation, bool, error)
+
+	// RetiresOnlyWhenPowered reports whether reservations are retired
+	// only once their guest powers on; when true a powered-off (warm)
+	// clone's claim must be released by the pool after the clone exists.
+	RetiresOnlyWhenPowered() bool
+
 	// Snapshot returns per-node capacity, for gauges and eviction
 	// planning.
 	Snapshot(ctx context.Context) (map[string]nodecap.NodeState, error)

@@ -1019,3 +1019,218 @@ func TestCPUHostUsageStoppedCloneRetainsReservation(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 18, states["pve1"].CommittedVCPU, "failed launch releases its CPU claim")
 }
+
+// ---------- ReserveExisting (warm-to-hot promotion) ----------
+
+// TestReserveExistingHostModeChargesTheStoppedWarmVM: in host_available
+// mode a powered-off warm VM holds no host RAM, so starting it must fit
+// in the node's live free memory — the gap that let a burst of warm
+// promotions drive the host from 35% to 7% available unchecked.
+func TestReserveExistingHostModeChargesTheStoppedWarmVM(t *testing.T) {
+	t.Parallel()
+	rs := newResourceServer(t, []map[string]any{
+		nodeRow("pve1", 32*gib, 16),
+		stoppedGuestRow(10001, "pve1", 8*gib, 4),
+		stoppedGuestRow(10002, "pve1", 8*gib, 4),
+	})
+	rs.setNodeStatus("pve1", 12*gib, 32*gib)
+	a := newAccountant(t, rs, func(o *Options) {
+		o.MemoryMode = MemoryModeHostAvailable
+		o.ReserveBytes = 0
+		o.Refresh = time.Minute
+	})
+	ctx := context.Background()
+
+	res, ok, err := a.ReserveExisting(ctx, "pve1", Shape{MemoryBytes: 8 * gib, VCPUs: 4}, 10001)
+	require.NoError(t, err)
+	require.True(t, ok, "8 GiB fits in 12 GiB free")
+	require.NotNil(t, res)
+
+	_, ok, err = a.ReserveExisting(ctx, "pve1", Shape{MemoryBytes: 8 * gib, VCPUs: 4}, 10002)
+	require.NoError(t, err)
+	require.False(t, ok, "the first promotion's 8 GiB is withheld; 4 GiB left cannot start a second")
+
+	states, err := a.Snapshot(ctx)
+	require.NoError(t, err)
+	require.Equal(t, uint64(4*gib), states["pve1"].AvailableBytes,
+		"a promotion of a stopped VM withholds its full shape until the guest powers on")
+}
+
+// TestReserveExistingSharesTheLedgerWithClones: promotions and clones
+// (from any profile or scale set using this accountant) draw on one
+// ledger, so neither can spend memory the other already claimed.
+func TestReserveExistingSharesTheLedgerWithClones(t *testing.T) {
+	t.Parallel()
+	rs := newResourceServer(t, []map[string]any{
+		nodeRow("pve1", 32*gib, 16),
+		stoppedGuestRow(10001, "pve1", 10*gib, 6),
+	})
+	rs.setNodeStatus("pve1", 14*gib, 32*gib)
+	a := newAccountant(t, rs, func(o *Options) {
+		o.MemoryMode = MemoryModeHostAvailable
+		o.ReserveBytes = 0
+		o.Refresh = time.Minute
+	})
+	ctx := context.Background()
+
+	_, ok, err := a.Reserve(ctx, "pve1", Shape{MemoryBytes: 4 * gib})
+	require.NoError(t, err)
+	require.True(t, ok, "a 4 GiB clone of another profile takes its share first")
+
+	_, ok, err = a.ReserveExisting(ctx, "pve1", Shape{MemoryBytes: 10 * gib, VCPUs: 6}, 10001)
+	require.NoError(t, err)
+	require.True(t, ok, "10 GiB still fits in the remaining 10 GiB")
+
+	_, ok, err = a.Reserve(ctx, "pve1", Shape{MemoryBytes: 4 * gib})
+	require.NoError(t, err)
+	require.False(t, ok, "and nothing is left for a further clone")
+}
+
+// TestReserveExistingConcurrentPromotionsNeverDoubleSpend races many
+// promotions of distinct warm VMs against one pinned snapshot.
+func TestReserveExistingConcurrentPromotionsNeverDoubleSpend(t *testing.T) {
+	t.Parallel()
+	rows := []map[string]any{nodeRow("pve1", 64*gib, 64)}
+	for i := range 32 {
+		rows = append(rows, stoppedGuestRow(10001+i, "pve1", 4*gib, 2))
+	}
+	rs := newResourceServer(t, rows)
+	rs.setNodeStatus("pve1", 20*gib, 64*gib)
+	a := newAccountant(t, rs, func(o *Options) {
+		o.MemoryMode = MemoryModeHostAvailable
+		o.ReserveBytes = 0
+		o.Refresh = time.Minute
+	})
+	ctx := context.Background()
+
+	var granted atomic.Int64
+	var wg sync.WaitGroup
+	for i := range 32 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, ok, err := a.ReserveExisting(ctx, "pve1", Shape{MemoryBytes: 4 * gib, VCPUs: 2}, 10001+i)
+			require.NoError(t, err)
+			if ok {
+				granted.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	require.Equal(t, int64(5), granted.Load(), "20 GiB free admits exactly five 4 GiB promotions")
+}
+
+// TestReserveExistingReleaseReturnsCapacity: the pool releases a
+// promotion's claim when the start fails; the bytes must come back.
+func TestReserveExistingReleaseReturnsCapacity(t *testing.T) {
+	t.Parallel()
+	rs := newResourceServer(t, []map[string]any{
+		nodeRow("pve1", 32*gib, 16),
+		stoppedGuestRow(10001, "pve1", 8*gib, 4),
+	})
+	rs.setNodeStatus("pve1", 8*gib, 32*gib)
+	a := newAccountant(t, rs, func(o *Options) {
+		o.MemoryMode = MemoryModeHostAvailable
+		o.ReserveBytes = 0
+		o.Refresh = time.Minute
+	})
+	ctx := context.Background()
+
+	res, ok, err := a.ReserveExisting(ctx, "pve1", Shape{MemoryBytes: 8 * gib}, 10001)
+	require.NoError(t, err)
+	require.True(t, ok)
+	_, ok, err = a.ReserveExisting(ctx, "pve1", Shape{MemoryBytes: 8 * gib}, 10001)
+	require.NoError(t, err)
+	require.False(t, ok, "while held, the node is full")
+
+	res.Release()
+	_, ok, err = a.ReserveExisting(ctx, "pve1", Shape{MemoryBytes: 8 * gib}, 10001)
+	require.NoError(t, err)
+	require.True(t, ok, "released bytes are admissible again")
+}
+
+// TestReserveExistingRetiresOncePowered: after a successful start the
+// guest's RAM shows up in the free reading, so the claim must retire
+// rather than charge the VM twice.
+func TestReserveExistingRetiresOncePowered(t *testing.T) {
+	t.Parallel()
+	rs := newResourceServer(t, []map[string]any{
+		nodeRow("pve1", 32*gib, 16),
+		stoppedGuestRow(10001, "pve1", 8*gib, 4),
+	})
+	rs.setNodeStatus("pve1", 24*gib, 32*gib)
+	a := newAccountant(t, rs, func(o *Options) {
+		o.MemoryMode = MemoryModeHostAvailable
+		o.ReserveBytes = 0
+	})
+	ctx := context.Background()
+
+	_, ok, err := a.ReserveExisting(ctx, "pve1", Shape{MemoryBytes: 8 * gib}, 10001)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	rs.setRows([]map[string]any{nodeRow("pve1", 32*gib, 16), guestRow(10001, "pve1", 8*gib, 4)})
+	rs.setNodeStatus("pve1", 16*gib, 32*gib)
+	settle()
+	states, err := a.Snapshot(ctx)
+	require.NoError(t, err)
+	require.Equal(t, uint64(16*gib), states["pve1"].AvailableBytes,
+		"once powered the free reading carries the VM; the reservation retires")
+}
+
+// TestReserveExistingAllocatedModeChargesOnce: allocated mode already
+// counts an owned stopped warm VM at full size, so promoting it must not
+// be charged a second time — a node packed exactly full of warm VMs can
+// still start every one of them.
+func TestReserveExistingAllocatedModeChargesOnce(t *testing.T) {
+	t.Parallel()
+	rs := newResourceServer(t, []map[string]any{
+		nodeRow("pve1", 16*gib, 16),
+		stoppedGuestRow(10001, "pve1", 8*gib, 4),
+		stoppedGuestRow(10002, "pve1", 8*gib, 4),
+	})
+	a := newAccountant(t, rs, func(o *Options) {
+		o.ReserveBytes = 0
+		o.CPUOvercommit = 1.0
+		o.Refresh = time.Minute
+	})
+	ctx := context.Background()
+
+	for _, vmid := range []int{10001, 10002} {
+		_, ok, err := a.ReserveExisting(ctx, "pve1", Shape{MemoryBytes: 8 * gib, VCPUs: 4}, vmid)
+		require.NoError(t, err)
+		require.True(t, ok, "vm %d is already charged; starting it adds nothing", vmid)
+	}
+	_, ok, err := a.Reserve(ctx, "pve1", Shape{MemoryBytes: 1 * gib, VCPUs: 1})
+	require.NoError(t, err)
+	require.False(t, ok, "the node is genuinely full")
+}
+
+// TestReserveExistingPoweredVMIsAdmitted: a VM that is somehow already
+// running is in every reading; admitting it must not need fresh room.
+func TestReserveExistingPoweredVMIsAdmitted(t *testing.T) {
+	t.Parallel()
+	rs := newResourceServer(t, []map[string]any{
+		nodeRow("pve1", 32*gib, 16),
+		guestRow(10001, "pve1", 8*gib, 4),
+	})
+	rs.setNodeStatus("pve1", 0, 32*gib)
+	a := newAccountant(t, rs, func(o *Options) {
+		o.MemoryMode = MemoryModeHostAvailable
+		o.ReserveBytes = 0
+	})
+	_, ok, err := a.ReserveExisting(context.Background(), "pve1", Shape{MemoryBytes: 8 * gib}, 10001)
+	require.NoError(t, err)
+	require.True(t, ok)
+}
+
+// TestRetiresOnlyWhenPowered pins the mode rule the pool relies on to
+// release a powered-off warm clone's claim.
+func TestRetiresOnlyWhenPowered(t *testing.T) {
+	t.Parallel()
+	rs := newResourceServer(t, []map[string]any{nodeRow("pve1", 32*gib, 16)})
+	rs.setNodeStatus("pve1", 32*gib, 32*gib)
+	require.False(t, newAccountant(t, rs, nil).RetiresOnlyWhenPowered(), "allocated mode retires on observation")
+	require.True(t, newAccountant(t, rs, func(o *Options) { o.MemoryMode = MemoryModeHostAvailable }).RetiresOnlyWhenPowered())
+	require.True(t, newAccountant(t, rs, func(o *Options) { o.CPUMode = CPUModeHostUsage; o.CPUUsageLimit = 0.8 }).RetiresOnlyWhenPowered())
+}

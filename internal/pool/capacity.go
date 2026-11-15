@@ -280,6 +280,41 @@ func (m *manager) profileTemplateNode(ctx context.Context, ps *profileState) (st
 	return m.cfg.TemplateNode, true
 }
 
+// admitPromotion claims capacity for starting the warm VM w. It is the
+// promotion counterpart of admitClone: the same shared accountant, so a
+// promotion competes for memory with every clone and promotion of every
+// profile, and concurrent promotions cannot spend the same bytes.
+//
+// The VM's own profile sets the shape. A row whose profile is gone from
+// config is still admitted against the default profile's shape rather
+// than started unchecked.
+func (m *manager) admitPromotion(ctx context.Context, w *store.VM) (capacityClaim, bool) {
+	if m.cfg.Capacity == nil {
+		return capacityClaim{release: func() {}}, true
+	}
+	ps := m.profileOf(w.Profile)
+	if ps == nil {
+		ps = m.profileOf(m.defaultProfile())
+	}
+	if ps == nil {
+		m.log.Warn("promote: no profile to size the VM; deferring", "vmid", w.VMID, "profile", w.Profile)
+		return capacityClaim{}, false
+	}
+	res, ok, err := m.cfg.Capacity.ReserveExisting(ctx, w.Node, shapeOf(ps.settings), w.VMID)
+	if err != nil {
+		m.recordCapacityDeferral(ps, w.Node, store.PoolKindHot)
+		m.log.Warn("promote: capacity unknown; deferring", "profile", ps.settings.Name, "vmid", w.VMID, "node", w.Node, "err", err)
+		return capacityClaim{}, false
+	}
+	if !ok {
+		m.recordCapacityDeferral(ps, w.Node, store.PoolKindHot)
+		m.log.Debug("promote: deferred, node is at capacity",
+			"profile", ps.settings.Name, "vmid", w.VMID, "node", w.Node, "memory_mb", ps.settings.MemoryMB)
+		return capacityClaim{}, false
+	}
+	return claimFor(res), true
+}
+
 // reserveCapacity claims capacity for one clone of ps on node.
 //
 // The returned bool is the admission decision: false means "no room
