@@ -292,7 +292,8 @@ func (m *manager) profileTemplateNode(ctx context.Context, ps *profileState) (st
 // admitPromotion claims capacity for starting the warm VM w. It is the
 // promotion counterpart of admitClone: the same shared accountant, so a
 // promotion competes for memory with every clone and promotion of every
-// profile, and concurrent promotions cannot spend the same bytes.
+// profile, and concurrent promotions cannot claim the same in-flight
+// capacity twice (see nodecap.ReserveExisting for what that excludes).
 //
 // A refusal is counted like a deferred hot clone but deliberately does
 // NOT arm idle eviction: eviction would pick this profile's own stopped

@@ -493,9 +493,12 @@ func (a *Accountant) ReserveFreeing(ctx context.Context, node string, shape Shap
 
 // ReserveExisting claims shape on node for an EXISTING, powered-off VM
 // that is about to be started — the pool's warm-to-hot promotion. It is
-// the same atomic gate as Reserve, so promotions and clones (from every
-// profile and scale set sharing this accountant) can never spend the
-// same memory twice.
+// the same atomic gate as Reserve, so concurrent promotions and clones
+// (from every profile and scale set sharing this accountant) cannot claim
+// the same in-flight capacity twice. That is a property of the
+// reservation ledger only: memory a running guest has yet to grow into
+// is not reserved (in host_available mode a claim retires once the guest
+// is observed powered on).
 //
 // The reservation is bound to vmid from the start, and the fit check
 // credits whatever that VM already contributes to the ledger, so a
