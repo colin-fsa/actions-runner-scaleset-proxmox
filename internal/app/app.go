@@ -745,7 +745,7 @@ func runOneScaleset(leaderCtx context.Context, deps runOneScalesetDeps, entry co
 		MaxConcurrentRunners: effectiveMaxConcurrent(entry.MaxConcurrentRunners),
 		ReconcileInterval:    cfg.Pool.ReconcileInterval.D(),
 		PowerPollInterval:    cfg.Pool.PowerPollInterval.D(),
-		RecycleMode:          cfg.Pool.RecycleMode,
+		RecycleMode:          cfg.RecycleModeFor(entry),
 		VMMaxAge:             cfg.Pool.VMMaxAge.D(),
 		DrainTimeout:         cfg.Pool.DrainTimeout.D(),
 		BootMaxAttempts:      cfg.Pool.BootMaxAttempts,
@@ -1480,6 +1480,7 @@ func profileSettingsForScaleset(ss config.ScaleSetEntry, cfg *config.Config) []p
 		out = append(out, pool.ProfileSettings{
 			Name:                 p.Name,
 			GuestOS:              p.GuestOS,
+			GuestType:            p.GuestTypeOrDefault(),
 			HotSize:              p.HotSizeOrDefault(cfg.Pool.HotSize),
 			WarmSize:             p.WarmSizeOrDefault(cfg.Pool.WarmSize),
 			MaxConcurrentRunners: effectiveMaxConcurrent(p.MaxConcurrentRunnersOrDefault(ss.MaxConcurrentRunners)),

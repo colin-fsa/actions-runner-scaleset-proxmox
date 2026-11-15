@@ -402,6 +402,9 @@ pool:
 #     labels: [self-hosted, linux, proxmox]   # == scaleset.labels
 #     # guest_os: linux             # default; use windows for a Windows template
 #     # windows_jit_path: 'C:\ProgramData\ActionsRunnerScaleSet\jitconfig' # Windows launcher must use the same path
+#     # guest_type: qemu            # default; lxc clones an unprivileged container template
+#     #                             # (Linux only, explicit template_vmid, no network block,
+#     #                             # destroy recycling, PVE 9.x). See docs/lxc-runners.md.
 #     template_vmid: 9000           # optional override of the global proxmox.template_vmid
 #     cpu: 4                        # cores; 0 inherits the template default
 #     memory_mb: 8192               # 0 inherits the template default
