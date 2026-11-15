@@ -61,6 +61,11 @@ startup error rather than a runtime surprise. Notable rules:
 - `github.scope` must set exactly one of `org` or `repo`.
 - A scale set's declared `labels` must be collectively covered by some
   profile — otherwise jobs matching those labels could never be routed.
+- `guest_type` is `qemu` (default) or `lxc`. An `lxc` profile must set its own
+  `template_vmid` and cannot have a `network:` block. It cannot share a scale
+  set with `qemu` profiles under `pool.recycle_mode: snapshot_rollback`. A
+  scale set made only of LXC profiles always uses destroy recycling. See
+  [LXC runners](lxc-runners.md).
 - `nodes.affinity` rules naming an undeclared profile or node are rejected.
 - With more than one scale set declared, every entry must carry its own
   `vmid_range` and the ranges must be pairwise disjoint.

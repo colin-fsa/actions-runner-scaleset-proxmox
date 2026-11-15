@@ -14,6 +14,7 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/config"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/observability"
 )
 
@@ -102,6 +103,9 @@ const agentFileWriteMaxBytes = 60 * 1024
 // environment-file. The runner unit loads the env file and passes
 // JIT_CONFIG to `run.sh --jitconfig`.
 //
+// LXC containers have no guest agent; they receive the JIT through the
+// container env option and a restart instead (see injectLXCJIT).
+//
 // We use the env-file form (rather than passing via shell substitution
 // in ExecStart) because shell substitution under systemd was unreliable:
 // the runner intermittently received an empty value and exited with
@@ -131,6 +135,18 @@ func (p *pmox) InjectJITConfig(ctx context.Context, vm *VM, jitConfig string) er
 		attribute.Int("jit.bytes", len(jitConfig)),
 	))
 	defer span.End()
+	guestType, gtErr := p.resolveGuestType(ctx, vm)
+	if gtErr != nil {
+		return gtErr
+	}
+	if guestType == config.GuestTypeLXC {
+		err := p.injectLXCJIT(ctx, vm, jitConfig)
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "inject failed")
+		}
+		return err
+	}
 	err := wrapGuestAgent(p.injectJITConfigInner(ctx, vm, jitConfig))
 	if err != nil {
 		span.RecordError(err)
@@ -232,7 +248,8 @@ func (p *pmox) agentExecWait(ctx context.Context, node string, vmid int, command
 }
 
 // ReadJITConfig reads the canonical JIT-config env file from inside the
-// VM via the guest agent. Used by crash recovery to inspect
+// VM via the guest agent (for an LXC container: the JIT stored in the
+// container's env option, see readLXCJIT). Used by crash recovery to inspect
 // /opt/actions-runner/jitconfig.env and decide whether a Hot-state VM
 // has been consumed. The path is hardcoded so the only thing a caller
 // controls is which VM to ask, not what file to read.
@@ -240,6 +257,13 @@ func (p *pmox) ReadJITConfig(ctx context.Context, vm *VM) ([]byte, error) {
 	const jitConfigPath = "/opt/actions-runner/jitconfig.env"
 	if vm == nil {
 		return nil, fmt.Errorf("read jit config: nil vm")
+	}
+	guestType, gtErr := p.resolveGuestType(ctx, vm)
+	if gtErr != nil {
+		return nil, gtErr
+	}
+	if guestType == config.GuestTypeLXC {
+		return p.readLXCJIT(ctx, vm)
 	}
 	return p.readAgentFile(ctx, vm, jitConfigPath)
 }
