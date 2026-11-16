@@ -129,6 +129,118 @@ Three things about that sum are load-bearing:
 The data comes from a single cached `GET /cluster/resources` call, refreshed
 every `refresh_interval` (default `15s`).
 
+### Planning against live free memory (`memory_mode`)
+
+The formula above plans against the guests' **configured** memory — the
+`allocated` mode, and the default. It is correct when every guest's configured
+RAM is what you want to count, but it cannot see the RAM the host holds outside
+the guests, and it reads a number that is a step behind a guest that has been
+cloned but not yet booted.
+
+Set `memory_mode: host_available` to plan against the node's **available RAM**,
+including reclaimable cache. It uses `memory.available` from
+`GET /nodes/{node}/status`; on older Proxmox versions without that field it
+uses `memory.total - memory.used`, matching Proxmox's reported memory usage.
+It does not use `memory.free`, which excludes reclaimable cache and can refuse
+clones even when the host has ample available memory. Readings refresh on the
+same cadence as resource accounting.
+
+```yaml
+pool:
+  capacity:
+    enabled: true
+    memory_mode: host_available
+    memory_overcommit: 1.0
+```
+
+In this mode a clone is admitted only when the node's available RAM covers its
+request scaled by `memory_overcommit` (default `1.0`, i.e. its full RAM), net
+of the host reserve. A value below `1.0` lets the pool oversubscribe the host —
+for example `0.7` admits a 4 GiB guest against 2.8 GiB of available RAM. `0` means
+`1.0`, and the knob is ignored in `allocated` mode.
+
+Because available RAM is measured rather than inferred, `host_available` **fails
+closed**: a node whose `status` reading cannot be taken, or whose snapshot has
+gone stale (reads failing long enough that the last good reading is older than
+twice the refresh interval), reports zero available memory and pauses
+provisioning for it rather than admit blind. Memory is the one resource you
+cannot overcommit, so a missing reading is treated as "no room", never as
+"plenty of room".
+
+`allocated` is unchanged and adds no extra Proxmox calls. `host_available`
+issues one additional `GET /nodes/{node}/status` per node per refresh.
+
+### CPU admission modes
+
+`cpu_mode: allocated` is the backwards-compatible default. It compares configured
+vCPUs with logical host CPUs times `cpu_overcommit_ratio`; a zero ratio disables
+CPU admission. It does not use current utilization.
+
+For a shared host where existing guests are often idle, select measured usage:
+
+```yaml
+pool:
+  capacity:
+    enabled: true
+    memory_mode: host_available
+    cpu_mode: host_usage
+    cpu_usage_limit: 0.8
+```
+
+`host_usage` reads the node's `cpu` fraction from `GET /nodes/{node}/status`,
+sharing the request with host memory admission. It ignores `cpu_overcommit_ratio`.
+The ceiling is `floor(logical CPUs * cpu_usage_limit)`, and measured consumption
+is rounded up to CPU equivalents. Configured vCPUs of existing guests do not
+set the base, so idle runners cost nothing. The limit defaults to 0.8 (80%);
+missing, invalid or stale readings fail closed.
+
+A launching runner is counted at `cpu_launch_vcpus` (default 1, capped at the
+profile's `cpu` when that is smaller) until the accountant sees it powered on;
+after that the measured reading carries whatever it really uses. A runner that
+is booting or waiting for a job is close to idle, so counting it at its core
+count would refuse clones on a host with plenty of real headroom. Concurrent
+launches still each hold their footprint, so they cannot all spend the same
+headroom. Set `cpu_launch_vcpus: 0` to admit purely on the measured reading.
+
+Because nothing is sized by core count in this mode, `cpu` is optional on a
+profile. That allows a runner to see every host thread while a `cpulimit` on
+its template caps its share, so the kernel can spread its work instead of
+pinning it to a few cores:
+
+```yaml
+pool:
+  capacity:
+    enabled: true
+    memory_mode: host_available
+    cpu_mode: host_usage
+    cpu_usage_limit: 0.8
+    cpu_launch_vcpus: 1
+scalesets:
+  - profiles:
+      - name: linux
+        # cpu omitted: clones keep the template's cores (e.g. all 88 threads)
+        # and its cpulimit (e.g. 6). Setting cpu: 88 works the same way here.
+        memory_mb: 10240
+```
+
+For LXC runners this matters beyond admission. Proxmox pins a container
+whose `cores` is below the host's thread count to that many specific CPUs,
+and `pvestatd` keeps moving that set every few seconds to balance containers.
+A job's processes can then lose CPUs mid-run (a process whose affinity was
+narrowed keeps only the CPUs its old mask shares with the new set). A
+container with `cores` unset, or equal to the host's thread count, is never
+pinned or moved; `cpulimit` still caps its CPU time.
+
+Idle Hot/Warm runners are never evicted to close a CPU gap in this mode: they
+add next to nothing to measured usage, so destroying them would not admit the
+queued job.
+
+This is admission based on sampled usage, not a CPU throttle or a guarantee
+against future contention. Existing jobs may become busy after admission. Leave
+headroom, keep concurrency limits, and monitor the host. CPU checks never bypass
+memory, placement or concurrency checks. A stopped warm VM is reserved until it
+boots (or its reservation expires), since it is not yet in host usage.
+
 ### Deferral is backpressure, not failure
 
 A clone that does not fit is **deferred**: no VM is created, no row is

@@ -504,21 +504,14 @@ func (m *manager) evictForDemand(ctx context.Context, ps *profileState) bool {
 }
 
 // fitsNode reports whether shape would be admitted on a node in this
-// state. Mirrors the accountant's own fit rule: memory always binds,
-// vCPU only when the operator configured an overcommit ratio.
-//
-// One edge is not mirrored exactly. For a shape with zero vCPUs on a
-// node already over its ceiling, the accountant refuses (committed + 0
-// still exceeds the limit) while this returns true (available 0 >= 0).
-// It relies on config validation requiring cpu > 0 on every profile
-// whenever cpu_overcommit_ratio is set, so a gated node never sees a
-// zero-vCPU shape. If that rule is ever relaxed, this needs the same
-// committed-vs-limit form the accountant uses.
+// state. Mirrors the accountant's own fit rule: memory always binds, and
+// CPU binds when either CPU mode is on, with the launch counted the way
+// the accountant counts it (see nodecap.NodeState.FitsCPU).
 func fitsNode(st nodecap.NodeState, shape nodecap.Shape) bool {
 	if st.AvailableBytes < shape.MemoryBytes {
 		return false
 	}
-	return !st.CPUGated || st.AvailableVCPU >= shape.VCPUs
+	return st.FitsCPU(shape)
 }
 
 // eligibleNodes returns, in sorted order, the subset of the snapshot's
@@ -562,8 +555,15 @@ func planEviction(candidates []evictionCandidate, shape nodecap.Shape, st nodeca
 	if shape.MemoryBytes > st.AvailableBytes {
 		plan.memGap = shape.MemoryBytes - st.AvailableBytes
 	}
-	if st.CPUGated && shape.VCPUs > st.AvailableVCPU {
-		plan.vcpuGap = shape.VCPUs - st.AvailableVCPU
+	if !st.FitsCPU(shape) {
+		plan.vcpuGap = st.CommittedVCPU + st.LaunchVCPUs(shape) - st.LimitVCPU
+		if st.CPUUsageMode {
+			// Measured usage comes from busy guests. Idle Hot/Warm VMs add
+			// next to nothing to it, and the accountant gives no credit for
+			// destroying them in this mode, so evicting them would only
+			// throw away warm capacity. Keep the gap for diagnostics.
+			return plan
+		}
 	}
 
 	// Warm before Hot (no boot invested, and Hot serves job-start
