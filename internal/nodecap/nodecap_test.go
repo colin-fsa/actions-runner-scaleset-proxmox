@@ -959,6 +959,7 @@ func TestCPUHostUsageAdmission(t *testing.T) {
 			a := newAccountant(t, rs, func(o *Options) {
 				o.CPUMode = CPUModeHostUsage
 				o.CPUUsageLimit = 0.8
+				o.CPULaunchVCPUs = 4
 				o.CPUOvercommit = 0.1
 				o.Refresh = time.Minute
 			})
@@ -982,7 +983,9 @@ func TestCPUHostUsageConcurrentReservations(t *testing.T) {
 	t.Parallel()
 	rs := newResourceServer(t, []map[string]any{nodeRow("pve1", 64*gib, 44)})
 	rs.nodeStatus = map[string]map[string]any{"pve1": {"cpu": 0.39}}
-	a := newAccountant(t, rs, func(o *Options) { o.CPUMode = CPUModeHostUsage; o.CPUUsageLimit = 0.8; o.Refresh = time.Minute })
+	a := newAccountant(t, rs, func(o *Options) {
+		o.CPUMode, o.CPUUsageLimit, o.CPULaunchVCPUs, o.Refresh = CPUModeHostUsage, 0.8, 4, time.Minute
+	})
 	var mu sync.Mutex
 	var admitted int
 	var wg sync.WaitGroup
@@ -1006,7 +1009,9 @@ func TestCPUHostUsageStoppedCloneRetainsReservation(t *testing.T) {
 	rows := []map[string]any{nodeRow("pve1", 64*gib, 44), stoppedGuestRow(10000, "pve1", gib, 4)}
 	rs := newResourceServer(t, rows)
 	rs.nodeStatus = map[string]map[string]any{"pve1": {"cpu": 0.39}}
-	a := newAccountant(t, rs, func(o *Options) { o.CPUMode = CPUModeHostUsage; o.CPUUsageLimit = 0.8; o.Refresh = time.Minute })
+	a := newAccountant(t, rs, func(o *Options) {
+		o.CPUMode, o.CPUUsageLimit, o.CPULaunchVCPUs, o.Refresh = CPUModeHostUsage, 0.8, 4, time.Minute
+	})
 	res, ok, err := a.Reserve(context.Background(), "pve1", Shape{MemoryBytes: gib, VCPUs: 4})
 	require.NoError(t, err)
 	require.True(t, ok)
@@ -1018,4 +1023,70 @@ func TestCPUHostUsageStoppedCloneRetainsReservation(t *testing.T) {
 	states, err = a.Snapshot(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, 18, states["pve1"].CommittedVCPU, "failed launch releases its CPU claim")
+}
+
+// A launching runner is close to idle, so host_usage counts it at the
+// launch footprint, not at its core count. A profile that exposes every
+// host thread (cores 88, capped by cpulimit in the template) must not
+// look bigger than the whole admission ceiling.
+func TestCPUHostUsageCountsLaunchFootprintNotCores(t *testing.T) {
+	t.Parallel()
+	rs := newResourceServer(t, []map[string]any{nodeRow("pve1", 64*gib, 44)})
+	rs.nodeStatus = map[string]map[string]any{"pve1": {"cpu": 0.39}}
+	a := newAccountant(t, rs, func(o *Options) {
+		o.CPUMode, o.CPUUsageLimit, o.CPULaunchVCPUs, o.Refresh = CPUModeHostUsage, 0.8, 1, time.Minute
+	})
+	admitted := 0
+	for range 30 {
+		_, ok, err := a.Reserve(context.Background(), "pve1", Shape{MemoryBytes: gib, VCPUs: 88})
+		require.NoError(t, err)
+		if ok {
+			admitted++
+		}
+	}
+	require.Equal(t, 17, admitted, "ceil(44*0.39)=18 used, floor(44*0.8)=35 limit: seventeen 1-vCPU launches fit")
+}
+
+// A profile that leaves cpu unset (zero vCPUs, inheriting the template)
+// is counted at the launch footprint too, and a node already over its
+// ceiling refuses even a launch counted at nothing.
+func TestCPUHostUsageZeroCoreShapeAndOverCeiling(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name     string
+		cpu      float64
+		launch   int
+		admitted bool
+	}{
+		{"unset cpu at launch footprint", 0.5, 1, true},
+		{"at the ceiling with a 1-vCPU launch", 0.8, 1, false},
+		{"at the ceiling with a free launch", 0.795, 0, true},
+		{"over the ceiling with a free launch", 0.9, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			rs := newResourceServer(t, []map[string]any{nodeRow("pve1", 64*gib, 40)})
+			rs.nodeStatus = map[string]map[string]any{"pve1": {"cpu": tc.cpu}}
+			a := newAccountant(t, rs, func(o *Options) {
+				o.CPUMode, o.CPUUsageLimit, o.CPULaunchVCPUs, o.Refresh = CPUModeHostUsage, 0.8, tc.launch, time.Minute
+			})
+			_, ok, err := a.Reserve(context.Background(), "pve1", Shape{MemoryBytes: gib})
+			require.NoError(t, err)
+			require.Equal(t, tc.admitted, ok)
+			states, err := a.Snapshot(context.Background())
+			require.NoError(t, err)
+			require.Equal(t, a.fitsLocked(a.lastFresh, "pve1", Shape{MemoryBytes: gib}, nil), states["pve1"].FitsCPU(Shape{MemoryBytes: gib}),
+				"NodeState.FitsCPU must agree with the accountant")
+		})
+	}
+}
+
+func TestNodeStateLaunchVCPUs(t *testing.T) {
+	t.Parallel()
+	allocated := NodeState{CPUGated: true, LaunchVCPU: 1}
+	require.Equal(t, 6, allocated.LaunchVCPUs(Shape{VCPUs: 6}), "allocated mode counts configured cores")
+	usage := NodeState{CPUGated: true, CPUUsageMode: true, LaunchVCPU: 2}
+	require.Equal(t, 2, usage.LaunchVCPUs(Shape{VCPUs: 88}), "usage mode counts the launch footprint")
+	require.Equal(t, 1, usage.LaunchVCPUs(Shape{VCPUs: 1}), "capped at a smaller core count")
+	require.Equal(t, 2, usage.LaunchVCPUs(Shape{}), "unset cores take the launch footprint")
 }

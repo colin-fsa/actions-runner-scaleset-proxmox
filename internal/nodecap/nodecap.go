@@ -86,6 +86,37 @@ type NodeState struct {
 	LimitVCPU     int
 	CommittedVCPU int
 	AvailableVCPU int
+
+	// CPUUsageMode reports that CPU admission follows measured host
+	// usage, and LaunchVCPU is what a launching clone is counted at in
+	// that mode (see Options.CPULaunchVCPUs). Use LaunchVCPUs and FitsCPU
+	// rather than comparing Shape.VCPUs against the fields above.
+	CPUUsageMode bool
+	LaunchVCPU   int
+}
+
+// LaunchVCPUs is the CPU a clone of shape is counted at while it
+// launches. The allocated mode counts its configured cores. host_usage
+// counts the configured launch footprint, capped at the shape's cores
+// when those are smaller, because a runner that is booting or waiting
+// for a job is close to idle and the measured reading takes over once it
+// is running.
+func (st NodeState) LaunchVCPUs(shape Shape) int {
+	if !st.CPUUsageMode {
+		return shape.VCPUs
+	}
+	if shape.VCPUs > 0 && shape.VCPUs < st.LaunchVCPU {
+		return shape.VCPUs
+	}
+	return st.LaunchVCPU
+}
+
+// FitsCPU reports whether a clone of shape fits under the node's CPU
+// ceiling. It compares committed plus the launch footprint against the
+// limit, as the accountant does, so a node already over its ceiling
+// refuses even a zero-vCPU launch.
+func (st NodeState) FitsCPU(shape Shape) bool {
+	return !st.CPUGated || st.CommittedVCPU+st.LaunchVCPUs(shape) <= st.LimitVCPU
 }
 
 // Reservation is a claim on a node's capacity held across a clone
@@ -127,9 +158,11 @@ type Options struct {
 	CPUOvercommit float64
 
 	// CPUMode defaults to allocated. host_usage uses measured host CPU with
-	// CPUUsageLimit (0..1), reserving each pending clone at its full vCPU size.
-	CPUMode       string
-	CPUUsageLimit float64
+	// CPUUsageLimit (0..1), counting each pending clone at CPULaunchVCPUs
+	// (capped at its shape's cores) until it is observed powered on.
+	CPUMode        string
+	CPUUsageLimit  float64
+	CPULaunchVCPUs int
 
 	// MemoryMode selects how a node's usable memory is derived. The
 	// zero value is MemoryModeAllocated (the default, and the historical
@@ -505,7 +538,7 @@ func (a *Accountant) fitsLocked(snap *snapshot, node string, shape Shape, extraF
 				vcpuCredit += snap.guestVCPU[vmid]
 			}
 		}
-		if st.CommittedVCPU-vcpuCredit+shape.VCPUs > a.vcpuLimit(totals.vcpus) {
+		if st.CommittedVCPU-vcpuCredit+st.LaunchVCPUs(shape) > a.vcpuLimit(totals.vcpus) {
 			return false
 		}
 	}
@@ -537,8 +570,8 @@ func (a *Accountant) stateLocked(snap *snapshot, node string) NodeState {
 		if r.vmid != 0 && (!a.cpuUsageMode() || snap.guestPowered[r.vmid]) {
 			observedVCPU = snap.guestVCPU[r.vmid]
 		}
-		if r.shape.VCPUs > observedVCPU {
-			deltaVCPU += r.shape.VCPUs - observedVCPU
+		if launch := a.launchVCPUs(r.shape); launch > observedVCPU {
+			deltaVCPU += launch - observedVCPU
 		}
 		for _, v := range r.freeing {
 			if !a.cpuUsageMode() {
@@ -564,6 +597,8 @@ func (a *Accountant) stateLocked(snap *snapshot, node string) NodeState {
 				ReserveBytes:    reserve,
 				CPUGated:        a.cpuGated(),
 				CommittedVCPU:   committedVCPU,
+				CPUUsageMode:    a.cpuUsageMode(),
+				LaunchVCPU:      a.opts.CPULaunchVCPUs,
 				MemoryPressured: true,
 			}
 		}
@@ -616,6 +651,8 @@ func (a *Accountant) stateLocked(snap *snapshot, node string) NodeState {
 		AvailableBytes: available,
 		CPUGated:       a.cpuGated(),
 		CommittedVCPU:  committedVCPU,
+		CPUUsageMode:   a.cpuUsageMode(),
+		LaunchVCPU:     a.opts.CPULaunchVCPUs,
 	}
 	if st.CPUGated {
 		st.LimitVCPU = a.vcpuLimit(totals.vcpus)
@@ -690,7 +727,12 @@ func (a *Accountant) stale(snap *snapshot) bool {
 }
 
 func (a *Accountant) cpuUsageMode() bool { return a.opts.CPUMode == CPUModeHostUsage }
-func (a *Accountant) cpuGated() bool     { return a.cpuUsageMode() || a.opts.CPUOvercommit > 0 }
+
+// launchVCPUs is NodeState.LaunchVCPUs for this accountant's options.
+func (a *Accountant) launchVCPUs(shape Shape) int {
+	return NodeState{CPUUsageMode: a.cpuUsageMode(), LaunchVCPU: a.opts.CPULaunchVCPUs}.LaunchVCPUs(shape)
+}
+func (a *Accountant) cpuGated() bool { return a.cpuUsageMode() || a.opts.CPUOvercommit > 0 }
 
 // vcpuLimit is shared by admission and reported capacity.
 func (a *Accountant) vcpuLimit(cores int) int {

@@ -438,6 +438,34 @@ func TestPlanEviction(t *testing.T) {
 			"the unmet gap survives so the caller can report what was short")
 	})
 
+	t.Run("usage mode never evicts for a CPU gap", func(t *testing.T) {
+		t.Parallel()
+		// Measured CPU comes from busy guests; idle Hot/Warm VMs add next
+		// to nothing and the accountant credits nothing for destroying
+		// them in this mode, so a plan would only lose warm capacity.
+		busy := nodecap.NodeState{
+			AvailableBytes: 64 * gib, CPUGated: true, CPUUsageMode: true,
+			LaunchVCPU: 1, LimitVCPU: 70, CommittedVCPU: 75,
+		}
+		c := candidate(1, 4, true, time.Hour)
+		c.vcpus = 88
+		plan := planEviction([]evictionCandidate{c}, nodecap.Shape{MemoryBytes: 4 * gib, VCPUs: 88}, busy)
+		require.Empty(t, plan.victims)
+		require.Equal(t, 6, plan.vcpuGap, "the unmet CPU gap is still reported")
+	})
+
+	t.Run("usage mode admits a wide profile at its launch footprint", func(t *testing.T) {
+		t.Parallel()
+		st := nodecap.NodeState{
+			AvailableBytes: 64 * gib, CPUGated: true, CPUUsageMode: true,
+			LaunchVCPU: 1, LimitVCPU: 70, CommittedVCPU: 40, AvailableVCPU: 30,
+		}
+		require.True(t, fitsNode(st, nodecap.Shape{MemoryBytes: 4 * gib, VCPUs: 88}),
+			"an 88-thread runner capped by cpulimit is not an 88-vCPU launch")
+		require.False(t, fitsNode(nodecap.NodeState{AvailableBytes: 64 * gib, CPUGated: true, LimitVCPU: 70, CommittedVCPU: 40, AvailableVCPU: 30},
+			nodecap.Shape{MemoryBytes: 4 * gib, VCPUs: 88}), "the allocated mode still counts configured cores")
+	})
+
 	t.Run("only takes what it needs", func(t *testing.T) {
 		t.Parallel()
 		plan := planEviction([]evictionCandidate{
