@@ -728,6 +728,16 @@ type CapacityConfig struct {
 	// CPUUsageLimit is the maximum forecast host utilization in host_usage mode.
 	// Defaults to 0.8; cpu_overcommit_ratio is ignored in this mode.
 	CPUUsageLimit float64 `yaml:"cpu_usage_limit" validate:"gt=0,lte=1"`
+	// CPULaunchVCPUs is what each launching clone is counted at in
+	// host_usage mode, from admission until the accountant sees it powered
+	// on; after that the measured reading carries whatever it really uses.
+	// A runner that is still booting or waiting for a job is close to idle,
+	// so counting it at its full core count (or cpulimit) would refuse
+	// clones on a host with plenty of real headroom. Capped at the
+	// profile's cpu when that is smaller. Default 1; 0 counts launches at
+	// nothing and admits purely on the measured reading. Ignored in the
+	// allocated mode, where clones are counted at their configured cpu.
+	CPULaunchVCPUs *int `yaml:"cpu_launch_vcpus" validate:"omitempty,gte=0,lte=1024"`
 
 	// EvictIdleForDemand lets a queued job reclaim capacity from an
 	// idle pool VM. When a job's clone cannot be admitted anywhere and
@@ -1440,6 +1450,10 @@ func (c *Config) applyPoolDefaults() {
 func (c *Config) applyCapacityDefaults() {
 	if c.Pool.Capacity.CPUMode == "" {
 		c.Pool.Capacity.CPUMode = "allocated"
+	}
+	if c.Pool.Capacity.CPULaunchVCPUs == nil {
+		one := 1
+		c.Pool.Capacity.CPULaunchVCPUs = &one
 	}
 	if c.Pool.Capacity.CPUUsageLimit == 0 {
 		c.Pool.Capacity.CPUUsageLimit = 0.8
@@ -2517,8 +2531,12 @@ func (c *Config) validateProfileFootprint(si int, ssName string, pi int, p Profi
 		return fmt.Errorf("scalesets[%d] %q.profiles[%d] %q: memory_mb must be > 0 when pool.capacity.enabled (admission cannot size a clone that inherits the template's memory)",
 			si, ssName, pi, p.Name)
 	}
-	if (c.Pool.Capacity.CPUOvercommitRatio > 0 || c.Pool.Capacity.CPUMode == "host_usage") && p.CPUCores <= 0 {
-		return fmt.Errorf("scalesets[%d] %q.profiles[%d] %q: cpu must be > 0 when CPU capacity admission is enabled (admission cannot size a clone that inherits the template's cpu count)",
+	// Only the allocated mode sizes a clone by its core count. host_usage
+	// counts a launching clone at cpu_launch_vcpus and then at what the
+	// host measures, so a profile may leave cpu unset and keep the
+	// template's cores (with any cpulimit the template carries).
+	if c.Pool.Capacity.CPUMode != "host_usage" && c.Pool.Capacity.CPUOvercommitRatio > 0 && p.CPUCores <= 0 {
+		return fmt.Errorf("scalesets[%d] %q.profiles[%d] %q: cpu must be > 0 when cpu_overcommit_ratio is set (admission cannot size a clone that inherits the template's cpu count; cpu_mode: host_usage does not need it)",
 			si, ssName, pi, p.Name)
 	}
 	return nil

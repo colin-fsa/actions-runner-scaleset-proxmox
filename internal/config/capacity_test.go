@@ -256,6 +256,19 @@ func TestCapacity_CPUModes(t *testing.T) {
 			require.Error(t, err)
 		}
 	}
-	_, err = config.Parse(capacityCfg("10", capacityOn+"\n    cpu_mode: host_usage", "0", "4096"))
-	require.Error(t, err, "usage forecasts require a known CPU shape")
+	require.Equal(t, 1, *cfg.Pool.Capacity.CPULaunchVCPUs, "launches are counted at one vCPU by default")
+
+	cfg, err = config.Parse(capacityCfg("10", capacityOn+"\n    cpu_mode: host_usage", "0", "4096"))
+	require.NoError(t, err, "host_usage counts launches at cpu_launch_vcpus, so cpu may inherit the template's cores")
+	require.Zero(t, cfg.Scalesets[0].Profiles[0].CPUCores)
+
+	_, err = config.Parse(capacityCfg("10", capacityOn+"\n    cpu_mode: host_usage\n    cpu_overcommit_ratio: 4.0", "0", "4096"))
+	require.NoError(t, err, "the overcommit ratio is ignored in host_usage, so it cannot demand a cpu")
+
+	cfg, err = config.Parse(capacityCfg("10", capacityOn+"\n    cpu_mode: host_usage\n    cpu_launch_vcpus: 0", "0", "4096"))
+	require.NoError(t, err)
+	require.Equal(t, 0, *cfg.Pool.Capacity.CPULaunchVCPUs, "an explicit zero is kept, not defaulted")
+
+	_, err = config.Parse(capacityCfg("10", capacityOn+"\n    cpu_mode: host_usage\n    cpu_launch_vcpus: -1", "0", "4096"))
+	require.Error(t, err)
 }

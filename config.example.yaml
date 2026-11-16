@@ -285,6 +285,9 @@ pool:
   #   # reason to refuse a clone.
   #   cpu_mode: allocated       # or host_usage for measured CPU admission
   #   cpu_usage_limit: 0.8       # host_usage ceiling (80%); ignores ratio
+  #   cpu_launch_vcpus: 1        # host_usage: what a launching runner counts as
+  #                              # until it is running (then it is measured);
+  #                              # profiles may omit cpu in this mode
   #   cpu_overcommit_ratio: 0
   #   # How memory is measured. allocated (default) plans against the node's
   #   # physical RAM minus the reserve minus the configured memory of every

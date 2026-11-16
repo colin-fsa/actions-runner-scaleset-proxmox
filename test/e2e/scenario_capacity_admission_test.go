@@ -348,3 +348,32 @@ func TestE2E_CapacityAdmission_CPUHostUsage(t *testing.T) {
 		return h.MetricValue(t, "scaleset_pool_size", formatLabel("state", "hot")) >= 2
 	}, 20*time.Second, 200*time.Millisecond, "39 percent host CPU must admit workers despite the foreign guest's 64-vCPU allocation")
 }
+
+// TestE2E_CapacityAdmission_CPUHostUsageCountsLaunchesNotCores covers
+// runners that expose every host thread and rely on a cpulimit in the
+// template: in host_usage mode a launch is counted at cpu_launch_vcpus
+// (default 1), so a profile wider than the whole node, or one that leaves
+// cpu unset to inherit the template, still fills its hot pool on a host
+// with measured headroom.
+func TestE2E_CapacityAdmission_CPUHostUsageCountsLaunchesNotCores(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name  string
+		cores int
+	}{{"wider than the node", 64}, {"cpu unset", 0}} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fp := fakeproxmox.New(t, fakeproxmox.Options{NodeCPUUsage: 0.39, TaskDuration: 5 * time.Millisecond})
+			fp.SetNodeCapacity("pve1", 64*gib, 16)
+			h := Start(t, Options{
+				FakeProxmox: fp, HotSize: 2, MaxConcurrentRunners: 2,
+				Profiles: []ProfileSpec{{Name: "wide", CPUCores: tc.cores, MemoryMB: 4096, HotSize: 2}},
+				Capacity: &CapacitySpec{ReserveMemoryMB: 2048, CPUMode: "host_usage", CPUUsageLimit: 0.8},
+			})
+			require.Eventually(t, func() bool {
+				return h.MetricValue(t, "scaleset_pool_size", formatLabel("state", "hot")) >= 2
+			}, 20*time.Second, 200*time.Millisecond,
+				"ceil(16*0.39)=7 used of a 12-vCPU ceiling: two 1-vCPU launches fit whatever the profile's cores")
+		})
+	}
+}

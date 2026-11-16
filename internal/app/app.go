@@ -565,6 +565,7 @@ func buildCapacityAccountant(cfg *config.Config, prov provisioner.Provisioner, l
 		CPUOvercommit:    cc.CPUOvercommitRatio,
 		CPUMode:          cc.CPUMode,
 		CPUUsageLimit:    cc.CPUUsageLimit,
+		CPULaunchVCPUs:   derefInt(cc.CPULaunchVCPUs),
 		MemoryMode:       cc.MemoryMode,
 		MemoryOvercommit: cc.MemoryOvercommit,
 		// The in-flight clone grace already means "how long before we
@@ -1561,4 +1562,13 @@ func firstNonEmpty(a, b string) string {
 		return a
 	}
 	return b
+}
+
+// derefInt reads an optional config integer that defaulting has already
+// filled; nil (only possible when defaults were skipped) reads as zero.
+func derefInt(p *int) int {
+	if p == nil {
+		return 0
+	}
+	return *p
 }

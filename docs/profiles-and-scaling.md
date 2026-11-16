@@ -193,11 +193,50 @@ pool:
 `host_usage` reads the node's `cpu` fraction from `GET /nodes/{node}/status`,
 sharing the request with host memory admission. It ignores `cpu_overcommit_ratio`.
 The ceiling is `floor(logical CPUs * cpu_usage_limit)`, and measured consumption
-is rounded up to CPU equivalents. Pending launches reserve their full configured
-vCPU count until observed powered on. Thus concurrent clones cannot spend the
-same forecast headroom; configured vCPUs of existing guests do not set the base.
-The limit defaults to 0.8 (80%); missing, invalid or stale readings fail closed.
-Profiles must specify their CPU count so a launch can be sized.
+is rounded up to CPU equivalents. Configured vCPUs of existing guests do not
+set the base, so idle runners cost nothing. The limit defaults to 0.8 (80%);
+missing, invalid or stale readings fail closed.
+
+A launching runner is counted at `cpu_launch_vcpus` (default 1, capped at the
+profile's `cpu` when that is smaller) until the accountant sees it powered on;
+after that the measured reading carries whatever it really uses. A runner that
+is booting or waiting for a job is close to idle, so counting it at its core
+count would refuse clones on a host with plenty of real headroom. Concurrent
+launches still each hold their footprint, so they cannot all spend the same
+headroom. Set `cpu_launch_vcpus: 0` to admit purely on the measured reading.
+
+Because nothing is sized by core count in this mode, `cpu` is optional on a
+profile. That allows a runner to see every host thread while a `cpulimit` on
+its template caps its share, so the kernel can spread its work instead of
+pinning it to a few cores:
+
+```yaml
+pool:
+  capacity:
+    enabled: true
+    memory_mode: host_available
+    cpu_mode: host_usage
+    cpu_usage_limit: 0.8
+    cpu_launch_vcpus: 1
+scalesets:
+  - profiles:
+      - name: linux
+        # cpu omitted: clones keep the template's cores (e.g. all 88 threads)
+        # and its cpulimit (e.g. 6). Setting cpu: 88 works the same way here.
+        memory_mb: 10240
+```
+
+For LXC runners this matters beyond admission. Proxmox pins a container
+whose `cores` is below the host's thread count to that many specific CPUs,
+and `pvestatd` keeps moving that set every few seconds to balance containers.
+A job's processes can then lose CPUs mid-run (a process whose affinity was
+narrowed keeps only the CPUs its old mask shares with the new set). A
+container with `cores` unset, or equal to the host's thread count, is never
+pinned or moved; `cpulimit` still caps its CPU time.
+
+Idle Hot/Warm runners are never evicted to close a CPU gap in this mode: they
+add next to nothing to measured usage, so destroying them would not admit the
+queued job.
 
 This is admission based on sampled usage, not a CPU throttle or a guarantee
 against future contention. Existing jobs may become busy after admission. Leave
