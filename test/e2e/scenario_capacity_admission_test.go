@@ -292,45 +292,93 @@ func TestE2E_CapacityAdmission_DisabledKeepsLegacyBehaviour(t *testing.T) {
 // down to the host reserve and stops, deferring the rest.
 func TestE2E_CapacityAdmission_HostAvailablePlansAgainstFreeMemory(t *testing.T) {
 	t.Parallel()
-	fp := fakeproxmox.New(t, fakeproxmox.Options{TaskDuration: 5 * time.Millisecond})
 	// 32 GiB node; a running foreign 8 GiB guest takes real host RAM, so
 	// live free starts at 24 GiB. 4 GiB host reserve => 20 GiB admissible,
-	// which is five mem-4g VMs — one short of the six the pool wants.
-	fp.SetNodeCapacity("pve1", 32*gib, 16)
-	fp.SeedVM("pve1", 500, "someone-elses-database", true, nil)
-	require.NoError(t, fp.SetVMConfig(500, "memory", 8*1024))
+	// which is five mem-4g guests RUNNING — one short of the six wanted.
+	//
+	// Only running guests spend live RAM (the fake, like PVE, takes free
+	// from powered-on guests). A stopped warm VM does not, so since the
+	// warm-promotion change its claim retires once its row is observed and
+	// the start reserves again (ReserveExisting). The bound therefore
+	// applies to powered-on VMs, not to how many stopped VMs the warm tier
+	// holds; the nodecap ReserveExisting tests cover the start side
+	// (charges the stopped VM, refuses when short, no double-spend across
+	// concurrent promotions).
+	setup := func(t *testing.T, hot, warm int) *Harness {
+		fp := fakeproxmox.New(t, fakeproxmox.Options{TaskDuration: 5 * time.Millisecond})
+		fp.SetNodeCapacity("pve1", 32*gib, 16)
+		fp.SeedVM("pve1", 500, "someone-elses-database", true, nil)
+		require.NoError(t, fp.SetVMConfig(500, "memory", 8*1024))
+		return Start(t, Options{
+			FakeProxmox:          fp,
+			HotSize:              hot,
+			MaxConcurrentRunners: 8,
+			Profiles: []ProfileSpec{
+				{Name: "mem-4g", CPUCores: 2, MemoryMB: 4096, HotSize: hot, WarmSize: warm},
+			},
+			Capacity: &CapacitySpec{
+				ReserveMemoryMB: 4096,
+				MemoryMode:      "host_available",
+			},
+		})
+	}
+	ownedRunning := func(h *Harness) (count, mb int) {
+		for _, vm := range h.Proxmox.Snapshot() {
+			if vm.VMID < vmidLo || vm.VMID >= vmidHi || !vm.Running {
+				continue
+			}
+			count++
+			mb += 4096
+		}
+		return count, mb
+	}
 
-	h := Start(t, Options{
-		FakeProxmox:          fp,
-		HotSize:              0,
-		MaxConcurrentRunners: 8,
-		Profiles: []ProfileSpec{
-			{Name: "mem-4g", CPUCores: 2, MemoryMB: 4096, WarmSize: 6},
-		},
-		Capacity: &CapacitySpec{
-			ReserveMemoryMB: 4096,
-			MemoryMode:      "host_available",
-		},
+	t.Run("running guests stop at live free minus the reserve", func(t *testing.T) {
+		t.Parallel()
+		h := setup(t, 6, 0)
+		require.Eventually(t, func() bool {
+			_, mb := ownedRunning(h)
+			return mb >= 20*1024
+		}, 20*time.Second, 200*time.Millisecond,
+			"the hot pool should fill the 20 GiB of live free RAM down to the reserve")
+		time.Sleep(2 * time.Second)
+
+		count, mb := ownedRunning(h)
+		require.Equal(t, 20*1024, mb,
+			"host_available must stop running guests at live free minus the reserve (20 GiB); saw %d MiB across %d VMs", mb, count)
+		require.Equal(t, 5, count, "20 GiB of live free / 4 GiB = 5 running VMs, not the 6 the pool wants")
+		total, _ := ownedAllocationMB(t, h)
+		require.Equal(t, 5, total, "the sixth clone is deferred, not created and left stopped")
+		// The sixth VM the pool wanted could not be admitted against the live
+		// free pool, so the wait is visible rather than silent.
+		require.Positive(t,
+			h.MetricValue(t, "scaleset_clone_deferred_capacity_total"),
+			"the clone that exceeds the live free pool must be counted")
 	})
 
-	require.Eventually(t, func() bool {
-		_, mb := ownedAllocationMB(t, h)
-		return mb >= 20*1024
-	}, 20*time.Second, 200*time.Millisecond,
-		"the pool should fill the 20 GiB of live free RAM down to the reserve")
-	time.Sleep(2 * time.Second)
+	t.Run("stopped warm VMs spend no live RAM", func(t *testing.T) {
+		t.Parallel()
+		// The old assumption was that the warm tier is capped by live free
+		// RAM too. A stopped VM never touches that RAM, so the cap is the
+		// warm size; what stops oversubscription is the start, which must
+		// reserve the VM's memory before it boots.
+		h := setup(t, 0, 6)
+		// Settle on exactly the warm size. The warm fill can briefly clone
+		// past it and drain the surplus (it does so with admission off
+		// too), so the check is the settled state, held for a while.
+		require.Eventually(t, func() bool {
+			count, _ := ownedAllocationMB(t, h)
+			return count == 6 &&
+				h.MetricValue(t, "scaleset_pool_size", formatLabel("state", "warm")) == 6
+		}, 20*time.Second, 200*time.Millisecond,
+			"the warm tier fills to its size although 24 GiB of stopped VMs exceeds the 20 GiB admissible")
+		time.Sleep(2 * time.Second)
 
-	count, allocatedMB := ownedAllocationMB(t, h)
-	require.Equal(t, 20*1024, allocatedMB,
-		"host_available must stop at live free minus the reserve (20 GiB); saw %d MiB across %d VMs",
-		allocatedMB, count)
-	require.Equal(t, 5, count, "20 GiB of live free / 4 GiB = 5 VMs, not the 6 the pool wants")
-
-	// The sixth VM the pool wanted could not be admitted against the live
-	// free pool, so the wait is visible rather than silent.
-	require.Positive(t,
-		h.MetricValue(t, "scaleset_clone_deferred_capacity_total"),
-		"the clone that exceeds the live free pool must be counted")
+		count, mb := ownedAllocationMB(t, h)
+		require.Equal(t, 6, count, "warm_size bounds the stopped tier; saw %d VMs (%d MiB)", count, mb)
+		running, _ := ownedRunning(h)
+		require.Zero(t, running, "warm VMs stay powered off, so live free RAM is untouched")
+	})
 }
 
 func TestE2E_CapacityAdmission_CPUHostUsage(t *testing.T) {

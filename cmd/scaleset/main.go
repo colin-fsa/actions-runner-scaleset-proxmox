@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -74,7 +75,9 @@ func main() {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			password := os.Getenv(prepPassEnv)
 			if prepPassFile != "" {
-				b, err := os.ReadFile(prepPassFile)
+				// The operator names this file on the command line to keep the
+				// password off argv; Clean normalises the path it reads.
+				b, err := os.ReadFile(filepath.Clean(prepPassFile))
 				if err != nil {
 					return fmt.Errorf("read password file: %w", err)
 				}

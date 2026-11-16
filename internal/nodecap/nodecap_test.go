@@ -1109,7 +1109,8 @@ func TestReserveExistingSharesTheLedgerWithClones(t *testing.T) {
 // promotions of distinct warm VMs against one pinned snapshot.
 func TestReserveExistingConcurrentPromotionsNeverDoubleSpend(t *testing.T) {
 	t.Parallel()
-	rows := []map[string]any{nodeRow("pve1", 64*gib, 64)}
+	rows := make([]map[string]any, 0, 33)
+	rows = append(rows, nodeRow("pve1", 64*gib, 64))
 	for i := range 32 {
 		rows = append(rows, stoppedGuestRow(10001+i, "pve1", 4*gib, 2))
 	}
