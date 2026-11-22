@@ -1273,11 +1273,11 @@ func TestReconcile_ClonesToFillHot(t *testing.T) {
 		return len(fp.clones) == 2
 	}, 2*time.Second, 10*time.Millisecond)
 
-	// Each clone should have PoweredOn=true (hot path).
+	// Hot clones are started explicitly after cloning for shared pacing.
 	fp.mu.Lock()
 	defer fp.mu.Unlock()
 	for _, c := range fp.clones {
-		require.True(t, c.PoweredOn, "hot-pool clones must be powered on")
+		require.False(t, c.PoweredOn, "hot-pool clones are started explicitly")
 	}
 }
 

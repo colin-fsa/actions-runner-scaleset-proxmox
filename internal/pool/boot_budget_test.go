@@ -46,13 +46,9 @@ func TestWindowsBudgetColdAndWarmShareNode(t *testing.T) {
 	}
 	m.promoteN(context.Background(), "win", 1)
 	require.Equal(t, store.StateWarm, stateOf(t, st, 60001))
-	// Linux must not consume or be blocked by the Windows-only budget.
+	// Linux shares the same host budget as the Windows cold clone.
 	m.promoteN(context.Background(), "linux", 1)
-	select {
-	case <-p.entered:
-	case <-time.After(5 * time.Second):
-		t.Fatal("Linux promotion blocked")
-	}
+	require.Equal(t, store.StateWarm, stateOf(t, st, 60002))
 	// A Windows warm on a different node gets an independent slot.
 	require.NoError(t, st.Insert(&store.VM{VMID: 60003, Node: "pve2", Name: "gh-runner-test-other", Profile: "win", State: store.StateWarm, PoolKind: store.PoolKindWarm}))
 	m.promoteN(context.Background(), "win", 2)
@@ -119,4 +115,20 @@ func TestWindowsBudgetReleasedOnCloneFailure(t *testing.T) {
 	release, ok := b.tryAcquire("pve1")
 	require.True(t, ok)
 	release()
+}
+
+func TestHostBudgetSpacingAndRecovery(t *testing.T) {
+	b := NewHostBootBudget(2, 30*time.Millisecond, 0)
+	b.BeginRecovery(time.Hour)
+	_, ok := b.tryAcquire("pve1")
+	require.False(t, ok)
+	b.BeginRecovery(0)
+	release, ok := b.tryAcquire("pve1")
+	require.True(t, ok)
+	defer release()
+	require.NoError(t, b.pace(context.Background(), "pve1"))
+	start := time.Now()
+	require.NoError(t, b.pace(context.Background(), "pve2"))
+	require.NoError(t, b.pace(context.Background(), "pve1"))
+	require.GreaterOrEqual(t, time.Since(start), 25*time.Millisecond)
 }

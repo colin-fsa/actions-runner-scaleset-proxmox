@@ -618,6 +618,8 @@ const (
 // operator can put a fleet-wide ceiling above the per-profile arithmetic.
 type PoolConfig struct {
 	WindowsBootsPerNode int      `yaml:"windows_boots_per_node" validate:"gte=0"`
+	BootsPerNode        int      `yaml:"boots_per_node" validate:"gte=0"`
+	BootStartInterval   Duration `yaml:"boot_start_interval"`
 	HotSize             int      `yaml:"hot_size" validate:"gte=0,lte=1000000"`
 	WarmSize            int      `yaml:"warm_size" validate:"gte=0,lte=1000000"`
 	GlobalMax           int      `yaml:"global_max" validate:"gte=0,lte=1000000"`
@@ -1428,6 +1430,7 @@ func (c *Config) ApplyDefaults() {
 // applyPoolDefaults fills the global Pool timing/sizing knobs.
 func (c *Config) applyPoolDefaults() {
 	// Pool
+	c.Pool.BootStartInterval.setDefault(0)
 	c.Pool.ReconcileInterval.setDefault(10 * time.Second)
 	c.Pool.VMMaxAge.setDefault(24 * time.Hour)
 	c.Pool.DrainTimeout.setDefault(30 * time.Minute)
@@ -1736,6 +1739,12 @@ func (c *Config) resolvePool() error {
 	}
 	if c.Pool.CloneInflightGrace.D() <= 0 {
 		return errors.New("pool.clone_inflight_grace must be positive")
+	}
+	if c.Pool.BootStartInterval.D() < 0 {
+		return errors.New("pool.boot_start_interval must not be negative")
+	}
+	if c.Pool.BootsPerNode != 0 && c.Pool.WindowsBootsPerNode != 0 {
+		return errors.New("pool.boots_per_node and pool.windows_boots_per_node cannot both be set")
 	}
 	if c.Pool.Capacity.Enabled && c.Pool.Capacity.RefreshInterval.D() <= 0 {
 		return errors.New("pool.capacity.refresh_interval must be positive")

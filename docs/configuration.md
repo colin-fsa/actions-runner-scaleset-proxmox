@@ -93,16 +93,55 @@ installation-token fetch and subsequent REST calls (typically
 Leave all of these empty when running against github.com — the default
 per-scope URL derivation already targets the right endpoint.
 
-### Windows boot pacing
+### Shared host boot pacing
 
-`pool.windows_boots_per_node` limits concurrent Windows VM cold starts and
-warm promotions on each node, shared across scale sets in this process. Set it
-to `2` as a conservative starting point. The default `0` disables the limit
-for backwards compatibility. It does not change runner caps or Linux starts.
-A slot is held from before the clone or promotion until guest-agent readiness
-or failure. Guest-agent readiness is not full Windows boot completion, and
-this limit does not by itself guarantee host memory remains available as guests
-grow. Capacity admission and a suitable host memory reserve remain necessary.
-The budget is process-local, not a distributed lock between independent
-orchestrator deployments. Saturated work retries on later reconcile passes;
-this is not a strict FIFO or starvation-freedom guarantee.
+`pool.boots_per_node` limits concurrent boots per Proxmox node across all
+profiles, operating systems, and scale sets in this controller. The default is
+`0` (unlimited). `pool.boot_start_interval` is the minimum interval between
+starts on the same node; its default is `0s` (unlimited). The old
+`windows_boots_per_node` setting is accepted as an alias but now covers all
+operating systems; do not set both names. A conservative initial setting is
+`boots_per_node: 2` and `boot_start_interval: 15s`. The existing per-profile
+runner limit, including a configured Windows ceiling of 25, remains separate.
+Slots are held through guest readiness or failure; saturation defers pool
+refill. The budget is local to one elected controller, not a lock between
+independently deployed controllers.
+
+With capacity enabled and `memory_mode: host_available`, start reservations
+withhold the configured RAM (scaled by `memory_overcommit`) for at least 15
+minutes after the start request, or `clone_inflight_grace` if longer. This is a
+bounded settling assumption, not a measurement of individual guest RAM. It can
+temporarily double count memory that has already appeared in host usage.
+After each leader election, start pacing and host-memory admission pause for
+the same window to let requests from the previous leader settle. Work can wait
+longer than usual after restart. This policy assumes Proxmox start tasks and
+memory ramp complete within that window; raise `clone_inflight_grace` if that
+is not conservative enough. Keep host reserve for other workloads.
+
+### Staged canary and rollback
+
+In an isolated test environment with representative Linux and Windows profiles,
+set the two controls to `2` and `15s`, enable host-available admission with the
+normal reserve, and retain the existing Windows runner ceiling. First establish
+baseline free RAM, start duration and queued-job latency. Then:
+
+1. Submit a small mixed burst that requires cold clones and warm promotions on
+   one node; verify no more than two boots are active and start timestamps are
+   at least 15 seconds apart. Repeat across two nodes to check independent budgets.
+2. During a controlled start, compare Proxmox host free-memory samples and
+   capacity admission. A powered-on guest whose memory has not yet appeared in
+   the host reading must still consume a reservation; further work waits.
+3. With an isolated assigned or running test job, briefly interrupt the runner's
+   GitHub connectivity, restore it within the grace, and verify the job survives.
+   Separately confirm sustained offline status is cleaned up after grace, and
+   repeat after a controller restart to check the timer begins again.
+
+Watch `scaleset_pool_size`, `scaleset_acquire_duration_seconds`,
+`scaleset_boot_duration_seconds`, `scaleset_startup_stage_duration_seconds`,
+`scaleset_reconcile_errors_total`, host MemAvailable, Proxmox task timestamps,
+and controller logs for deferred admission, reservation expiry and force
+destroy. Stop the canary if memory pressure, failed jobs, excessive waiting,
+or unexpected destroys appear. Roll back by restoring the previous controller
+image and configuration together, then confirm the old leader has stopped and
+inspect in-flight Proxmox tasks before resuming demand. A rollback removes these
+protections; do not use it as a substitute for controlling incoming load.

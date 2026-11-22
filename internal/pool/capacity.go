@@ -55,6 +55,13 @@ func (c capacityClaim) bind(vmid int) {
 	}
 }
 
+func (c capacityClaim) beginStart() bool {
+	if r, ok := c.res.(interface{ BeginStart() bool }); ok {
+		return r.BeginStart()
+	}
+	return true
+}
+
 // expectPoweredOff marks the claim's VM as staying powered off (a warm
 // clone), so the accountant retires it on observation; see
 // nodecap.Reservation.ExpectPoweredOff.

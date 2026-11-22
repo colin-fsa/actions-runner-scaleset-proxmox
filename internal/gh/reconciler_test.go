@@ -256,6 +256,10 @@ func TestReconcile_AssignedIdlePastGrace_Destroys(t *testing.T) {
 	r, err := New(baseCfg(), newTestClient(t, srv), mgr, &stubProv{}, silentLogger(), nil)
 	require.NoError(t, err)
 	require.NoError(t, r.Tick(context.Background()))
+	first := r.offlineSince[mgr.rows[0].Name]
+	first.since = first.since.Add(-time.Hour)
+	r.offlineSince[mgr.rows[0].Name] = first
+	require.NoError(t, r.Tick(context.Background()))
 
 	require.Empty(t, mgr.promoteCalls)
 	require.Len(t, mgr.destroyCalls, 1)
@@ -357,6 +361,10 @@ func TestReconcile_RunningIdle_Destroys(t *testing.T) {
 	}}
 	r, err := New(baseCfg(), newTestClient(t, srv), mgr, &stubProv{}, silentLogger(), nil)
 	require.NoError(t, err)
+	require.NoError(t, r.Tick(context.Background()))
+	first := r.offlineSince[mgr.rows[0].Name]
+	first.since = first.since.Add(-time.Hour)
+	r.offlineSince[mgr.rows[0].Name] = first
 	require.NoError(t, r.Tick(context.Background()))
 
 	require.Len(t, mgr.destroyCalls, 1)

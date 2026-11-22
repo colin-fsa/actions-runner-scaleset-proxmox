@@ -147,6 +147,7 @@ type offlineObservation struct {
 	runnerID int64
 	created  time.Time
 	since    time.Time
+	status   string
 }
 
 // New builds a Reconciler. The github.Client must already be authenticated
@@ -344,7 +345,7 @@ func listRunnersByPrefix(ctx context.Context, gh *github.Client, scope githubaut
 				ID:      gr.GetID(),
 				Online:  gr.GetStatus() == "online",
 				Busy:    gr.GetBusy(),
-				Unknown: gr.GetStatus() != "online" && gr.GetStatus() != "offline",
+				Unknown: gr.GetID() == 0 || gr.Busy == nil || (gr.GetStatus() != "online" && gr.GetStatus() != "offline"),
 			}
 		}
 		if resp == nil || resp.NextPage == 0 {
@@ -589,25 +590,35 @@ func (r *Reconciler) applyMatrix(ctx context.Context, rows []pool.RowSnapshot, r
 			r.metrics.RunnerObservedOnline(r.cfg.ScaleSetName, row.Name)
 		}
 		ghLabel := ghStateLabel(gr, present)
-		if (row.State == "assigned" || row.State == "running") && ghLabel == "offline" {
+		if (row.State == "assigned" || row.State == "running") && (ghLabel == "offline" || ghLabel == "idle") {
 			seen[row.Name] = true
 			first, ok := r.offlineSince[row.Name]
-			if !ok || first.runnerID != gr.ID || !first.created.Equal(row.CreatedAt) {
-				r.offlineSince[row.Name] = offlineObservation{runnerID: gr.ID, created: row.CreatedAt, since: now}
+			if !ok || first.runnerID != gr.ID || !first.created.Equal(row.CreatedAt) || first.status != ghLabel {
+				r.offlineSince[row.Name] = offlineObservation{runnerID: gr.ID, created: row.CreatedAt, since: now, status: ghLabel}
 				continue
 			}
 			grace := r.cfg.AssignedOfflineGrace
+			if row.State == "assigned" && ghLabel == "idle" {
+				grace = r.cfg.AssignedGrace
+			}
 			if row.State == "running" {
 				grace = r.cfg.RunningIdleGrace
 			}
 			if now.Sub(first.since) < grace {
 				continue
 			}
-			if !r.confirmOffline(ctx, row, gr.ID) {
+			if !r.confirmRunnerState(ctx, row, gr.ID, ghLabel) {
 				delete(r.offlineSince, row.Name)
 				continue
 			}
 			reason := row.State + ": runner went offline"
+			if ghLabel == "idle" {
+				if row.State == "running" {
+					reason = "running: runner went idle (missed JobCompleted)"
+				} else {
+					reason = "assigned: runner online but never picked up a job"
+				}
+			}
 			if guarded, ok := r.pool.(interface {
 				ForceDestroyUnchanged(context.Context, pool.RowSnapshot, string) error
 			}); ok {
@@ -650,15 +661,15 @@ func (r *Reconciler) applyMatrix(ctx context.Context, rows []pool.RowSnapshot, r
 	}
 }
 
-// confirmOffline requires a fresh successful listing and an unchanged pool
+// confirmRunnerState requires a fresh successful listing and an unchanged pool
 // row immediately before requesting cleanup. Unknown or missing data defers.
-func (r *Reconciler) confirmOffline(ctx context.Context, row pool.RowSnapshot, id int64) bool {
+func (r *Reconciler) confirmRunnerState(ctx context.Context, row pool.RowSnapshot, id int64, want string) bool {
 	runners, truncated, err := r.listOurRunners(ctx)
 	if err != nil || truncated {
 		return false
 	}
 	gr, ok := runners[row.Name]
-	if !ok || gr.ID != id || gr.Online || gr.Unknown {
+	if !ok || gr.ID != id || ghStateLabel(gr, true) != want {
 		return false
 	}
 	rows, err := r.pool.ListRows(ctx)

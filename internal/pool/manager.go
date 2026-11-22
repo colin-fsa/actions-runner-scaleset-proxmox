@@ -1593,11 +1593,12 @@ func (m *manager) powerPollOnce(ctx context.Context) {
 		}
 		// Empty string means "unknown" (VM not found). Skip — the
 		// stuck-state sweep will reap genuinely-missing rows.
-		if state == "" || state == "running" {
+		if state != "stopped" {
 			continue
 		}
-		// Anything else ("stopped", "paused", ...) signals the job is
-		// no longer executing. MarkCompleted is idempotent and refuses
+		// A stopped guest signals normal job completion. Paused and unknown
+		// states do not establish that an assigned job has finished.
+		// MarkCompleted is idempotent and refuses
 		// rows already in Draining/Destroying, so a duplicate poll
 		// observation is harmless.
 		m.log.Info("power-poll: vm not running; marking completed",
@@ -2179,14 +2180,11 @@ func (m *manager) promoteN(ctx context.Context, profile string, n int) {
 			continue
 		}
 		releaseWindowsBoot := func() {}
-		ps := m.profileOf(w.Profile)
-		if ps == nil {
-			ps = m.profileOf(m.defaultProfile())
-		}
-		if ps != nil && ps.settings.GuestOS == "windows" {
+		{
 			var acquired bool
 			releaseWindowsBoot, acquired = m.cfg.WindowsBootBudget.tryAcquire(w.Node)
 			if !acquired {
+				m.log.Debug("promote: host boot budget unavailable", "vmid", w.VMID, "node", w.Node)
 				m.bootSem.Release(1)
 				continue
 			}
@@ -2317,6 +2315,7 @@ type clonePrep struct {
 	// off (warm), so it retires on observation. No-op when admission is
 	// disabled.
 	expectPoweredOff   func()
+	beginStart         func() bool
 	releaseWindowsBoot func()
 }
 
@@ -2351,7 +2350,7 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 	// snapshot must be taken while the VM is still stopped, before the
 	// runner's first boot dirties the disk. Hot fills start the VM
 	// explicitly below, after the snapshot lands.
-	cloneStartsVM := prep.poweredOn && !m.snapshotRecycle()
+	cloneStartsVM := false
 
 	cloneStart := time.Now()
 	pv, err := m.prov.Clone(prep.ctx, provisioner.CloneOptions{
@@ -2449,7 +2448,13 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 			// start the VM now so runBootInline's WaitReady has a
 			// booting guest to poll.
 			startTime := time.Now()
-			serr := m.prov.Start(prep.ctx, pv)
+			serr := m.cfg.WindowsBootBudget.pace(prep.ctx, prep.node)
+			if serr == nil && !prep.beginStart() {
+				serr = errors.New("capacity reservation expired before start")
+			}
+			if serr == nil {
+				serr = m.prov.Start(prep.ctx, pv)
+			}
 			if m.metrics != nil {
 				m.metrics.ObserveStartupStage(m.cfg.ScaleSetName, prep.profileName, "power_on", time.Since(startTime))
 			}
@@ -2503,10 +2508,11 @@ func (m *manager) prepareClone(profile string, kind store.PoolKind, poweredOn bo
 	}
 
 	releaseWindowsBoot := func() {}
-	if poweredOn && ps.settings.GuestOS == "windows" {
+	if poweredOn {
 		var ok bool
 		releaseWindowsBoot, ok = m.cfg.WindowsBootBudget.tryAcquire(node)
 		if !ok {
+			m.log.Debug("clone: host boot budget unavailable", "profile", profileName, "node", node)
 			claim.release()
 			span.End()
 			cancel()
@@ -2567,6 +2573,7 @@ func (m *manager) prepareClone(profile string, kind store.PoolKind, poweredOn bo
 
 		releaseCapacity:    claim.release,
 		expectPoweredOff:   claim.expectPoweredOff,
+		beginStart:         claim.beginStart,
 		releaseWindowsBoot: releaseWindowsBoot,
 	}
 
@@ -2680,13 +2687,23 @@ func (m *manager) runBoot(row *store.VM, claim capacityClaim) {
 	defer cancel()
 	pv := &provisioner.VM{VMID: row.VMID, Node: row.Node, Name: row.Name, Profile: row.Profile}
 	startTime := time.Now()
-	err := m.prov.Start(ctx, pv)
+	err := m.cfg.WindowsBootBudget.pace(ctx, row.Node)
+	if err == nil && !claim.beginStart() {
+		err = errors.New("capacity reservation expired before start")
+	}
+	issued := false
+	if err == nil {
+		issued = true
+		err = m.prov.Start(ctx, pv)
+	}
 	if m.metrics != nil {
 		m.metrics.ObserveStartupStage(m.cfg.ScaleSetName, row.Profile, "power_on", time.Since(startTime))
 	}
 	if err != nil {
 		m.log.Warn("boot: start failed", "vmid", row.VMID, "err", err)
-		claim.release()
+		if !issued {
+			claim.release()
+		}
 		m.markPoisonOrDestroy(row)
 		return
 	}

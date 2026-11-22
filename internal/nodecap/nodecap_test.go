@@ -882,17 +882,22 @@ func TestHostModeReservationRetiresOnObservation(t *testing.T) {
 	require.Equal(t, uint64(16*gib), states["pve1"].AvailableBytes,
 		"the reservation withholds its 16 GiB from the 32 GiB free pool")
 
-	// The clone lands at full size and starts consuming RAM: free drops to
-	// 16 GiB. The reservation retires (observed >= shape) and the free
-	// reading carries the allocation — available stays 16, not 0.
+	// The clone lands at full size and host free drops, but power and
+	// configured size do not prove that memory has finished ramping.
 	rs.setRows([]map[string]any{nodeRow("pve1", 32*gib, 16), guestRow(10001, "pve1", 16*gib, 8)})
 	rs.setNodeStatus("pve1", 16*gib, 32*gib)
 	settle()
 	states, err = a.Snapshot(ctx)
 	require.NoError(t, err)
 	require.Equal(t, uint64(16*gib), states["pve1"].CommittedBytes, "total minus free")
+	require.Zero(t, states["pve1"].AvailableBytes)
+	a.mu.Lock()
+	res.(*reservation).expires = time.Now().Add(-time.Second)
+	a.mu.Unlock()
+	states, err = a.Snapshot(ctx)
+	require.NoError(t, err)
 	require.Equal(t, uint64(16*gib), states["pve1"].AvailableBytes,
-		"retiring must not subtract the guest a second time off the free reading")
+		"after settling, the live free reading carries the allocation")
 }
 
 // TestAllocatedModeDoesNotReadNodeStatus is the back-compat contract: the
@@ -1194,8 +1199,27 @@ func TestReserveExistingRetiresOncePowered(t *testing.T) {
 	settle()
 	states, err := a.Snapshot(ctx)
 	require.NoError(t, err)
-	require.Equal(t, uint64(16*gib), states["pve1"].AvailableBytes,
-		"once powered the free reading carries the VM; the reservation retires")
+	require.Equal(t, uint64(8*gib), states["pve1"].AvailableBytes,
+		"a powered guest stays reserved during the settling interval")
+}
+
+func TestHostModePoweredGuestWithLaggingFreeMemory(t *testing.T) {
+	rs := newResourceServer(t, []map[string]any{nodeRow("pve1", 16*gib, 16)})
+	rs.setNodeStatus("pve1", 16*gib, 16*gib)
+	a := newAccountant(t, rs, func(o *Options) {
+		o.MemoryMode = MemoryModeHostAvailable
+		o.ReserveBytes = 0
+	})
+	ctx := context.Background()
+	r, ok, err := a.Reserve(ctx, "pve1", Shape{MemoryBytes: 16 * gib})
+	require.NoError(t, err)
+	require.True(t, ok)
+	r.Bind(10001)
+	rs.setRows([]map[string]any{nodeRow("pve1", 16*gib, 16), guestRow(10001, "pve1", 16*gib, 2)})
+	settle()
+	_, ok, err = a.Reserve(ctx, "pve1", Shape{MemoryBytes: gib})
+	require.NoError(t, err)
+	require.False(t, ok, "power-on alone must not release the memory claim")
 }
 
 // TestReserveExistingAllocatedModeChargesOnce: allocated mode already
@@ -1426,4 +1450,18 @@ func TestHostModeCachedRunningObservationDoesNotEraseNewReservation(t *testing.T
 		require.NoError(t, err)
 		require.False(t, ok, "cached running observation must not erase post-snapshot claim")
 	}
+}
+
+func TestHostMemoryAdmissionWaitsForLeaderRecovery(t *testing.T) {
+	rs := newResourceServer(t, []map[string]any{nodeRow("pve1", 16*gib, 16)})
+	rs.setNodeStatus("pve1", 16*gib, 16*gib)
+	a := newAccountant(t, rs, func(o *Options) { o.MemoryMode = MemoryModeHostAvailable; o.ReserveBytes = 0 })
+	a.BeginRecovery(time.Hour)
+	_, ok, err := a.Reserve(context.Background(), "pve1", Shape{MemoryBytes: gib})
+	require.NoError(t, err)
+	require.False(t, ok)
+	a.BeginRecovery(0)
+	_, ok, err = a.Reserve(context.Background(), "pve1", Shape{MemoryBytes: gib})
+	require.NoError(t, err)
+	require.True(t, ok)
 }
