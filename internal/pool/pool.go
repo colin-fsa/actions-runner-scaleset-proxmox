@@ -121,9 +121,10 @@ type RowSnapshot struct {
 // appears in synthesised "unknown" entries; production callers receive
 // the GitHub-assigned positive int64.
 type RunnerInfo struct {
-	ID     int64
-	Online bool
-	Busy   bool
+	ID      int64
+	Online  bool
+	Busy    bool
+	Unknown bool
 }
 
 // JobMetadata is the per-job context stamped onto a VM row by

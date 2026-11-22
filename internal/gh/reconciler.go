@@ -136,7 +136,17 @@ type Reconciler struct {
 	// reappears in the store rows snapshot.
 	orphanProxmoxFirstSeen map[int]time.Time
 
+	// Offline observations are deliberately process-local: after a restart a
+	// runner must complete a new grace period before it can be reaped.
+	offlineSince map[string]offlineObservation
+
 	now func() time.Time // injected for tests
+}
+
+type offlineObservation struct {
+	runnerID int64
+	created  time.Time
+	since    time.Time
 }
 
 // New builds a Reconciler. The github.Client must already be authenticated
@@ -169,6 +179,7 @@ func New(cfg Config, gh *github.Client, p pool.Manager, prov provisioner.Provisi
 		metrics:                metrics,
 		orphanFirstSeen:        make(map[string]time.Time),
 		orphanProxmoxFirstSeen: make(map[int]time.Time),
+		offlineSince:           make(map[string]offlineObservation),
 		now:                    time.Now,
 	}, nil
 }
@@ -234,6 +245,7 @@ func (r *Reconciler) Tick(ctx context.Context) error {
 
 	runners, truncated, err := r.listOurRunners(ctx)
 	if err != nil {
+		clear(r.offlineSince)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "list runners failed")
 		return fmt.Errorf("list runners: %w", err)
@@ -241,6 +253,7 @@ func (r *Reconciler) Tick(ctx context.Context) error {
 
 	rows, err := r.pool.ListRows(ctx)
 	if err != nil {
+		clear(r.offlineSince)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "list rows failed")
 		return fmt.Errorf("list rows: %w", err)
@@ -328,9 +341,10 @@ func listRunnersByPrefix(ctx context.Context, gh *github.Client, scope githubaut
 				continue
 			}
 			out[name] = pool.RunnerInfo{
-				ID:     gr.GetID(),
-				Online: gr.GetStatus() == "online",
-				Busy:   gr.GetBusy(),
+				ID:      gr.GetID(),
+				Online:  gr.GetStatus() == "online",
+				Busy:    gr.GetBusy(),
+				Unknown: gr.GetStatus() != "online" && gr.GetStatus() != "offline",
 			}
 		}
 		if resp == nil || resp.NextPage == 0 {
@@ -513,9 +527,7 @@ var stateTransitionTable = map[transitionKey]transitionAction{
 		grace:      func(c Config) time.Duration { return c.AssignedGrace },
 	},
 	{dbState: "assigned", ghLabel: "missing"}: {
-		op:         opDestroy,
-		destroyMsg: "assigned: runner never registered on GitHub",
-		grace:      func(c Config) time.Duration { return c.AssignedGrace },
+		op: opNoop,
 	},
 
 	// running: a job is in flight.
@@ -537,8 +549,7 @@ var stateTransitionTable = map[transitionKey]transitionAction{
 		grace: func(c Config) time.Duration { return c.RunningIdleGrace },
 	},
 	{dbState: "running", ghLabel: "missing"}: {
-		op:         opDestroy,
-		destroyMsg: "running: runner missing from GitHub",
+		op: opNoop,
 	},
 
 	// recycling: post-job snapshot rollback in flight (recycle_mode:
@@ -571,12 +582,43 @@ var stateTransitionTable = map[transitionKey]transitionAction{
 // table is the documentation for the reconciler's behaviour.
 func (r *Reconciler) applyMatrix(ctx context.Context, rows []pool.RowSnapshot, runners map[string]pool.RunnerInfo) {
 	now := r.now()
+	seen := make(map[string]bool, len(rows))
 	for _, row := range rows {
 		gr, present := runners[row.Name]
 		if present && gr.Online {
 			r.metrics.RunnerObservedOnline(r.cfg.ScaleSetName, row.Name)
 		}
 		ghLabel := ghStateLabel(gr, present)
+		if (row.State == "assigned" || row.State == "running") && ghLabel == "offline" {
+			seen[row.Name] = true
+			first, ok := r.offlineSince[row.Name]
+			if !ok || first.runnerID != gr.ID || !first.created.Equal(row.CreatedAt) {
+				r.offlineSince[row.Name] = offlineObservation{runnerID: gr.ID, created: row.CreatedAt, since: now}
+				continue
+			}
+			grace := r.cfg.AssignedOfflineGrace
+			if row.State == "running" {
+				grace = r.cfg.RunningIdleGrace
+			}
+			if now.Sub(first.since) < grace {
+				continue
+			}
+			if !r.confirmOffline(ctx, row, gr.ID) {
+				delete(r.offlineSince, row.Name)
+				continue
+			}
+			reason := row.State + ": runner went offline"
+			if guarded, ok := r.pool.(interface {
+				ForceDestroyUnchanged(context.Context, pool.RowSnapshot, string) error
+			}); ok {
+				if err := guarded.ForceDestroyUnchanged(ctx, row, reason); err != nil {
+					r.log.Warn("reconcile: guarded destroy failed", "vmid", row.VMID, "err", err)
+				}
+			} else {
+				r.forceDestroy(ctx, row.VMID, reason, row.State, ghLabel)
+			}
+			continue
+		}
 		age := now.Sub(row.StateSince)
 
 		action, ok := stateTransitionTable[transitionKey{dbState: row.State, ghLabel: ghLabel}]
@@ -601,6 +643,35 @@ func (r *Reconciler) applyMatrix(ctx context.Context, rows []pool.RowSnapshot, r
 			r.forceDestroy(ctx, row.VMID, action.destroyMsg, row.State, ghLabel)
 		}
 	}
+	for name := range r.offlineSince {
+		if !seen[name] {
+			delete(r.offlineSince, name)
+		}
+	}
+}
+
+// confirmOffline requires a fresh successful listing and an unchanged pool
+// row immediately before requesting cleanup. Unknown or missing data defers.
+func (r *Reconciler) confirmOffline(ctx context.Context, row pool.RowSnapshot, id int64) bool {
+	runners, truncated, err := r.listOurRunners(ctx)
+	if err != nil || truncated {
+		return false
+	}
+	gr, ok := runners[row.Name]
+	if !ok || gr.ID != id || gr.Online || gr.Unknown {
+		return false
+	}
+	rows, err := r.pool.ListRows(ctx)
+	if err != nil {
+		return false
+	}
+	for _, current := range rows {
+		if current.VMID == row.VMID && current.Name == row.Name && current.State == row.State &&
+			current.RunnerID == row.RunnerID && current.JobID == row.JobID && current.CreatedAt.Equal(row.CreatedAt) && current.StateSince.Equal(row.StateSince) {
+			return true
+		}
+	}
+	return false
 }
 
 // promoteToRunning is the shared error-handling wrapper for
@@ -802,7 +873,7 @@ func (r *Reconciler) recordMismatch(dbState, ghState, action string) {
 // ghStateLabel collapses the (present, online, busy) tuple into a single
 // low-cardinality label suitable for Prometheus.
 func ghStateLabel(gr pool.RunnerInfo, present bool) string {
-	if !present {
+	if !present || gr.Unknown {
 		return "missing"
 	}
 	if !gr.Online {

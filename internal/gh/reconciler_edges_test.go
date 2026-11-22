@@ -216,7 +216,9 @@ func TestReconcile_FastOnlineBusyOfflineTransitions(t *testing.T) {
 
 	// Tick 4: backdate the row past RunningIdleGrace → the offline
 	// runner is now a genuine failure → destroy.
-	mgr.rows[0].StateSince = time.Now().Add(-2 * cfg.RunningIdleGrace)
+	first := rec.offlineSince[mgr.rows[0].Name]
+	first.since = first.since.Add(-2 * cfg.RunningIdleGrace)
+	rec.offlineSince[mgr.rows[0].Name] = first
 	require.NoError(t, rec.Tick(context.Background()))
 	require.Len(t, mgr.destroyCalls, 1,
 		"running+offline past RunningIdleGrace must reach the destroy path")

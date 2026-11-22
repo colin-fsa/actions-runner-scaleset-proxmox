@@ -950,6 +950,33 @@ func (m *manager) ForceDestroy(_ context.Context, vmid int, reason string) error
 	return nil
 }
 
+// ForceDestroyUnchanged only reaps the exact row checked by the reconciler.
+// The check and transition run inside the store's write transaction, so a
+// concurrent completion, reassignment, or VMID reuse wins safely.
+func (m *manager) ForceDestroyUnchanged(_ context.Context, expected RowSnapshot, reason string) error {
+	matched := false
+	row, err := m.store.Update(expected.VMID, func(v *store.VM) {
+		if v.Name != expected.Name || string(v.State) != expected.State || v.JobID != expected.JobID ||
+			v.RunnerID != expected.RunnerID || !v.CreatedAt.Equal(expected.CreatedAt) || !v.StateSince.Equal(expected.StateSince) {
+			return
+		}
+		matched = true
+		v.State = store.StateDraining
+		v.StateSince = time.Now()
+	})
+	if errors.Is(err, store.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if matched {
+		m.log.Warn("force destroy", "vmid", row.VMID, "reason", reason)
+		m.destroyAsync(row.VMID, row.Node, row.Profile)
+	}
+	return nil
+}
+
 // Preempt destroys an Assigned-but-not-yet-Running VM to free
 // capacity for a higher-priority job (issue #10). Refuses any row
 // not in Assigned — never preempts Running (interrupting an
