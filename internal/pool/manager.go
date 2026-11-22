@@ -771,7 +771,7 @@ func (m *manager) Acquire(ctx context.Context, jobID int64, maxBusy int) (*VM, e
 		attribute.String("vm.node", row.Node),
 	)
 	m.SignalRefill()
-	return &VM{VMID: row.VMID, Node: row.Node, Name: row.Name, Profile: row.Profile}, nil
+	return &VM{VMID: row.VMID, Node: row.Node, Name: row.Name, Profile: row.Profile, CreatedAt: row.CreatedAt, AssignedAt: row.StateSince}, nil
 }
 
 // AcquireForProfile is the profile-aware variant of Acquire. An
@@ -817,7 +817,7 @@ func (m *manager) AcquireForProfile(ctx context.Context, jobID int64, profile st
 		attribute.String("vm.node", row.Node),
 	)
 	m.signalProfileRefill(resolved)
-	return &VM{VMID: row.VMID, Node: row.Node, Name: row.Name, Profile: resolved}, nil
+	return &VM{VMID: row.VMID, Node: row.Node, Name: row.Name, Profile: resolved, CreatedAt: row.CreatedAt, AssignedAt: row.StateSince}, nil
 }
 
 // SetRunnerID stamps RunnerID on the row without changing state. Used by
@@ -957,7 +957,7 @@ func (m *manager) ForceDestroyUnchanged(_ context.Context, expected RowSnapshot,
 	matched := false
 	row, err := m.store.Update(expected.VMID, func(v *store.VM) {
 		if v.Name != expected.Name || string(v.State) != expected.State || v.JobID != expected.JobID ||
-			v.RunnerID != expected.RunnerID || !v.CreatedAt.Equal(expected.CreatedAt) || !v.StateSince.Equal(expected.StateSince) {
+			v.RunnerID != expected.RunnerID || v.JITPending || !v.CreatedAt.Equal(expected.CreatedAt) || !v.StateSince.Equal(expected.StateSince) {
 			return
 		}
 		matched = true
@@ -1064,9 +1064,23 @@ func (m *manager) ListRows(_ context.Context) ([]RowSnapshot, error) {
 			RecycleCount: r.RecycleCount,
 			StateSince:   r.StateSince,
 			CreatedAt:    r.CreatedAt,
+			JITPending:   r.JITPending,
 		})
 	}
 	return out, nil
+}
+
+// FinishJITDelivery ends the protected acquisition phase, whether injection
+// succeeded or failed. Missing rows have already been cleaned up.
+func (m *manager) FinishJITDelivery(vmid int, createdAt, assignedAt time.Time) {
+	_, err := m.store.Update(vmid, func(v *store.VM) {
+		if v.CreatedAt.Equal(createdAt) && v.JITAssignedAt.Equal(assignedAt) {
+			v.JITPending = false
+		}
+	})
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		m.log.Warn("finish jit delivery failed", "vmid", vmid, "err", err)
+	}
 }
 
 // MarkCompleted transitions a busy VM (Assigned or Running) → Draining
@@ -1574,6 +1588,9 @@ func (m *manager) powerPollOnce(ctx context.Context) {
 	suppressed := 0
 	for _, row := range rows {
 		seen[row.VMID] = struct{}{}
+		if row.JITPending {
+			continue
+		}
 		vmCtx, cancel := context.WithTimeout(ctx, powerPollTimeoutPerVM)
 		state, err := m.prov.PowerState(vmCtx, &provisioner.VM{
 			VMID: row.VMID, Node: row.Node, Name: row.Name, Profile: row.Profile,

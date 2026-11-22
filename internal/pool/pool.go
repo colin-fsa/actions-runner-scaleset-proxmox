@@ -92,10 +92,12 @@ func (s Stats) LiveWarm() int { return s.Warm }
 // VM is the pool's external view of a managed VM. It is intentionally
 // thin; the full state row lives in the ent store.
 type VM struct {
-	VMID    int
-	Node    string
-	Name    string
-	Profile string
+	VMID       int
+	Node       string
+	Name       string
+	Profile    string
+	CreatedAt  time.Time
+	AssignedAt time.Time
 }
 
 // RowSnapshot is the reconciler's view of a single VM row. It excludes
@@ -114,6 +116,7 @@ type RowSnapshot struct {
 	RecycleCount int
 	StateSince   time.Time
 	CreatedAt    time.Time
+	JITPending   bool
 }
 
 // RunnerInfo is the subset of GitHub's per-runner state that the

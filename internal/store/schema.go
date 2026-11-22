@@ -108,6 +108,8 @@ type VM struct {
 	// so the reconciler must NOT credit it as "returning to the pool"
 	// when sizing replacement clones. Always false in destroy mode.
 	HasRecycleSnapshot bool
+	JITPending         bool
+	JITAssignedAt      time.Time
 	CreatedAt          time.Time
 	UpdatedAt          time.Time
 	StateSince         time.Time

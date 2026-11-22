@@ -43,3 +43,23 @@ func TestOfflineGraceRecoveryAndRestart(t *testing.T) {
 	require.NoError(t, r.Tick(context.Background()))
 	require.Len(t, mgr.destroyCalls, 1)
 }
+
+func TestPendingJITCannotBeReaped(t *testing.T) {
+	srv := runnersServer(t, []fakeRunner{{id: 42, name: "gh-runner-test-42", status: "offline"}})
+	defer srv.Close()
+	now := time.Now()
+	mgr := &fakeManager{rows: []pool.RowSnapshot{{VMID: 42, Name: "gh-runner-test-42", State: "assigned", StateSince: now.Add(-time.Hour), JITPending: true}}}
+	r, err := New(baseCfg(), newTestClient(t, srv), mgr, &stubProv{}, silentLogger(), nil)
+	require.NoError(t, err)
+	r.now = func() time.Time { return now }
+	require.NoError(t, r.Tick(context.Background()))
+	now = now.Add(time.Hour)
+	require.NoError(t, r.Tick(context.Background()))
+	require.Empty(t, mgr.destroyCalls)
+	mgr.rows[0].JITPending = false
+	require.NoError(t, r.Tick(context.Background()))
+	require.Empty(t, mgr.destroyCalls)
+	now = now.Add(r.cfg.AssignedOfflineGrace + time.Second)
+	require.NoError(t, r.Tick(context.Background()))
+	require.Len(t, mgr.destroyCalls, 1)
+}

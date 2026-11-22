@@ -581,6 +581,8 @@ func (s *Store) AcquireHotInProfile(profile string, jobID int64, maxConcurrent, 
 	now := time.Now()
 	cp := oldest.Clone()
 	cp.State = StateAssigned
+	cp.JITPending = true
+	cp.JITAssignedAt = now
 	cp.JobID = jobID
 	cp.StateSince = now
 	cp.UpdatedAt = now

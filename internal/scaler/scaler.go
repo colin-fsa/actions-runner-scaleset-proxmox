@@ -506,6 +506,11 @@ func (s *Scaler) provisionAcquired(ctx context.Context, vms []*pool.VM) int {
 // inject for a single acquired VM. Returns true iff the VM was
 // successfully delivered to GitHub.
 func (s *Scaler) provisionOne(ctx context.Context, vmObj *pool.VM) bool {
+	if pending, ok := s.pool.(interface {
+		FinishJITDelivery(int, time.Time, time.Time)
+	}); ok {
+		defer pending.FinishJITDelivery(vmObj.VMID, vmObj.CreatedAt, vmObj.AssignedAt)
+	}
 	// Idempotent self-heal: if a runner with this name already exists
 	// on GitHub (from a previous attempt that failed mid-flight),
 	// deregister it before asking for a fresh JIT config. Without this,

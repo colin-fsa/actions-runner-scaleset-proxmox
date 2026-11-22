@@ -585,6 +585,9 @@ func (r *Reconciler) applyMatrix(ctx context.Context, rows []pool.RowSnapshot, r
 	now := r.now()
 	seen := make(map[string]bool, len(rows))
 	for _, row := range rows {
+		if row.JITPending {
+			continue
+		}
 		gr, present := runners[row.Name]
 		if present && gr.Online {
 			r.metrics.RunnerObservedOnline(r.cfg.ScaleSetName, row.Name)
@@ -677,7 +680,7 @@ func (r *Reconciler) confirmRunnerState(ctx context.Context, row pool.RowSnapsho
 		return false
 	}
 	for _, current := range rows {
-		if current.VMID == row.VMID && current.Name == row.Name && current.State == row.State &&
+		if !current.JITPending && current.VMID == row.VMID && current.Name == row.Name && current.State == row.State &&
 			current.RunnerID == row.RunnerID && current.JobID == row.JobID && current.CreatedAt.Equal(row.CreatedAt) && current.StateSince.Equal(row.StateSince) {
 			return true
 		}
