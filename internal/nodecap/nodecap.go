@@ -195,6 +195,9 @@ type Options struct {
 	// without retiring. It is a leak guard for a clone that hangs or
 	// dies past the pool's panic recovery, not a normal expiry path.
 	ReservationTTL time.Duration
+	// RecoveryDelay pauses host-memory admission after controller startup,
+	// allowing starts submitted by the previous process to settle.
+	RecoveryDelay time.Duration
 
 	// OwnedVMIDs are the VMID spans this orchestrator allocates clones
 	// from — every scale set's range — and OwnerScaleSets are the scale
@@ -333,7 +336,8 @@ type Accountant struct {
 	// now is the clock used for reservation expiry and snapshot
 	// staleness. Indirect so a test can age a snapshot without sleeping;
 	// New pins it to time.Now.
-	now func() time.Time
+	now           func() time.Time
+	recoveryUntil time.Time
 }
 
 // snapshot is one immutable read of /cluster/resources.
@@ -389,18 +393,43 @@ type reservation struct {
 	// snapshot already reflects the freed memory and crediting again
 	// would double-count).
 	freeing  []int
+	created  time.Time
 	expires  time.Time
 	released bool
 	acct     *Accountant
 	// poweredOff marks a reservation for a VM that stays powered off;
 	// it retires on observation alone (see ExpectPoweredOff).
 	poweredOff bool
+	started    bool
 }
 
 func (r *reservation) Bind(vmid int) {
 	r.acct.mu.Lock()
 	defer r.acct.mu.Unlock()
 	r.vmid = vmid
+}
+
+// BeginStart extends a live claim before issuing a start. A claim that has
+// expired cannot be used to start a guest without re-admission.
+func (r *reservation) BeginStart() bool {
+	r.acct.mu.Lock()
+	defer r.acct.mu.Unlock()
+	if !r.acct.isHostMode() {
+		return true
+	}
+	if r.released || time.Now().After(r.expires) {
+		return false
+	}
+	r.expires = time.Now().Add(r.acct.opts.ReservationTTL)
+	r.started = true
+	return true
+}
+
+// BeginRecovery pauses host-available admission at leader transitions.
+func (a *Accountant) BeginRecovery(delay time.Duration) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.recoveryUntil = time.Now().Add(delay)
 }
 
 func (r *reservation) Release() {
@@ -434,10 +463,11 @@ func New(cli *proxmox.Client, opts Options) (*Accountant, error) {
 		opts.Log = slog.Default()
 	}
 	return &Accountant{
-		cli:  cli,
-		opts: opts,
-		log:  opts.Log,
-		now:  time.Now,
+		cli:           cli,
+		opts:          opts,
+		log:           opts.Log,
+		now:           time.Now,
+		recoveryUntil: time.Now().Add(opts.RecoveryDelay),
 		cache: ttlcache.New[string, *snapshot](
 			ttlcache.WithTTL[string, *snapshot](opts.Refresh),
 			ttlcache.WithDisableTouchOnHit[string, *snapshot](),
@@ -517,6 +547,7 @@ func (a *Accountant) ReserveFreeing(ctx context.Context, node string, shape Shap
 		node:    node,
 		shape:   shape,
 		freeing: append([]int(nil), freeing...),
+		created: time.Now(),
 		expires: time.Now().Add(a.opts.ReservationTTL),
 		acct:    a,
 	}
@@ -528,10 +559,8 @@ func (a *Accountant) ReserveFreeing(ctx context.Context, node string, shape Shap
 // that is about to be started — the pool's warm-to-hot promotion. It is
 // the same atomic gate as Reserve, so concurrent promotions and clones
 // (from every profile and scale set sharing this accountant) cannot claim
-// the same in-flight capacity twice. That is a property of the
-// reservation ledger only: memory a running guest has yet to grow into
-// is not reserved (in host_available mode a claim retires once the guest
-// is observed powered on).
+// the same in-flight capacity twice. In host_available mode a start
+// retains its claim throughout the bounded settling period.
 //
 // The reservation is bound to vmid from the start, and the fit check
 // credits whatever that VM already contributes to the ledger, so a
@@ -563,6 +592,7 @@ func (a *Accountant) ReserveExisting(ctx context.Context, node string, shape Sha
 		node:    node,
 		shape:   shape,
 		vmid:    vmid,
+		created: time.Now(),
 		expires: time.Now().Add(a.opts.ReservationTTL),
 		acct:    a,
 	}
@@ -625,6 +655,9 @@ func (a *Accountant) fitsLocked(snap *snapshot, node string, shape Shape, extraF
 // knows are already charged to the ledger on its behalf. Caller must hold
 // a.mu and must have checked node is in snap.
 func (a *Accountant) fitsWithCreditLocked(snap *snapshot, node string, shape Shape, memCredit uint64, vcpuCredit int) bool {
+	if a.isHostMode() && time.Now().Before(a.recoveryUntil) {
+		return false
+	}
 	totals := snap.nodes[node]
 	st := a.stateLocked(snap, node)
 	avail := st.AvailableBytes + memCredit
@@ -668,7 +701,7 @@ func (a *Accountant) stateLocked(snap *snapshot, node string) NodeState {
 			continue
 		}
 		observedVCPU := 0
-		if r.vmid != 0 && (!a.cpuUsageMode() || snap.guestPowered[r.vmid]) {
+		if r.vmid != 0 && (!a.cpuUsageMode() || (snap.takenAt.After(r.created) && snap.guestPowered[r.vmid])) {
 			observedVCPU = snap.guestVCPU[r.vmid]
 		}
 		if launch := a.launchVCPUs(r.shape); launch > observedVCPU {
@@ -775,11 +808,11 @@ func (a *Accountant) holdsAndCreditsLocked(snap *snapshot, node string) (holds, 
 		observed := uint64(0)
 		if r.vmid != 0 {
 			observed = snap.guestMem[r.vmid]
-			if a.isHostMode() && !snap.guestPowered[r.vmid] {
+			if a.isHostMode() && !r.poweredOff {
 				// A powered-off guest's configured RAM is not in the node's
 				// live available-memory reading, so treat the reservation as fully
-				// withheld until its guest powers on and the fresh reading
-				// absorbs it.
+				// withheld during the bounded settling interval; the power
+				// state and configured RAM are not usage observations.
 				observed = 0
 			}
 		}
@@ -919,29 +952,37 @@ func (a *Accountant) reserveFor(total uint64) uint64 {
 // expired ones. Caller must hold a.mu.
 //
 // A reservation retires once its VM is observed at (or above) its full
-// configured size — at that point the guest row carries the allocation
-// and keeping the reservation would double-count it. In host_available
-// mode it also has to be powered on first, because the guest's RAM only
-// reaches the node's live available-memory reading when it is running. Expiry is
-// the leak guard for clones that never got that far.
+// configured size in allocated mode. In host_available mode a powered
+// guest remains reserved for a bounded settling period because the power
+// flag does not show whether host memory usage has caught up. Expiry is
+// also the leak guard for clones that never got that far.
 func (a *Accountant) sweepLocked(snap *snapshot) {
 	now := time.Now()
 	for id, r := range a.res {
 		if now.After(r.expires) {
-			a.log.Warn("nodecap: reservation expired without retiring; releasing",
-				"node", r.node, "vmid", r.vmid, "memory_bytes", r.shape.MemoryBytes)
+			if a.isHostMode() && r.started {
+				a.log.Debug("nodecap: start reservation settled", "node", r.node, "vmid", r.vmid)
+			} else {
+				a.log.Warn("nodecap: reservation expired without retiring; releasing",
+					"node", r.node, "vmid", r.vmid, "memory_bytes", r.shape.MemoryBytes)
+			}
 			r.released = true
 			delete(a.res, id)
 			continue
 		}
 		retired := r.vmid != 0 && snap.guestMem[r.vmid] >= r.shape.MemoryBytes
+		if a.isHostMode() && !r.poweredOff {
+			// Power-on is not evidence that host RAM has settled. Expiry
+			// above is the bounded settling policy for these reservations.
+			retired = false
+		}
 		if (a.isHostMode() || a.cpuUsageMode()) && !r.poweredOff {
 			// In host mode the node's live available-memory reading absorbs a
 			// reservation's RAM only once its guest is actually powered on.
 			// A powered-off guest's configured RAM never reached that reading,
 			// so retiring now would stop withholding RAM the host is not yet
 			// spending.
-			retired = retired && snap.guestPowered[r.vmid]
+			retired = retired && snap.takenAt.After(r.created) && snap.guestPowered[r.vmid]
 		}
 		if retired {
 			r.released = true

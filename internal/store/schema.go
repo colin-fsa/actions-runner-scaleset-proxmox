@@ -108,9 +108,18 @@ type VM struct {
 	// so the reconciler must NOT credit it as "returning to the pool"
 	// when sizing replacement clones. Always false in destroy mode.
 	HasRecycleSnapshot bool
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
-	StateSince         time.Time
+	JITPending         bool
+	JITAssignedAt      time.Time
+	// AdoptionProtected prevents cleanup or reuse while restart observations
+	// cannot establish that an inherited guest's job is no longer busy.
+	AdoptionProtected bool
+	// StartWorkerDeadline is set atomically with Provisioning/Booting while
+	// the local clone or boot worker owns the row. The in-memory store is
+	// rebuilt on restart; a zero value denotes no tracked worker.
+	StartWorkerDeadline time.Time
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
+	StateSince          time.Time
 }
 
 // Clone returns a deep copy. memdb stores by pointer; mutating a row read

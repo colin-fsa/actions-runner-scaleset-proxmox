@@ -176,14 +176,31 @@ func Run(ctx context.Context, opts Options) error {
 	}
 
 	deps := runOneScalesetDeps{
-		cfg:      cfg,
-		auth:     auth,
-		sel:      sel,
-		capacity: capacity,
-		metrics:  metrics,
-		health:   health,
-		log:      log,
-		sysInfo:  sysInfo,
+		cfg:               cfg,
+		auth:              auth,
+		sel:               sel,
+		capacity:          capacity,
+		windowsBootBudget: pool.NewHostBootBudget(max(cfg.Pool.BootsPerNode, cfg.Pool.WindowsBootsPerNode), cfg.Pool.BootStartInterval.D(), 0),
+		metrics:           metrics,
+		health:            health,
+		log:               log,
+		sysInfo:           sysInfo,
+	}
+	for _, state := range scStates {
+		if setter, ok := state.prov.(interface {
+			SetStartGate(interface {
+				AcquireStart(context.Context, string) (func(), error)
+			})
+		}); ok {
+			setter.SetStartGate(deps.windowsBootBudget)
+		}
+		if setter, ok := state.prov.(interface {
+			SetStartCapacity(interface {
+				ReserveExisting(context.Context, string, nodecap.Shape, int) (nodecap.Reservation, bool, error)
+			})
+		}); ok && capacity != nil {
+			setter.SetStartCapacity(capacity)
+		}
 	}
 
 	// runLeaderPlane fans the per-scaleset workers out under one
@@ -193,6 +210,13 @@ func Run(ctx context.Context, opts Options) error {
 	// other scale sets keep running. Sibling shutdown still
 	// happens via ctx cancel on process-wide SIGTERM / drain.
 	runLeaderPlane := func(leaderCtx context.Context) error {
+		// An old leader can have Proxmox tasks in flight after it exits.
+		// Wait through their bounded start and memory-settling window.
+		recovery := max(15*time.Minute, cfg.Pool.CloneInflightGrace.D())
+		deps.windowsBootBudget.BeginRecovery(recovery)
+		if acct, ok := deps.capacity.(interface{ BeginRecovery(time.Duration) }); ok {
+			acct.BeginRecovery(recovery)
+		}
 		g, ctxg := errgroup.WithContext(leaderCtx)
 		for i := range cfg.Scalesets {
 			entry := cfg.Scalesets[i]
@@ -572,7 +596,7 @@ func buildCapacityAccountant(cfg *config.Config, prov provisioner.Provisioner, l
 		// assume a clone that never came back is gone"; a reservation
 		// outliving its clone is the same question, so it reuses the
 		// same knob rather than adding a near-duplicate one.
-		ReservationTTL: cfg.Pool.CloneInflightGrace.D(),
+		ReservationTTL: max(15*time.Minute, cfg.Pool.CloneInflightGrace.D()),
 		// How the accountant recognises our own guests, which count even
 		// when powered off — the warm tier is stopped by design — while
 		// foreign guests count only while they actually hold memory.
@@ -685,11 +709,12 @@ type runOneScalesetDeps struct {
 	// resource-aware admission is disabled. Shared rather than
 	// per-scaleset so sibling scale sets cannot each admit a clone
 	// against the same free memory.
-	capacity pool.CapacityAdmitter
-	metrics  *observability.Metrics
-	health   *observability.Health
-	log      *slog.Logger
-	sysInfo  scaleset.SystemInfo
+	capacity          pool.CapacityAdmitter
+	windowsBootBudget *pool.WindowsBootBudget
+	metrics           *observability.Metrics
+	health            *observability.Health
+	log               *slog.Logger
+	sysInfo           scaleset.SystemInfo
 }
 
 // runOneScaleset drives one scale set's GH listener, REST
@@ -761,6 +786,7 @@ func runOneScaleset(leaderCtx context.Context, deps runOneScalesetDeps, entry co
 		OnRunnerOrphaned:     ghClient.RemoveRunner,
 		RunnerLister:         gh.NewRunnerLister(restCli, scope, state.vmPrefix, log),
 		Capacity:             deps.capacity,
+		WindowsBootBudget:    deps.windowsBootBudget,
 		EvictIdleForDemand:   cfg.Pool.Capacity.EvictIdleForDemand,
 		// The same universe handed to the nodeselector wrappers, so the
 		// pool's placement probes ask about exactly the nodes the
@@ -781,7 +807,9 @@ func runOneScaleset(leaderCtx context.Context, deps runOneScalesetDeps, entry co
 	}()
 
 	if err := mgr.Adopt(leaderCtx); err != nil {
-		log.Warn("adopt: list-owned-vms failed; starting with empty pool", "scaleset", entry.Name, "err", err)
+		// An empty store after failed discovery makes live guests look like
+		// orphans. Let the supervisor retry adoption before any sweeper runs.
+		return fmt.Errorf("adopt inherited guests: %w", err)
 	}
 	health.MarkScalesetRecoveryDone(entry.Name)
 	health.MarkProxmoxOK()

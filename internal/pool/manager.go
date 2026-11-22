@@ -175,6 +175,8 @@ type Config struct {
 	// Independent of MaxConcurrentRunners rather than a replacement for
 	// it: when both are configured, both must admit the clone, so the
 	// stricter one binds.
+	WindowsBootBudget *WindowsBootBudget
+
 	Capacity CapacityAdmitter
 
 	// EvictIdleForDemand lets a queued job reclaim capacity from an idle
@@ -377,6 +379,8 @@ type manager struct {
 	// the real signal). Only the power-poll goroutine touches this
 	// map, so no synchronisation is needed.
 	powerPollErrLastLog map[int]time.Time
+	// Only the power-poll goroutine touches this throttle.
+	adoptionNextCheck time.Time
 }
 
 // normaliseProfiles returns the profile slice the manager will
@@ -769,7 +773,7 @@ func (m *manager) Acquire(ctx context.Context, jobID int64, maxBusy int) (*VM, e
 		attribute.String("vm.node", row.Node),
 	)
 	m.SignalRefill()
-	return &VM{VMID: row.VMID, Node: row.Node, Name: row.Name, Profile: row.Profile}, nil
+	return &VM{VMID: row.VMID, Node: row.Node, Name: row.Name, Profile: row.Profile, CreatedAt: row.CreatedAt, AssignedAt: row.StateSince}, nil
 }
 
 // AcquireForProfile is the profile-aware variant of Acquire. An
@@ -815,7 +819,7 @@ func (m *manager) AcquireForProfile(ctx context.Context, jobID int64, profile st
 		attribute.String("vm.node", row.Node),
 	)
 	m.signalProfileRefill(resolved)
-	return &VM{VMID: row.VMID, Node: row.Node, Name: row.Name, Profile: resolved}, nil
+	return &VM{VMID: row.VMID, Node: row.Node, Name: row.Name, Profile: resolved, CreatedAt: row.CreatedAt, AssignedAt: row.StateSince}, nil
 }
 
 // SetRunnerID stamps RunnerID on the row without changing state. Used by
@@ -948,6 +952,33 @@ func (m *manager) ForceDestroy(_ context.Context, vmid int, reason string) error
 	return nil
 }
 
+// ForceDestroyUnchanged only reaps the exact row checked by the reconciler.
+// The check and transition run inside the store's write transaction, so a
+// concurrent completion, reassignment, or VMID reuse wins safely.
+func (m *manager) ForceDestroyUnchanged(_ context.Context, expected RowSnapshot, reason string) error {
+	matched := false
+	row, err := m.store.Update(expected.VMID, func(v *store.VM) {
+		if v.Name != expected.Name || string(v.State) != expected.State || v.JobID != expected.JobID ||
+			v.RunnerID != expected.RunnerID || v.JITPending || v.AdoptionProtected || !v.CreatedAt.Equal(expected.CreatedAt) || !v.StateSince.Equal(expected.StateSince) {
+			return
+		}
+		matched = true
+		v.State = store.StateDraining
+		v.StateSince = time.Now()
+	})
+	if errors.Is(err, store.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if matched {
+		m.log.Warn("force destroy", "vmid", row.VMID, "reason", reason)
+		m.destroyAsync(row.VMID, row.Node, row.Profile)
+	}
+	return nil
+}
+
 // Preempt destroys an Assigned-but-not-yet-Running VM to free
 // capacity for a higher-priority job (issue #10). Refuses any row
 // not in Assigned — never preempts Running (interrupting an
@@ -967,10 +998,16 @@ func (m *manager) Preempt(_ context.Context, vmid int, reason string) error {
 		}
 		return fmt.Errorf("preempt: lookup: %w", err)
 	}
+	if target.AdoptionProtected {
+		return fmt.Errorf("%w: vmid %d is protected during ambiguous adoption", ErrPreemptRefused, vmid)
+	}
 	if target.State != store.StateAssigned {
 		return fmt.Errorf("%w: vmid %d is in state %s", ErrPreemptRefused, vmid, target.State)
 	}
-	ok, err := m.store.UpdateState(vmid, store.StateAssigned, store.StateDraining, func(v *store.VM) {
+	ok, err := m.store.UpdateIf(vmid, func(v *store.VM) bool {
+		return v.State == store.StateAssigned && !v.AdoptionProtected && v.CreatedAt.Equal(target.CreatedAt) && v.StateSince.Equal(target.StateSince)
+	}, func(v *store.VM) {
+		v.State = store.StateDraining
 		v.StateSince = time.Now()
 	})
 	if err != nil {
@@ -1025,19 +1062,34 @@ func (m *manager) ListRows(_ context.Context) ([]RowSnapshot, error) {
 	out := make([]RowSnapshot, 0, len(rows))
 	for _, r := range rows {
 		out = append(out, RowSnapshot{
-			VMID:         r.VMID,
-			Node:         r.Node,
-			Name:         r.Name,
-			Profile:      r.Profile,
-			State:        string(r.State),
-			JobID:        r.JobID,
-			RunnerID:     r.RunnerID,
-			RecycleCount: r.RecycleCount,
-			StateSince:   r.StateSince,
-			CreatedAt:    r.CreatedAt,
+			VMID:              r.VMID,
+			Node:              r.Node,
+			Name:              r.Name,
+			Profile:           r.Profile,
+			State:             string(r.State),
+			JobID:             r.JobID,
+			RunnerID:          r.RunnerID,
+			RecycleCount:      r.RecycleCount,
+			StateSince:        r.StateSince,
+			CreatedAt:         r.CreatedAt,
+			JITPending:        r.JITPending,
+			AdoptionProtected: r.AdoptionProtected,
 		})
 	}
 	return out, nil
+}
+
+// FinishJITDelivery ends the protected acquisition phase, whether injection
+// succeeded or failed. Missing rows have already been cleaned up.
+func (m *manager) FinishJITDelivery(vmid int, createdAt, assignedAt time.Time) {
+	_, err := m.store.Update(vmid, func(v *store.VM) {
+		if v.CreatedAt.Equal(createdAt) && v.JITAssignedAt.Equal(assignedAt) {
+			v.JITPending = false
+		}
+	})
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		m.log.Warn("finish jit delivery failed", "vmid", vmid, "err", err)
+	}
 }
 
 // MarkCompleted transitions a busy VM (Assigned or Running) → Draining
@@ -1153,23 +1205,20 @@ func (m *manager) shouldRecycle(row *store.VM) bool {
 // for every owner-tagged VM the previous leader (or this process's
 // prior incarnation) left behind. The classification matrix is:
 //
-//	power=stopped                          → Warm   / PoolKindWarm
+//	power=stopped, runner known nonbusy or absent → Warm / PoolKindWarm
 //	power=running, no GitHub runner        → Hot    / PoolKindHot
 //	power=running, runner busy             → Running  / PoolKindHot (with RunnerID)
 //	power=running, runner online & idle    → Assigned / PoolKindHot (with RunnerID)
 //	power=running, runner offline          → Assigned / PoolKindHot (with RunnerID)
-//	power query failed                     → Hot    / PoolKindHot (safe fallback)
+//	busy or ambiguous power/runner data   → protected Assigned/Running
 //
 // The gh.Reconciler's matrix converges any misclassifications on its
 // next tick (Hot+busy → promote to Running, Assigned/Running grace
 // timers, etc.), so adoption only needs to be approximately right.
 //
-// Best-effort by design: a per-VM PowerState or store.Insert failure
-// is logged and the loop continues. The whole-pass error is returned
-// only when ListOwnedVMs itself fails — Proxmox is unreachable, no
-// classification is possible. The caller (app.runLeaderPlane) logs
-// and continues with an empty pool; the orphan-sweep in gh.Reconciler
-// will reap any stranded VMs once Proxmox recovers.
+// Power-state errors result in protected rows. Discovery or insertion
+// failures abort adoption; the caller retries before starting orphan
+// sweeps, so inherited guests are not mistaken for orphans.
 //
 // JobID is intentionally left 0: we don't know which GitHub job an
 // in-flight runner is executing, and the power-poller / reconciler
@@ -1180,21 +1229,21 @@ func (m *manager) Adopt(ctx context.Context) error {
 		return fmt.Errorf("adopt: list owned vms: %w", err)
 	}
 
-	// Best-effort GitHub runner snapshot. A whole-pass failure here is
-	// non-fatal: power-state-only classification still preserves every
-	// inherited VM; the next gh.Reconciler tick reclassifies Hot rows
-	// whose runners turn out to be busy.
+	// A failed GitHub listing leaves inherited VMs protected until both
+	// power and runner observations establish a safe state.
 	var runners map[string]RunnerInfo
 	if m.cfg.RunnerLister != nil {
 		runners, err = m.cfg.RunnerLister(ctx)
 		if err != nil {
-			m.log.Warn("adopt: github runner list failed; classifying by power-state only", "err", err)
+			m.log.Warn("adopt: github runner list failed; preserving inherited guests", "err", err)
 			runners = nil
 		}
 	}
 
 	for _, pv := range pmoxVMs {
-		m.adoptOne(ctx, pv, runners)
+		if err := m.adoptOne(ctx, pv, runners); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -1239,14 +1288,16 @@ func (m *manager) adoptLXCState(ctx context.Context, pv *provisioner.VM, profile
 // adoptOne classifies a single inherited VM and inserts it into the
 // store. Extracted so the per-VM error paths can `return` cleanly
 // without leaking the loop control structure into the classification.
-func (m *manager) adoptOne(ctx context.Context, pv *provisioner.VM, runners map[string]RunnerInfo) {
-	state, kind, runnerID := m.classifyAdoption(ctx, pv, runners)
+func (m *manager) adoptOne(ctx context.Context, pv *provisioner.VM, runners map[string]RunnerInfo) error {
+	state, kind, runnerID, protected := m.classifyAdoption(ctx, pv, runners)
 	profile := pv.Profile
 	unknownProfile := profile != "" && m.profileOf(profile) == nil
 	if profile == "" || unknownProfile {
 		profile = m.defaultProfile()
 	}
-	if unknownProfile {
+	if protected {
+		m.log.Warn("adopt: preserving inherited guest pending unambiguous job and power state", "vmid", pv.VMID, "node", pv.Node, "runner_id", runnerID, "unknown_profile", unknownProfile)
+	} else if unknownProfile {
 		m.log.Warn("adopt: unknown profile; destroying inherited vm", "vmid", pv.VMID, "profile", pv.Profile)
 		state = store.StateDestroying
 	} else if ps := m.profileOf(profile); ps != nil && ps.settings.GuestType == config.GuestTypeLXC {
@@ -1286,13 +1337,14 @@ func (m *manager) adoptOne(ctx context.Context, pv *provisioner.VM, runners map[
 		}
 	}
 	row := &store.VM{
-		VMID:     pv.VMID,
-		Node:     pv.Node,
-		Name:     pv.Name,
-		Profile:  profile,
-		PoolKind: kind,
-		State:    state,
-		RunnerID: runnerID,
+		VMID:              pv.VMID,
+		Node:              pv.Node,
+		Name:              pv.Name,
+		Profile:           profile,
+		PoolKind:          kind,
+		State:             state,
+		RunnerID:          runnerID,
+		AdoptionProtected: protected,
 		// Optimistic in recycle mode: an inherited VM was cloned by a
 		// recycle-mode leader, so the clone-time snapshot almost
 		// certainly exists — and BEFORE this field existed, adopted
@@ -1305,9 +1357,7 @@ func (m *manager) adoptOne(ctx context.Context, pv *provisioner.VM, runners map[
 		HasRecycleSnapshot: m.snapshotRecycle(),
 	}
 	if err := m.store.Insert(row); err != nil {
-		m.log.Warn("adopt: insert failed; skipping",
-			"vmid", pv.VMID, "node", pv.Node, "state", state, "err", err)
-		return
+		return fmt.Errorf("adopt: insert vm %d on %s: %w", pv.VMID, pv.Node, err)
 	}
 	m.log.Info("adopt: inherited vm",
 		"vmid", pv.VMID, "node", pv.Node, "name", pv.Name, "profile", profile,
@@ -1320,6 +1370,7 @@ func (m *manager) adoptOne(ctx context.Context, pv *provisioner.VM, runners map[
 	} else if state == store.StateDestroying {
 		m.destroyOrSyncFallback(pv.VMID, pv.Node, profile) //nolint:contextcheck // destruction is owned by the manager worker context, surviving the adoption request
 	}
+	return nil
 }
 
 // adoptionKey is the explicit state matrix axis: each cell maps a
@@ -1342,12 +1393,13 @@ type adoptionClass struct {
 	withRunnerID bool
 }
 
-// adoptionMatrix exhaustively enumerates every (powerRunning,
+// adoptionMatrix is consulted only after busy and ambiguous observations
+// have been diverted to protected states. It enumerates every (powerRunning,
 // runnerPresent, runnerBusy) triple. Listing all eight cells (over an
 // "any" sentinel) keeps the table grep-friendly and forces a new
 // classification to be a single-line addition.
 var adoptionMatrix = map[adoptionKey]adoptionClass{
-	// power != "running" → Warm regardless of runner snapshot.
+	// Only an explicitly stopped guest reaches these non-running cells.
 	{powerRunning: false, runnerPresent: false, runnerBusy: false}: {store.StateWarm, store.PoolKindWarm, false},
 	{powerRunning: false, runnerPresent: false, runnerBusy: true}:  {store.StateWarm, store.PoolKindWarm, false},
 	{powerRunning: false, runnerPresent: true, runnerBusy: false}:  {store.StateWarm, store.PoolKindWarm, false},
@@ -1366,23 +1418,26 @@ var adoptionMatrix = map[adoptionKey]adoptionClass{
 // VM from observable Proxmox power state and the GitHub runner snapshot
 // (which may be nil when GitHub was unreachable).
 //
-// The PowerState query failure path defaults to Hot (NOT Warm) so the
-// reconciler's hot+busy → promote-to-Running rule can recover any
-// in-flight job if a runner does turn out to be registered. Defaulting
-// to Warm would hide the VM from the reconciler's matrix entirely.
-func (m *manager) classifyAdoption(ctx context.Context, pv *provisioner.VM, runners map[string]RunnerInfo) (store.State, store.PoolKind, int64) {
+// Busy and ambiguous observations are retained in a protected busy state,
+// preventing reuse, reaping or rollback until fresh evidence resolves them.
+func (m *manager) classifyAdoption(ctx context.Context, pv *provisioner.VM, runners map[string]RunnerInfo) (store.State, store.PoolKind, int64, bool) {
 	// Per-VM timeout so one stuck node doesn't pin the leader-plane
 	// startup. The default-to-hot fallback below absorbs the timeout
 	// cleanly — the gh.Reconciler reclassifies on its first tick.
 	vmCtx, cancel := context.WithTimeout(ctx, adoptPowerStateTimeoutPerVM)
 	defer cancel()
 	power, err := m.prov.PowerState(vmCtx, pv)
-	if err != nil {
-		m.log.Warn("adopt: power-state query failed; defaulting to hot",
-			"vmid", pv.VMID, "node", pv.Node, "err", err)
-		return store.StateHot, store.PoolKindHot, 0
-	}
 	gr, present := runners[pv.Name]
+	if err != nil || (power != "running" && power != "stopped") || runners == nil || (present && (gr.Busy || gr.Unknown)) {
+		if err != nil {
+			m.log.Warn("adopt: power-state query failed", "vmid", pv.VMID, "node", pv.Node, "err", err)
+		}
+		state := store.StateAssigned
+		if present && gr.Busy {
+			state = store.StateRunning
+		}
+		return state, store.PoolKindHot, gr.ID, true
+	}
 	key := adoptionKey{
 		powerRunning:  power == "running",
 		runnerPresent: present,
@@ -1393,7 +1448,7 @@ func (m *manager) classifyAdoption(ctx context.Context, pv *provisioner.VM, runn
 	if class.withRunnerID {
 		runnerID = gr.ID
 	}
-	return class.state, class.kind, runnerID
+	return class.state, class.kind, runnerID, false
 }
 
 // Run is the reconcile loop.
@@ -1543,8 +1598,14 @@ func (m *manager) powerPollOnce(ctx context.Context) {
 	now := time.Now()
 	seen := make(map[int]struct{}, len(rows))
 	suppressed := 0
+	var adoptionRunners map[string]RunnerInfo
+	var adoptionErr error
+	adoptionChecked := false
 	for _, row := range rows {
 		seen[row.VMID] = struct{}{}
+		if row.JITPending {
+			continue
+		}
 		vmCtx, cancel := context.WithTimeout(ctx, powerPollTimeoutPerVM)
 		state, err := m.prov.PowerState(vmCtx, &provisioner.VM{
 			VMID: row.VMID, Node: row.Node, Name: row.Name, Profile: row.Profile,
@@ -1562,13 +1623,61 @@ func (m *manager) powerPollOnce(ctx context.Context) {
 			}
 			continue
 		}
-		// Empty string means "unknown" (VM not found). Skip — the
-		// stuck-state sweep will reap genuinely-missing rows.
-		if state == "" || state == "running" {
+		if row.AdoptionProtected {
+			if last, ok := m.powerPollErrLastLog[row.VMID]; !ok || now.Sub(last) >= 5*time.Minute {
+				m.log.Warn("adopt: guest remains protected pending confirmed nonbusy runner and known power state", "vmid", row.VMID, "power", state, "runner_id", row.RunnerID)
+				m.powerPollErrLastLog[row.VMID] = now
+			}
+			// Paused, missing and unknown power states never establish job
+			// completion. Check GitHub only on a known power state, at most
+			// once per 30 seconds across all protected guests.
+			if state != "running" && state != "stopped" {
+				continue
+			}
+			if !adoptionChecked && !now.Before(m.adoptionNextCheck) && m.cfg.RunnerLister != nil {
+				adoptionChecked = true
+				m.adoptionNextCheck = now.Add(30 * time.Second)
+				checkCtx, checkCancel := context.WithTimeout(ctx, 10*time.Second)
+				adoptionRunners, adoptionErr = m.cfg.RunnerLister(checkCtx)
+				checkCancel()
+				if adoptionErr != nil {
+					m.log.Warn("adopt: runner recheck failed; preserving protected guests", "err", adoptionErr)
+				}
+			}
+			gr, found := adoptionRunners[row.Name]
+			if !adoptionChecked || adoptionErr != nil || !found || gr.Unknown || gr.ID == 0 || gr.Busy || (row.RunnerID != 0 && row.RunnerID != gr.ID) {
+				continue
+			}
+			if state == "stopped" {
+				// GitHub was queried after the first power observation. Refresh
+				// power before taking the destructive transition as well.
+				checkCtx, checkCancel := context.WithTimeout(ctx, powerPollTimeoutPerVM)
+				confirmed, confirmErr := m.prov.PowerState(checkCtx, &provisioner.VM{VMID: row.VMID, Node: row.Node, Name: row.Name, Profile: row.Profile})
+				checkCancel()
+				if confirmErr == nil && confirmed == "stopped" {
+					m.completeProtectedAdoption(row)
+				}
+				continue
+			}
+			ok, clearErr := m.store.UpdateIf(row.VMID, func(v *store.VM) bool {
+				return v.AdoptionProtected && !v.JITPending && v.State == row.State && v.CreatedAt.Equal(row.CreatedAt) && v.StateSince.Equal(row.StateSince) && v.RunnerID == row.RunnerID && v.JobID == row.JobID
+			}, func(v *store.VM) { v.AdoptionProtected = false })
+			if clearErr != nil {
+				m.log.Warn("adopt: release protection failed", "vmid", row.VMID, "err", clearErr)
+			}
+			if ok {
+				delete(m.powerPollErrLastLog, row.VMID)
+				m.log.Info("adopt: runner confirmed nonbusy on running guest; protection released", "vmid", row.VMID)
+			}
 			continue
 		}
-		// Anything else ("stopped", "paused", ...) signals the job is
-		// no longer executing. MarkCompleted is idempotent and refuses
+		// Empty and other unrecognised power states are unknown.
+		if state != "stopped" {
+			continue
+		}
+		// A stopped guest signals normal job completion. Paused and unknown
+		// states do not establish that an assigned job has finished.
+		// MarkCompleted is idempotent and refuses
 		// rows already in Draining/Destroying, so a duplicate poll
 		// observation is harmless.
 		m.log.Info("power-poll: vm not running; marking completed",
@@ -1591,6 +1700,36 @@ func (m *manager) powerPollOnce(ctx context.Context) {
 			delete(m.powerPollErrLastLog, vmid)
 		}
 	}
+}
+
+// completeProtectedAdoption only cleans up the exact protected generation
+// after both the guest is stopped and its GitHub runner is confirmed nonbusy.
+func (m *manager) completeProtectedAdoption(row *store.VM) {
+	recycle := m.shouldRecycle(row)
+	ok, err := m.store.UpdateIf(row.VMID, func(v *store.VM) bool {
+		return v.AdoptionProtected && !v.JITPending && v.State == row.State && v.CreatedAt.Equal(row.CreatedAt) && v.StateSince.Equal(row.StateSince) && v.RunnerID == row.RunnerID && v.JobID == row.JobID
+	}, func(v *store.VM) {
+		v.AdoptionProtected = false
+		if recycle {
+			v.State = store.StateRecycling
+		} else {
+			v.State = store.StateDraining
+		}
+		v.StateSince = time.Now()
+	})
+	if err != nil {
+		m.log.Warn("adopt: protected completion failed", "vmid", row.VMID, "err", err)
+		return
+	}
+	if !ok {
+		return
+	}
+	if recycle {
+		m.rollbackAsync(row.VMID, row.Node, row.Name, row.Profile)
+	} else {
+		m.destroyAsync(row.VMID, row.Node, row.Profile)
+	}
+	m.SignalRefill()
 }
 
 // reconcileOnce is kept as a thin wrapper that delegates to the
@@ -2083,7 +2222,7 @@ func (m *manager) recycleOldVMs(profile string, maxAge time.Duration) {
 // the destroy path instead of pinning the row (and its VMID) forever.
 func (m *manager) sweepStuckRows() {
 	const stuckGrace = 5 * time.Minute
-	stuckCutoff := time.Now().Add(-stuckGrace)
+	now := time.Now()
 	stuckCandidates, err := m.store.ListByState(
 		store.StateProvisioning, store.StateBooting,
 		store.StateRecycling,
@@ -2093,17 +2232,33 @@ func (m *manager) sweepStuckRows() {
 		return
 	}
 	for _, s := range stuckCandidates {
-		if !s.UpdatedAt.Before(stuckCutoff) {
-			continue
-		}
-		m.log.Warn("sweep: row stuck in transient state; re-queueing for destroy",
-			"vmid", s.VMID, "state", s.State, "age", time.Since(s.UpdatedAt))
-		if _, err := m.store.Update(s.VMID, func(v *store.VM) {
-			v.State = store.StateDraining
-			v.StateSince = time.Now()
-		}); err == nil {
-			m.destroyAsync(s.VMID, s.Node, s.Profile)
-		}
+		m.sweepStuckCandidate(s, now, stuckGrace)
+	}
+}
+
+func (m *manager) sweepStuckCandidate(s *store.VM, now time.Time, grace time.Duration) {
+	if !s.UpdatedAt.Before(now.Add(-grace)) {
+		return
+	}
+	if (s.State == store.StateProvisioning || s.State == store.StateBooting) && s.StartWorkerDeadline.After(now) {
+		return
+	}
+	ok, err := m.store.UpdateIf(s.VMID, func(v *store.VM) bool {
+		return v.State == s.State && v.CreatedAt.Equal(s.CreatedAt) && v.StateSince.Equal(s.StateSince) && v.UpdatedAt.Equal(s.UpdatedAt) && v.StartWorkerDeadline.Equal(s.StartWorkerDeadline)
+	}, func(v *store.VM) { v.State = store.StateDraining; v.StateSince = time.Now() })
+	if err == nil && ok {
+		m.log.Warn("sweep: row stuck in transient state; re-queueing for destroy", "vmid", s.VMID, "state", s.State, "age", time.Since(s.UpdatedAt))
+		m.destroyAsync(s.VMID, s.Node, s.Profile)
+	}
+}
+
+// clearStartWorker clears only the worker generation that is finishing.
+func (m *manager) clearStartWorker(vmid int, createdAt, deadline time.Time) {
+	_, err := m.store.UpdateIf(vmid, func(v *store.VM) bool {
+		return v.CreatedAt.Equal(createdAt) && v.StartWorkerDeadline.Equal(deadline)
+	}, func(v *store.VM) { v.StartWorkerDeadline = time.Time{} })
+	if err != nil {
+		m.log.Warn("clear start worker failed", "vmid", vmid, "err", err)
 	}
 }
 
@@ -2149,28 +2304,51 @@ func (m *manager) promoteN(ctx context.Context, profile string, n int) {
 			m.log.Debug("promote: bootSem saturated, deferring to next tick", "vmid", w.VMID)
 			continue
 		}
+		releaseWindowsBoot := func() {}
+		{
+			var acquired bool
+			releaseWindowsBoot, acquired = m.cfg.WindowsBootBudget.tryAcquire(w.Node)
+			if !acquired {
+				m.log.Debug("promote: host boot budget unavailable", "vmid", w.VMID, "node", w.Node)
+				m.bootSem.Release(1)
+				continue
+			}
+		}
 		// Capacity before the CAS, so a refusal leaves nothing to roll
 		// back: the row stays Warm and the next tick retries.
 		claim, admitted := m.admitPromotion(ctx, w)
 		if !admitted {
+			releaseWindowsBoot()
 			m.bootSem.Release(1)
 			continue
 		}
 		// CAS warm -> booting; if lost, hand back the slot and the claim.
-		ok, err := m.store.UpdateState(w.VMID, store.StateWarm, store.StateBooting, func(v *store.VM) {
+		bootCtx, bootCancel := context.WithTimeout(m.workerCtx, 5*time.Minute)
+		deadline, _ := bootCtx.Deadline()
+		ok, err := m.store.UpdateIf(w.VMID, func(v *store.VM) bool {
+			return v.State == store.StateWarm && v.CreatedAt.Equal(w.CreatedAt) && v.StateSince.Equal(w.StateSince)
+		}, func(v *store.VM) {
+			v.State = store.StateBooting
+			v.StateSince = time.Now()
+			v.StartWorkerDeadline = deadline
 			v.PoolKind = store.PoolKindHot // promoted to hot budget
 		})
 		if err != nil || !ok {
+			bootCancel()
 			claim.release()
+			releaseWindowsBoot()
 			m.bootSem.Release(1)
 			continue
 		}
 		row := w
+		row.StartWorkerDeadline = deadline
 		m.wg.Add(1)
 		// runBoot derives its own context from m.workerCtx; the caller's
 		// ctx is for the reconcile tick, not the boot lifetime.
 		go func() { //nolint:contextcheck // boot outlives the reconcile-tick ctx
 			defer m.wg.Done()
+			defer bootCancel()
+			defer m.clearStartWorker(row.VMID, row.CreatedAt, deadline)
 			defer func() {
 				if r := recover(); r != nil {
 					// Whether or not the VM started, nothing will retire this
@@ -2181,7 +2359,8 @@ func (m *manager) promoteN(ctx context.Context, profile string, n int) {
 				}
 			}()
 			defer m.bootSem.Release(1)
-			m.runBoot(row, claim)
+			defer releaseWindowsBoot()
+			m.runBoot(bootCtx, row, deadline, claim)
 		}()
 	}
 }
@@ -2236,6 +2415,8 @@ func (m *manager) kickClone(ctx context.Context, profile string, kind store.Pool
 // (handleCloneFailure) parameterless beyond the prep itself.
 type clonePrep struct {
 	ctx           context.Context
+	createdAt     time.Time
+	deadline      time.Time
 	cancel        context.CancelFunc
 	span          trace.Span
 	ps            *profileState
@@ -2271,7 +2452,9 @@ type clonePrep struct {
 	// expectPoweredOff marks the clone's reservation as staying powered
 	// off (warm), so it retires on observation. No-op when admission is
 	// disabled.
-	expectPoweredOff func()
+	expectPoweredOff   func()
+	beginStart         func() bool
+	releaseWindowsBoot func()
 }
 
 // runClone is the body of an async clone goroutine. The caller
@@ -2299,12 +2482,14 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 	}
 	defer prep.cancel()
 	defer prep.span.End()
+	defer prep.releaseWindowsBoot()
+	defer m.clearStartWorker(prep.vmid, prep.createdAt, prep.deadline)
 
 	// Snapshot-rollback mode clones NEVER auto-start: the clean
 	// snapshot must be taken while the VM is still stopped, before the
 	// runner's first boot dirties the disk. Hot fills start the VM
 	// explicitly below, after the snapshot lands.
-	cloneStartsVM := prep.poweredOn && !m.snapshotRecycle()
+	cloneStartsVM := false
 
 	cloneStart := time.Now()
 	pv, err := m.prov.Clone(prep.ctx, provisioner.CloneOptions{
@@ -2365,24 +2550,31 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 	if prep.poweredOn {
 		target = store.StateBooting
 	}
-	updated, err := m.store.Update(prep.vmid, func(v *store.VM) {
+	transitioned, err := m.store.UpdateIf(prep.vmid, func(v *store.VM) bool {
+		return v.State == store.StateProvisioning && v.CreatedAt.Equal(prep.createdAt) && v.StartWorkerDeadline.Equal(prep.deadline)
+	}, func(v *store.VM) {
 		v.State = target
 		v.StateSince = time.Now()
 		v.HasRecycleSnapshot = hasSnapshot
 	})
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			// Row was deleted while Clone was in flight — typically by
-			// admin ForceDestroy or a stuck-state sweep that didn't see
-			// the in-flight clone. The Proxmox VM is real; without an
-			// immediate destroy it lives until sweepProxmoxOrphans picks
-			// it up (OrphanGrace + reconcile tick). Destroy it now.
-			m.log.Info("clone: row deleted mid-clone, destroying orphan vm",
-				"vmid", prep.vmid, "node", prep.node)
-			m.destroyOrSyncFallback(prep.vmid, prep.node, prep.profileName)
+	if err != nil || !transitioned {
+		if !transitioned && err == nil {
+			// Reserve a missing VMID with a destroying tombstone before
+			// cleaning the clone. If another generation owns the ID, the
+			// insert fails and its VM must be left alone.
+			tombstone := &store.VM{VMID: prep.vmid, Node: prep.node, Name: prep.name,
+				Profile: prep.profileName, PoolKind: prep.kind, State: store.StateDestroying, CreatedAt: prep.createdAt}
+			if insertErr := m.store.Insert(tombstone); insertErr == nil {
+				m.log.Info("clone: row vanished; destroying orphan vm", "vmid", prep.vmid, "node", prep.node)
+				m.destroyOrSyncFallback(prep.vmid, prep.node, prep.profileName)
+			}
 			return
 		}
 		m.log.Warn("clone: update row state failed", "vmid", prep.vmid, "err", err)
+		return
+	}
+	updated, err := m.store.Get(prep.vmid)
+	if err != nil {
 		return
 	}
 
@@ -2402,7 +2594,13 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 			// start the VM now so runBootInline's WaitReady has a
 			// booting guest to poll.
 			startTime := time.Now()
-			serr := m.prov.Start(prep.ctx, pv)
+			serr := m.cfg.WindowsBootBudget.pace(prep.ctx, prep.node)
+			if serr == nil && !prep.beginStart() {
+				serr = errors.New("capacity reservation expired before start")
+			}
+			if serr == nil {
+				serr = m.prov.Start(prep.ctx, pv)
+			}
 			if m.metrics != nil {
 				m.metrics.ObserveStartupStage(m.cfg.ScaleSetName, prep.profileName, "power_on", time.Since(startTime))
 			}
@@ -2412,7 +2610,7 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 				return
 			}
 		}
-		m.runBootInline(prep.ctx, pv, updated)
+		m.runBootInline(prep.ctx, pv, updated, prep.deadline)
 	}
 	m.SignalRefill()
 }
@@ -2455,14 +2653,43 @@ func (m *manager) prepareClone(profile string, kind store.PoolKind, poweredOn bo
 		return nil
 	}
 
-	vmid, name, templateVMID, templateClass, err := m.allocateVMIDAndInsertRow(ctx, ps, kind, node)
+	releaseWindowsBoot := func() {}
+	if poweredOn {
+		var ok bool
+		releaseWindowsBoot, ok = m.cfg.WindowsBootBudget.tryAcquire(node)
+		if !ok {
+			m.log.Debug("clone: host boot budget unavailable", "profile", profileName, "node", node)
+			claim.release()
+			span.End()
+			cancel()
+			return nil
+		}
+	}
+
+	bootHandedOff := false
+	defer func() {
+		if !bootHandedOff {
+			releaseWindowsBoot()
+		}
+	}()
+
+	createdAt := time.Now()
+	deadline, _ := ctx.Deadline()
+	vmid, name, templateVMID, templateClass, err := m.allocateVMIDAndInsertRow(ctx, ps, kind, node, createdAt, deadline)
 	if err != nil {
 		m.log.Warn("clone: allocate/insert failed", "profile", profileName, "err", err)
+		releaseWindowsBoot()
 		claim.release()
 		span.End()
 		cancel()
 		return nil
 	}
+	workerHandedOff := false
+	defer func() {
+		if !workerHandedOff {
+			m.clearStartWorker(vmid, createdAt, deadline)
+		}
+	}()
 	// The Provisioning row now carries this dispatch's headroom; drop
 	// the reservation so the reconciler counts it exactly once.
 	rowInserted()
@@ -2486,6 +2713,8 @@ func (m *manager) prepareClone(profile string, kind store.PoolKind, poweredOn bo
 
 	prep := &clonePrep{
 		ctx:           ctx,
+		createdAt:     createdAt,
+		deadline:      deadline,
 		cancel:        cancel,
 		span:          span,
 		ps:            ps,
@@ -2498,8 +2727,10 @@ func (m *manager) prepareClone(profile string, kind store.PoolKind, poweredOn bo
 		kind:          kind,
 		poweredOn:     poweredOn,
 
-		releaseCapacity:  claim.release,
-		expectPoweredOff: claim.expectPoweredOff,
+		releaseCapacity:    claim.release,
+		expectPoweredOff:   claim.expectPoweredOff,
+		beginStart:         claim.beginStart,
+		releaseWindowsBoot: releaseWindowsBoot,
 	}
 
 	// Allocate a static IP (if the profile's IPAM is non-noop)
@@ -2517,6 +2748,7 @@ func (m *manager) prepareClone(profile string, kind store.PoolKind, poweredOn bo
 		// Row exists; the standard failure path marks it Destroying
 		// and queues a destroy (which releases the IPAM lease — safe
 		// because Release is idempotent and nothing was allocated).
+		releaseWindowsBoot()
 		m.handleCloneFailure(prep, err, "ipam")
 		span.End()
 		cancel()
@@ -2525,6 +2757,8 @@ func (m *manager) prepareClone(profile string, kind store.PoolKind, poweredOn bo
 	if ipAssignment != "" {
 		prep.ipConfig = "ip=" + ipAssignment
 	}
+	bootHandedOff = true
+	workerHandedOff = true
 	return prep
 }
 
@@ -2535,7 +2769,7 @@ func (m *manager) prepareClone(profile string, kind store.PoolKind, poweredOn bo
 // only for the duration of this helper — IPAM and Proxmox calls
 // happen outside the lock. The defer guarantees release even on
 // panic, which would otherwise wedge every subsequent clone.
-func (m *manager) allocateVMIDAndInsertRow(ctx context.Context, ps *profileState, kind store.PoolKind, node string) (vmid int, name string, templateVMID int, templateClass string, err error) {
+func (m *manager) allocateVMIDAndInsertRow(ctx context.Context, ps *profileState, kind store.PoolKind, node string, createdAt, deadline time.Time) (vmid int, name string, templateVMID int, templateClass string, err error) {
 	m.allocMu.Lock()
 	defer m.allocMu.Unlock()
 
@@ -2559,13 +2793,15 @@ func (m *manager) allocateVMIDAndInsertRow(ctx context.Context, ps *profileState
 		}
 	}
 	row := &store.VM{
-		VMID:     vmid,
-		Node:     node,
-		Name:     name,
-		Profile:  ps.settings.Name,
-		Template: templateClass,
-		PoolKind: kind,
-		State:    store.StateProvisioning,
+		VMID:                vmid,
+		Node:                node,
+		Name:                name,
+		Profile:             ps.settings.Name,
+		Template:            templateClass,
+		PoolKind:            kind,
+		State:               store.StateProvisioning,
+		CreatedAt:           createdAt,
+		StartWorkerDeadline: deadline,
 	}
 	if err := m.store.Insert(row); err != nil {
 		return 0, "", 0, "", fmt.Errorf("create row: %w", err)
@@ -2591,41 +2827,53 @@ func (m *manager) handleCloneFailure(prep *clonePrep, err error, op string) {
 	// the capacity claim must go back to the pool rather than wait out
 	// its TTL.
 	prep.releaseCapacity()
-	if _, updErr := m.store.Update(prep.vmid, func(v *store.VM) {
+	ok, updErr := m.store.UpdateIf(prep.vmid, func(v *store.VM) bool {
+		return v.State == store.StateProvisioning && v.CreatedAt.Equal(prep.createdAt) && v.StartWorkerDeadline.Equal(prep.deadline)
+	}, func(v *store.VM) {
 		v.State = store.StateDestroying
 		v.StateSince = time.Now()
-	}); updErr != nil {
+	})
+	if updErr != nil {
 		m.log.Warn("clone: mark destroying failed", "vmid", prep.vmid, "op", op, "err", updErr)
 	}
-	m.destroyOrSyncFallback(prep.vmid, prep.node, prep.profileName)
+	if ok {
+		m.destroyOrSyncFallback(prep.vmid, prep.node, prep.profileName)
+	}
 }
 
 // runBoot is the body of a warm->hot promotion goroutine. claim is the
 // promotion's capacity reservation (inert when admission is disabled).
-// A successful start keeps it — the accountant retires it once the
-// powered-on guest shows up in its reading — while a failed start
-// releases it, because the VM never consumed the memory.
-func (m *manager) runBoot(row *store.VM, claim capacityClaim) {
-	ctx, cancel := context.WithTimeout(m.workerCtx, 5*time.Minute)
-	defer cancel()
+// An issued start keeps its capacity claim through the settling period,
+// even on an ambiguous error; failures before issuance release it.
+func (m *manager) runBoot(ctx context.Context, row *store.VM, deadline time.Time, claim capacityClaim) {
 	pv := &provisioner.VM{VMID: row.VMID, Node: row.Node, Name: row.Name, Profile: row.Profile}
 	startTime := time.Now()
-	err := m.prov.Start(ctx, pv)
+	err := m.cfg.WindowsBootBudget.pace(ctx, row.Node)
+	if err == nil && !claim.beginStart() {
+		err = errors.New("capacity reservation expired before start")
+	}
+	issued := false
+	if err == nil {
+		issued = true
+		err = m.prov.Start(ctx, pv)
+	}
 	if m.metrics != nil {
 		m.metrics.ObserveStartupStage(m.cfg.ScaleSetName, row.Profile, "power_on", time.Since(startTime))
 	}
 	if err != nil {
 		m.log.Warn("boot: start failed", "vmid", row.VMID, "err", err)
-		claim.release()
+		if !issued {
+			claim.release()
+		}
 		m.markPoisonOrDestroy(row)
 		return
 	}
-	m.runBootInline(ctx, pv, row)
+	m.runBootInline(ctx, pv, row, deadline)
 }
 
 // runBootInline waits for the guest agent and transitions Booting → Hot.
 // Shared by the clone(poweredOn=true) and warm-promotion paths.
-func (m *manager) runBootInline(ctx context.Context, pv *provisioner.VM, row *store.VM) {
+func (m *manager) runBootInline(ctx context.Context, pv *provisioner.VM, row *store.VM, deadline time.Time) {
 	ctx, span := tracer.Start(ctx, "pool.runBoot", trace.WithAttributes(
 		attribute.Int("vm.id", row.VMID),
 		attribute.String("vm.node", row.Node),
@@ -2646,7 +2894,9 @@ func (m *manager) runBootInline(ctx context.Context, pv *provisioner.VM, row *st
 	if m.metrics != nil {
 		m.metrics.BootDuration.WithLabelValues(m.cfg.ScaleSetName, row.Profile, row.Node).Observe(time.Since(bootStart).Seconds())
 	}
-	if _, err := m.store.Update(row.VMID, func(v *store.VM) {
+	if _, err := m.store.UpdateIf(row.VMID, func(v *store.VM) bool {
+		return v.State == store.StateBooting && v.CreatedAt.Equal(row.CreatedAt) && v.StartWorkerDeadline.Equal(deadline)
+	}, func(v *store.VM) {
 		v.State = store.StateHot
 		v.StateSince = time.Now()
 	}); err != nil {
@@ -2663,61 +2913,45 @@ func (m *manager) runBootInline(ctx context.Context, pv *provisioner.VM, row *st
 // rows whose profile no longer exists in config fall back to the
 // fleet-wide cfg value.
 func (m *manager) markPoisonOrDestroy(row *store.VM) {
-	updated, err := m.store.Update(row.VMID, func(v *store.VM) {
+	threshold := m.cfg.BootMaxAttempts
+	if ps := m.profileOf(row.Profile); ps != nil {
+		threshold = ps.settings.BootMaxAttempts
+	}
+	var attempts int
+	var poison bool
+	ok, err := m.store.UpdateIf(row.VMID, func(v *store.VM) bool {
+		return v.State == store.StateBooting && v.CreatedAt.Equal(row.CreatedAt) && v.StartWorkerDeadline.Equal(row.StartWorkerDeadline)
+	}, func(v *store.VM) {
 		v.BootAttempts++
+		attempts = v.BootAttempts
+		poison = attempts >= threshold
+		if poison {
+			v.State = store.StatePoison
+		} else {
+			v.State = store.StateDestroying
+		}
+		v.StateSince = time.Now()
 	})
 	if err != nil {
-		m.log.Warn("poison: inc attempts failed", "vmid", row.VMID, "profile", row.Profile, "err", err)
+		m.log.Warn("poison: transition failed", "vmid", row.VMID, "err", err)
 		return
 	}
-	// Feed the canary controller's failure counter — only fires
-	// when Template was stamped as "candidate" at clone time.
-	// When the cumulative rate trips the operator's threshold the
-	// controller returns true and we emit the
-	// scaleset_canary_reverted_total counter.
-	//
-	// Gate on the 0->1 BootAttempts transition so a clone contributes
-	// at most ONE failure. markPoisonOrDestroy runs once per failed
-	// boot attempt and increments BootAttempts each time, while
-	// RecordClone fires once per clone. Recording on every attempt let
-	// a single bad canary VM add up to BootMaxAttempts failures against
-	// one clone, pushing failures/clones above 1.0 and tripping the
-	// auto-revert far earlier than canary_max_failure_rate intends
-	// (#353).
-	if m.cfg.Canary != nil && row.Template != "" && updated.BootAttempts == 1 {
+	if !ok {
+		return
+	}
+	if m.cfg.Canary != nil && row.Template != "" && attempts == 1 {
 		if reverted := m.cfg.Canary.RecordFailure(row.Profile, canary.Template(row.Template)); reverted {
-			m.log.Warn("canary: auto-reverted percent to 0; investigate canary template",
-				"profile", row.Profile, "vmid", row.VMID)
+			m.log.Warn("canary: auto-reverted percent to 0; investigate canary template", "profile", row.Profile, "vmid", row.VMID)
 			if m.metrics != nil {
 				m.metrics.CanaryReverts.WithLabelValues(m.cfg.ScaleSetName, row.Profile).Inc()
 			}
 		}
 	}
-	threshold := m.cfg.BootMaxAttempts
-	if ps := m.profileOf(row.Profile); ps != nil {
-		threshold = ps.settings.BootMaxAttempts
-	}
-	if updated.BootAttempts >= threshold {
-		if _, updErr := m.store.Update(row.VMID, func(v *store.VM) {
-			v.State = store.StatePoison
-			v.StateSince = time.Now()
-		}); updErr != nil {
-			m.log.Warn("poison: mark poison failed", "vmid", row.VMID, "profile", row.Profile, "err", updErr)
-		}
-		// Page-worthy: a VM has exhausted its boot-retry budget and is
-		// quarantined until an operator triages the underlying failure
-		// (template image regression, networking misconfig, etc.).
-		m.log.Error("vm marked poison; manual intervention required",
-			"vmid", row.VMID, "profile", row.Profile, "attempts", updated.BootAttempts)
+	if poison {
+		m.log.Error("vm marked poison; manual intervention required", "vmid", row.VMID, "profile", row.Profile, "attempts", attempts)
 		return
 	}
-	if _, updErr := m.store.Update(row.VMID, func(v *store.VM) {
-		v.State = store.StateDestroying
-		v.StateSince = time.Now()
-	}); updErr != nil {
-		m.log.Warn("poison: mark destroying failed", "vmid", row.VMID, "profile", row.Profile, "err", updErr)
-	}
-	m.destroyAsync(updated.VMID, updated.Node, updated.Profile)
+	m.destroyAsync(row.VMID, row.Node, row.Profile)
 }
 
 // destroyRequest is the unit of work the destroy dispatcher consumes.

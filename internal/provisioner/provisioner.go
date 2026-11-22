@@ -26,6 +26,7 @@ import (
 	"github.com/luthermonson/go-proxmox"
 
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/config"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/nodecap"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/tags"
 )
 
@@ -248,6 +249,12 @@ type pmox struct {
 	templateNodeVMID int
 	profiles         map[string]config.ProfileConfig
 	log              *slog.Logger
+	startGate        interface {
+		AcquireStart(context.Context, string) (func(), error)
+	}
+	startCapacity interface {
+		ReserveExisting(context.Context, string, nodecap.Shape, int) (nodecap.Reservation, bool, error)
+	}
 
 	// inFlightClones tracks VMIDs currently inside Clone() between the
 	// PVE qmclone task returning and the follow-up qmconfig that applies
@@ -285,6 +292,19 @@ type pmox struct {
 	// cloneLXCFromTemplate. Guarded by lxcCloneMu.
 	lxcCloneMu    sync.Mutex
 	lxcCloneLocks map[int]*sync.Mutex
+}
+
+// SetStartGate installs the shared host budget before workers start.
+func (p *pmox) SetStartGate(gate interface {
+	AcquireStart(context.Context, string) (func(), error)
+}) {
+	p.startGate = gate
+}
+
+func (p *pmox) SetStartCapacity(capacity interface {
+	ReserveExisting(context.Context, string, nodecap.Shape, int) (nodecap.Reservation, bool, error)
+}) {
+	p.startCapacity = capacity
 }
 
 // Options configures Provisioner trackers separate from the static

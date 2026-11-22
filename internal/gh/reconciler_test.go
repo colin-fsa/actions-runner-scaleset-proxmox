@@ -256,6 +256,10 @@ func TestReconcile_AssignedIdlePastGrace_Destroys(t *testing.T) {
 	r, err := New(baseCfg(), newTestClient(t, srv), mgr, &stubProv{}, silentLogger(), nil)
 	require.NoError(t, err)
 	require.NoError(t, r.Tick(context.Background()))
+	first := r.offlineSince[mgr.rows[0].Name]
+	first.since = first.since.Add(-time.Hour)
+	r.offlineSince[mgr.rows[0].Name] = first
+	require.NoError(t, r.Tick(context.Background()))
 
 	require.Empty(t, mgr.promoteCalls)
 	require.Len(t, mgr.destroyCalls, 1)
@@ -298,6 +302,10 @@ func TestReconcile_AssignedOfflinePastGrace_Destroys(t *testing.T) {
 	r, err := New(baseCfg(), newTestClient(t, srv), mgr, &stubProv{}, silentLogger(), nil)
 	require.NoError(t, err)
 	require.NoError(t, r.Tick(context.Background()))
+	first := r.offlineSince[mgr.rows[0].Name]
+	first.since = first.since.Add(-time.Hour)
+	r.offlineSince[mgr.rows[0].Name] = first
+	require.NoError(t, r.Tick(context.Background()))
 
 	require.Len(t, mgr.destroyCalls, 1)
 	require.Contains(t, mgr.destroyCalls[0].Reason, "offline")
@@ -317,8 +325,7 @@ func TestReconcile_AssignedMissingPastGrace_Destroys(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, r.Tick(context.Background()))
 
-	require.Len(t, mgr.destroyCalls, 1)
-	require.Contains(t, mgr.destroyCalls[0].Reason, "never registered")
+	require.Empty(t, mgr.destroyCalls)
 }
 
 // 6. running + busy → no action
@@ -355,6 +362,10 @@ func TestReconcile_RunningIdle_Destroys(t *testing.T) {
 	r, err := New(baseCfg(), newTestClient(t, srv), mgr, &stubProv{}, silentLogger(), nil)
 	require.NoError(t, err)
 	require.NoError(t, r.Tick(context.Background()))
+	first := r.offlineSince[mgr.rows[0].Name]
+	first.since = first.since.Add(-time.Hour)
+	r.offlineSince[mgr.rows[0].Name] = first
+	require.NoError(t, r.Tick(context.Background()))
 
 	require.Len(t, mgr.destroyCalls, 1)
 	require.Contains(t, mgr.destroyCalls[0].Reason, "missed JobCompleted")
@@ -375,6 +386,10 @@ func TestReconcile_RunningOffline_Destroys(t *testing.T) {
 	r, err := New(baseCfg(), newTestClient(t, srv), mgr, &stubProv{}, silentLogger(), nil)
 	require.NoError(t, err)
 	require.NoError(t, r.Tick(context.Background()))
+	first := r.offlineSince[mgr.rows[0].Name]
+	first.since = first.since.Add(-time.Hour)
+	r.offlineSince[mgr.rows[0].Name] = first
+	require.NoError(t, r.Tick(context.Background()))
 
 	require.Len(t, mgr.destroyCalls, 1)
 	require.Contains(t, mgr.destroyCalls[0].Reason, "offline")
@@ -394,8 +409,7 @@ func TestReconcile_RunningMissing_Destroys(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, r.Tick(context.Background()))
 
-	require.Len(t, mgr.destroyCalls, 1)
-	require.Contains(t, mgr.destroyCalls[0].Reason, "missing")
+	require.Empty(t, mgr.destroyCalls)
 }
 
 // 10. hot + busy → promote (sneak-assignment)

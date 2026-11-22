@@ -92,3 +92,72 @@ installation-token fetch and subsequent REST calls (typically
 
 Leave all of these empty when running against github.com — the default
 per-scope URL derivation already targets the right endpoint.
+
+### Shared host boot pacing
+
+`pool.boots_per_node` limits concurrent boots per Proxmox node across all
+profiles, operating systems, and scale sets in this controller. The default is
+`0` (unlimited). `pool.boot_start_interval` is the minimum interval between
+starts on the same node; its default is `0s` (unlimited). The old
+`windows_boots_per_node` setting is accepted as an alias but now covers all
+operating systems; do not set both names. A conservative initial setting is
+`boots_per_node: 2` and `boot_start_interval: 15s`. The existing per-profile
+runner limit, including a configured Windows ceiling of 25, remains separate.
+Slots are held through guest readiness or failure; saturation defers pool
+refill. The budget is local to one elected controller, not a lock between
+independently deployed controllers.
+
+With capacity enabled and `memory_mode: host_available`, start reservations
+withhold the configured RAM (scaled by `memory_overcommit`) for at least 15
+minutes after the start request, or `clone_inflight_grace` if longer. This is a
+bounded settling assumption, not a measurement of individual guest RAM. It can
+temporarily double count memory that has already appeared in host usage.
+After each leader election, start pacing and host-memory admission pause for
+the same window to let requests from the previous leader settle. This initial
+quiet period is intentional even on a fresh controller: with pacing enabled,
+new starts wait at least 15 minutes after election; host-available admission
+also waits when capacity accounting is enabled. Queued work can remain queued
+throughout this period and LXC JIT delivery can wait for the budget, increasing
+listener response time. Plan the isolated canary around that delay rather than
+interpreting it as a failed start. This policy assumes Proxmox start tasks and
+memory ramp complete within that window; raise `clone_inflight_grace` if that
+is not conservative enough. Keep host reserve for other workloads.
+
+### Staged canary and rollback
+
+In an isolated test environment with representative Linux and Windows profiles,
+set the two controls to `2` and `15s`, enable host-available admission with the
+normal reserve, and retain the existing Windows runner ceiling. First establish
+baseline free RAM, start duration and queued-job latency. Then:
+
+1. Submit a small mixed burst that requires cold clones and warm promotions on
+   one node; verify no more than two boots are active and start timestamps are
+   at least 15 seconds apart. Repeat across two nodes to check independent budgets.
+2. During a controlled start, compare Proxmox host free-memory samples and
+   capacity admission. A powered-on guest whose memory has not yet appeared in
+   the host reading must still consume a reservation; further work waits.
+3. With an isolated assigned or running test job, briefly interrupt the runner's
+   GitHub connectivity, restore it within the grace, and verify the job survives.
+   Separately confirm sustained offline status is cleaned up after grace, and
+   repeat after a controller restart to check the timer begins again.
+
+Watch `scaleset_pool_size`, `scaleset_acquire_duration_seconds`,
+`scaleset_boot_duration_seconds`, `scaleset_startup_stage_duration_seconds`,
+`scaleset_reconcile_errors_total`, host MemAvailable, Proxmox task timestamps,
+and controller logs for deferred admission, reservation expiry and force
+destroy. An offline runner still reported busy is deliberately not reaped;
+watch for `runner offline but still reported busy` warnings and investigate
+these ambiguous cases using authoritative job and runner evidence. Stop the
+canary if memory pressure, failed jobs, excessive waiting,
+or unexpected destroys appear. Roll back by restoring the previous controller
+image and configuration together, then confirm the old leader has stopped and
+inspect in-flight Proxmox tasks before resuming demand. A rollback removes these
+protections; do not use it as a substitute for controlling incoming load.
+
+After restart, a busy runner or ambiguous guest power or GitHub state is
+adopted as protected, not returned to the warm or hot pool. The controller
+logs `adopt: guest remains protected` and waits for a known power state and a
+fresh, matching, nonbusy runner observation before resolving it. If GitHub
+data stays missing or inconsistent, the guest can remain protected
+indefinitely and requires operator investigation. Failed owned-guest discovery
+is retried before orphan cleanup starts.

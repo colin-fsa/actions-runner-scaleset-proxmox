@@ -201,7 +201,7 @@ func TestAllocateVMIDAndInsertRow_ReleasesLockOnPanic(t *testing.T) {
 			r := recover()
 			require.NotNil(t, r, "fake provisioner must have panicked inside the locked section")
 		}()
-		_, _, _, _, _ = mgr.allocateVMIDAndInsertRow(context.Background(), ps, store.PoolKindHot, "pve1")
+		_, _, _, _, _ = mgr.allocateVMIDAndInsertRow(context.Background(), ps, store.PoolKindHot, "pve1", time.Now(), time.Now().Add(time.Minute))
 	}()
 
 	require.True(t, mgr.allocMu.TryLock(),

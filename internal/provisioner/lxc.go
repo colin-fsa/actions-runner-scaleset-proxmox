@@ -31,6 +31,7 @@ import (
 	"github.com/luthermonson/go-proxmox"
 
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/config"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/nodecap"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/tags"
 )
 
@@ -772,6 +773,47 @@ func (p *pmox) injectLXCJIT(ctx context.Context, vm *VM, jit string) error {
 	if err != nil {
 		return fmt.Errorf("inject jit: get ct %d status: %w", vm.VMID, classifyProxmoxError(err))
 	}
+	var claim nodecap.Reservation
+	if st.Status != "running" && p.startCapacity != nil {
+		profile, ok := p.profiles[vm.Profile]
+		if !ok || profile.MemoryMB <= 0 {
+			return fmt.Errorf("inject jit: cannot size stopped ct %d", vm.VMID)
+		}
+		shape := nodecap.Shape{MemoryBytes: uint64(profile.MemoryMB) * 1024 * 1024, VCPUs: profile.CPUCores}
+		for {
+			var admitted bool
+			claim, admitted, err = p.startCapacity.ReserveExisting(ctx, vm.Node, shape, vm.VMID)
+			if err == nil && admitted {
+				break
+			}
+			timer := time.NewTimer(time.Second)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
+	}
+	issued := false
+	defer func() {
+		if claim != nil && !issued {
+			claim.Release()
+		}
+	}()
+	if p.startGate != nil {
+		release, gateErr := p.startGate.AcquireStart(ctx, vm.Node)
+		if gateErr != nil {
+			return fmt.Errorf("inject jit: wait for host boot budget: %w", gateErr)
+		}
+		defer release()
+	}
+	if claim != nil {
+		if starter, ok := claim.(interface{ BeginStart() bool }); ok && !starter.BeginStart() {
+			return fmt.Errorf("inject jit: capacity reservation expired for ct %d", vm.VMID)
+		}
+	}
+	issued = true
 	if st.Status == "running" {
 		err = p.postLXCTask(ctx, vm, "/status/reboot", map[string]any{"timeout": lxcRebootTimeoutSeconds}, 300)
 	} else {

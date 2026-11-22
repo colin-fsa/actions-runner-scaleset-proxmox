@@ -92,10 +92,12 @@ func (s Stats) LiveWarm() int { return s.Warm }
 // VM is the pool's external view of a managed VM. It is intentionally
 // thin; the full state row lives in the ent store.
 type VM struct {
-	VMID    int
-	Node    string
-	Name    string
-	Profile string
+	VMID       int
+	Node       string
+	Name       string
+	Profile    string
+	CreatedAt  time.Time
+	AssignedAt time.Time
 }
 
 // RowSnapshot is the reconciler's view of a single VM row. It excludes
@@ -104,16 +106,18 @@ type VM struct {
 // int64 with 0 meaning "unset". RecycleCount mirrors the store row's
 // snapshot-rollback recycle counter (always 0 in destroy mode).
 type RowSnapshot struct {
-	VMID         int
-	Node         string
-	Name         string
-	Profile      string
-	State        string
-	JobID        int64
-	RunnerID     int64
-	RecycleCount int
-	StateSince   time.Time
-	CreatedAt    time.Time
+	VMID              int
+	Node              string
+	Name              string
+	Profile           string
+	State             string
+	JobID             int64
+	RunnerID          int64
+	RecycleCount      int
+	StateSince        time.Time
+	CreatedAt         time.Time
+	JITPending        bool
+	AdoptionProtected bool
 }
 
 // RunnerInfo is the subset of GitHub's per-runner state that the
@@ -121,9 +125,10 @@ type RowSnapshot struct {
 // appears in synthesised "unknown" entries; production callers receive
 // the GitHub-assigned positive int64.
 type RunnerInfo struct {
-	ID     int64
-	Online bool
-	Busy   bool
+	ID      int64
+	Online  bool
+	Busy    bool
+	Unknown bool
 }
 
 // JobMetadata is the per-job context stamped onto a VM row by
