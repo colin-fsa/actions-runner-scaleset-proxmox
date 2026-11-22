@@ -216,6 +216,8 @@ nodes:
   #     anti_affinity_with: { profile: prod }
 
 pool:
+  # 0 disables pacing; try 2 simultaneous Windows boots per node.
+  windows_boots_per_node: 0
   hot_size: 2                     # always-booted idle runners (default; profiles can override)
   warm_size: 3                    # pre-cloned, powered-off runners (default; profiles can override)
   # Optional fleet-wide ceiling on the sum of per-profile

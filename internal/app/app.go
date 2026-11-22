@@ -176,14 +176,15 @@ func Run(ctx context.Context, opts Options) error {
 	}
 
 	deps := runOneScalesetDeps{
-		cfg:      cfg,
-		auth:     auth,
-		sel:      sel,
-		capacity: capacity,
-		metrics:  metrics,
-		health:   health,
-		log:      log,
-		sysInfo:  sysInfo,
+		cfg:               cfg,
+		auth:              auth,
+		sel:               sel,
+		capacity:          capacity,
+		windowsBootBudget: pool.NewWindowsBootBudget(cfg.Pool.WindowsBootsPerNode),
+		metrics:           metrics,
+		health:            health,
+		log:               log,
+		sysInfo:           sysInfo,
 	}
 
 	// runLeaderPlane fans the per-scaleset workers out under one
@@ -685,11 +686,12 @@ type runOneScalesetDeps struct {
 	// resource-aware admission is disabled. Shared rather than
 	// per-scaleset so sibling scale sets cannot each admit a clone
 	// against the same free memory.
-	capacity pool.CapacityAdmitter
-	metrics  *observability.Metrics
-	health   *observability.Health
-	log      *slog.Logger
-	sysInfo  scaleset.SystemInfo
+	capacity          pool.CapacityAdmitter
+	windowsBootBudget *pool.WindowsBootBudget
+	metrics           *observability.Metrics
+	health            *observability.Health
+	log               *slog.Logger
+	sysInfo           scaleset.SystemInfo
 }
 
 // runOneScaleset drives one scale set's GH listener, REST
@@ -761,6 +763,7 @@ func runOneScaleset(leaderCtx context.Context, deps runOneScalesetDeps, entry co
 		OnRunnerOrphaned:     ghClient.RemoveRunner,
 		RunnerLister:         gh.NewRunnerLister(restCli, scope, state.vmPrefix, log),
 		Capacity:             deps.capacity,
+		WindowsBootBudget:    deps.windowsBootBudget,
 		EvictIdleForDemand:   cfg.Pool.Capacity.EvictIdleForDemand,
 		// The same universe handed to the nodeselector wrappers, so the
 		// pool's placement probes ask about exactly the nodes the

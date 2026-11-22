@@ -175,6 +175,8 @@ type Config struct {
 	// Independent of MaxConcurrentRunners rather than a replacement for
 	// it: when both are configured, both must admit the clone, so the
 	// stricter one binds.
+	WindowsBootBudget *WindowsBootBudget
+
 	Capacity CapacityAdmitter
 
 	// EvictIdleForDemand lets a queued job reclaim capacity from an idle
@@ -2149,10 +2151,24 @@ func (m *manager) promoteN(ctx context.Context, profile string, n int) {
 			m.log.Debug("promote: bootSem saturated, deferring to next tick", "vmid", w.VMID)
 			continue
 		}
+		releaseWindowsBoot := func() {}
+		ps := m.profileOf(w.Profile)
+		if ps == nil {
+			ps = m.profileOf(m.defaultProfile())
+		}
+		if ps != nil && ps.settings.GuestOS == "windows" {
+			var acquired bool
+			releaseWindowsBoot, acquired = m.cfg.WindowsBootBudget.tryAcquire(w.Node)
+			if !acquired {
+				m.bootSem.Release(1)
+				continue
+			}
+		}
 		// Capacity before the CAS, so a refusal leaves nothing to roll
 		// back: the row stays Warm and the next tick retries.
 		claim, admitted := m.admitPromotion(ctx, w)
 		if !admitted {
+			releaseWindowsBoot()
 			m.bootSem.Release(1)
 			continue
 		}
@@ -2162,6 +2178,7 @@ func (m *manager) promoteN(ctx context.Context, profile string, n int) {
 		})
 		if err != nil || !ok {
 			claim.release()
+			releaseWindowsBoot()
 			m.bootSem.Release(1)
 			continue
 		}
@@ -2181,6 +2198,7 @@ func (m *manager) promoteN(ctx context.Context, profile string, n int) {
 				}
 			}()
 			defer m.bootSem.Release(1)
+			defer releaseWindowsBoot()
 			m.runBoot(row, claim)
 		}()
 	}
@@ -2271,7 +2289,8 @@ type clonePrep struct {
 	// expectPoweredOff marks the clone's reservation as staying powered
 	// off (warm), so it retires on observation. No-op when admission is
 	// disabled.
-	expectPoweredOff func()
+	expectPoweredOff   func()
+	releaseWindowsBoot func()
 }
 
 // runClone is the body of an async clone goroutine. The caller
@@ -2299,6 +2318,7 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 	}
 	defer prep.cancel()
 	defer prep.span.End()
+	defer prep.releaseWindowsBoot()
 
 	// Snapshot-rollback mode clones NEVER auto-start: the clean
 	// snapshot must be taken while the VM is still stopped, before the
@@ -2455,9 +2475,29 @@ func (m *manager) prepareClone(profile string, kind store.PoolKind, poweredOn bo
 		return nil
 	}
 
+	releaseWindowsBoot := func() {}
+	if poweredOn && ps.settings.GuestOS == "windows" {
+		var ok bool
+		releaseWindowsBoot, ok = m.cfg.WindowsBootBudget.tryAcquire(node)
+		if !ok {
+			claim.release()
+			span.End()
+			cancel()
+			return nil
+		}
+	}
+
+	bootHandedOff := false
+	defer func() {
+		if !bootHandedOff {
+			releaseWindowsBoot()
+		}
+	}()
+
 	vmid, name, templateVMID, templateClass, err := m.allocateVMIDAndInsertRow(ctx, ps, kind, node)
 	if err != nil {
 		m.log.Warn("clone: allocate/insert failed", "profile", profileName, "err", err)
+		releaseWindowsBoot()
 		claim.release()
 		span.End()
 		cancel()
@@ -2498,8 +2538,9 @@ func (m *manager) prepareClone(profile string, kind store.PoolKind, poweredOn bo
 		kind:          kind,
 		poweredOn:     poweredOn,
 
-		releaseCapacity:  claim.release,
-		expectPoweredOff: claim.expectPoweredOff,
+		releaseCapacity:    claim.release,
+		expectPoweredOff:   claim.expectPoweredOff,
+		releaseWindowsBoot: releaseWindowsBoot,
 	}
 
 	// Allocate a static IP (if the profile's IPAM is non-noop)
@@ -2517,6 +2558,7 @@ func (m *manager) prepareClone(profile string, kind store.PoolKind, poweredOn bo
 		// Row exists; the standard failure path marks it Destroying
 		// and queues a destroy (which releases the IPAM lease — safe
 		// because Release is idempotent and nothing was allocated).
+		releaseWindowsBoot()
 		m.handleCloneFailure(prep, err, "ipam")
 		span.End()
 		cancel()
@@ -2525,6 +2567,7 @@ func (m *manager) prepareClone(profile string, kind store.PoolKind, poweredOn bo
 	if ipAssignment != "" {
 		prep.ipConfig = "ip=" + ipAssignment
 	}
+	bootHandedOff = true
 	return prep
 }
 

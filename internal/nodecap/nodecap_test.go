@@ -1409,3 +1409,21 @@ func TestNodeStateLaunchVCPUs(t *testing.T) {
 	require.Equal(t, 1, usage.LaunchVCPUs(Shape{VCPUs: 1}), "capped at a smaller core count")
 	require.Equal(t, 2, usage.LaunchVCPUs(Shape{}), "unset cores take the launch footprint")
 }
+
+// A cached observation of a previously-running recycled VM cannot retire a
+// reservation made after that observation. Repeated admission against the
+// same snapshot must continue to account for the newly reserved start.
+func TestHostModeCachedRunningObservationDoesNotEraseNewReservation(t *testing.T) {
+	rs := newResourceServer(t, []map[string]any{nodeRow("pve1", 32*gib, 16), guestRow(10001, "pve1", 8*gib, 4)})
+	rs.setNodeStatus("pve1", 12*gib, 32*gib)
+	a := newAccountant(t, rs, func(o *Options) { o.MemoryMode = MemoryModeHostAvailable; o.ReserveBytes = 0 })
+	ctx := context.Background()
+	_, ok, err := a.ReserveExisting(ctx, "pve1", Shape{MemoryBytes: 8 * gib}, 10001)
+	require.NoError(t, err)
+	require.True(t, ok)
+	for i := 0; i < 3; i++ {
+		_, ok, err = a.Reserve(ctx, "pve1", Shape{MemoryBytes: 8 * gib})
+		require.NoError(t, err)
+		require.False(t, ok, "cached running observation must not erase post-snapshot claim")
+	}
+}

@@ -92,3 +92,17 @@ installation-token fetch and subsequent REST calls (typically
 
 Leave all of these empty when running against github.com — the default
 per-scope URL derivation already targets the right endpoint.
+
+### Windows boot pacing
+
+`pool.windows_boots_per_node` limits concurrent Windows VM cold starts and
+warm promotions on each node, shared across scale sets in this process. Set it
+to `2` as a conservative starting point. The default `0` disables the limit
+for backwards compatibility. It does not change runner caps or Linux starts.
+A slot is held from before the clone or promotion until guest-agent readiness
+or failure. Guest-agent readiness is not full Windows boot completion, and
+this limit does not by itself guarantee host memory remains available as guests
+grow. Capacity admission and a suitable host memory reserve remain necessary.
+The budget is process-local, not a distributed lock between independent
+orchestrator deployments. Saturated work retries on later reconcile passes;
+this is not a strict FIFO or starvation-freedom guarantee.

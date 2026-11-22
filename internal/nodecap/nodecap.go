@@ -389,6 +389,7 @@ type reservation struct {
 	// snapshot already reflects the freed memory and crediting again
 	// would double-count).
 	freeing  []int
+	created  time.Time
 	expires  time.Time
 	released bool
 	acct     *Accountant
@@ -517,6 +518,7 @@ func (a *Accountant) ReserveFreeing(ctx context.Context, node string, shape Shap
 		node:    node,
 		shape:   shape,
 		freeing: append([]int(nil), freeing...),
+		created: time.Now(),
 		expires: time.Now().Add(a.opts.ReservationTTL),
 		acct:    a,
 	}
@@ -563,6 +565,7 @@ func (a *Accountant) ReserveExisting(ctx context.Context, node string, shape Sha
 		node:    node,
 		shape:   shape,
 		vmid:    vmid,
+		created: time.Now(),
 		expires: time.Now().Add(a.opts.ReservationTTL),
 		acct:    a,
 	}
@@ -668,7 +671,7 @@ func (a *Accountant) stateLocked(snap *snapshot, node string) NodeState {
 			continue
 		}
 		observedVCPU := 0
-		if r.vmid != 0 && (!a.cpuUsageMode() || snap.guestPowered[r.vmid]) {
+		if r.vmid != 0 && (!a.cpuUsageMode() || (snap.takenAt.After(r.created) && snap.guestPowered[r.vmid])) {
 			observedVCPU = snap.guestVCPU[r.vmid]
 		}
 		if launch := a.launchVCPUs(r.shape); launch > observedVCPU {
@@ -775,7 +778,7 @@ func (a *Accountant) holdsAndCreditsLocked(snap *snapshot, node string) (holds, 
 		observed := uint64(0)
 		if r.vmid != 0 {
 			observed = snap.guestMem[r.vmid]
-			if a.isHostMode() && !snap.guestPowered[r.vmid] {
+			if a.isHostMode() && (!snap.takenAt.After(r.created) || !snap.guestPowered[r.vmid]) {
 				// A powered-off guest's configured RAM is not in the node's
 				// live available-memory reading, so treat the reservation as fully
 				// withheld until its guest powers on and the fresh reading
@@ -941,7 +944,7 @@ func (a *Accountant) sweepLocked(snap *snapshot) {
 			// A powered-off guest's configured RAM never reached that reading,
 			// so retiring now would stop withholding RAM the host is not yet
 			// spending.
-			retired = retired && snap.guestPowered[r.vmid]
+			retired = retired && snap.takenAt.After(r.created) && snap.guestPowered[r.vmid]
 		}
 		if retired {
 			r.released = true

@@ -617,13 +617,14 @@ const (
 // when set, caps the sum of per-profile MaxConcurrentRunners so an
 // operator can put a fleet-wide ceiling above the per-profile arithmetic.
 type PoolConfig struct {
-	HotSize           int      `yaml:"hot_size" validate:"gte=0,lte=1000000"`
-	WarmSize          int      `yaml:"warm_size" validate:"gte=0,lte=1000000"`
-	GlobalMax         int      `yaml:"global_max" validate:"gte=0,lte=1000000"`
-	ReconcileInterval Duration `yaml:"reconcile_interval"`
-	VMMaxAge          Duration `yaml:"vm_max_age"`
-	DrainTimeout      Duration `yaml:"drain_timeout"`
-	BootMaxAttempts   int      `yaml:"boot_max_attempts" validate:"gte=1"`
+	WindowsBootsPerNode int      `yaml:"windows_boots_per_node" validate:"gte=0"`
+	HotSize             int      `yaml:"hot_size" validate:"gte=0,lte=1000000"`
+	WarmSize            int      `yaml:"warm_size" validate:"gte=0,lte=1000000"`
+	GlobalMax           int      `yaml:"global_max" validate:"gte=0,lte=1000000"`
+	ReconcileInterval   Duration `yaml:"reconcile_interval"`
+	VMMaxAge            Duration `yaml:"vm_max_age"`
+	DrainTimeout        Duration `yaml:"drain_timeout"`
+	BootMaxAttempts     int      `yaml:"boot_max_attempts" validate:"gte=1"`
 
 	// PowerPollInterval is how often the manager polls Proxmox for the
 	// power state of Assigned/Running VMs. When a row's VM is observed
