@@ -429,6 +429,24 @@ func (s *Store) Update(vmid int, mutate func(*VM)) (*VM, error) {
 	return row.Clone(), nil
 }
 
+// UpdateIf checks and changes a row in the same write transaction.
+func (s *Store) UpdateIf(vmid int, predicate func(*VM) bool, mutate func(*VM)) (bool, error) {
+	txn := s.db.Txn(true)
+	defer txn.Abort()
+	raw, err := txn.First(tableVM, "id", vmid)
+	if err != nil {
+		return false, fmt.Errorf("store: conditional lookup %d: %w", vmid, err)
+	}
+	if raw == nil || !predicate(raw.(*VM).Clone()) {
+		return false, nil
+	}
+	if _, err := updateInTxn(txn, vmid, mutate); err != nil {
+		return false, err
+	}
+	txn.Commit()
+	return true, nil
+}
+
 // UpdateState atomically transitions a row from `from` to `to`. Returns
 // (true, nil) if the transition was applied, (false, nil) if the current
 // state doesn't match `from` (the typical CAS-lost outcome), or

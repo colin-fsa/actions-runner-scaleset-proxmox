@@ -2130,7 +2130,7 @@ func (m *manager) recycleOldVMs(profile string, maxAge time.Duration) {
 // the destroy path instead of pinning the row (and its VMID) forever.
 func (m *manager) sweepStuckRows() {
 	const stuckGrace = 5 * time.Minute
-	stuckCutoff := time.Now().Add(-stuckGrace)
+	now := time.Now()
 	stuckCandidates, err := m.store.ListByState(
 		store.StateProvisioning, store.StateBooting,
 		store.StateRecycling,
@@ -2140,17 +2140,33 @@ func (m *manager) sweepStuckRows() {
 		return
 	}
 	for _, s := range stuckCandidates {
-		if !s.UpdatedAt.Before(stuckCutoff) {
-			continue
-		}
-		m.log.Warn("sweep: row stuck in transient state; re-queueing for destroy",
-			"vmid", s.VMID, "state", s.State, "age", time.Since(s.UpdatedAt))
-		if _, err := m.store.Update(s.VMID, func(v *store.VM) {
-			v.State = store.StateDraining
-			v.StateSince = time.Now()
-		}); err == nil {
-			m.destroyAsync(s.VMID, s.Node, s.Profile)
-		}
+		m.sweepStuckCandidate(s, now, stuckGrace)
+	}
+}
+
+func (m *manager) sweepStuckCandidate(s *store.VM, now time.Time, grace time.Duration) {
+	if !s.UpdatedAt.Before(now.Add(-grace)) {
+		return
+	}
+	if (s.State == store.StateProvisioning || s.State == store.StateBooting) && s.StartWorkerDeadline.After(now) {
+		return
+	}
+	ok, err := m.store.UpdateIf(s.VMID, func(v *store.VM) bool {
+		return v.State == s.State && v.CreatedAt.Equal(s.CreatedAt) && v.StateSince.Equal(s.StateSince) && v.UpdatedAt.Equal(s.UpdatedAt) && v.StartWorkerDeadline.Equal(s.StartWorkerDeadline)
+	}, func(v *store.VM) { v.State = store.StateDraining; v.StateSince = time.Now() })
+	if err == nil && ok {
+		m.log.Warn("sweep: row stuck in transient state; re-queueing for destroy", "vmid", s.VMID, "state", s.State, "age", time.Since(s.UpdatedAt))
+		m.destroyAsync(s.VMID, s.Node, s.Profile)
+	}
+}
+
+// clearStartWorker clears only the worker generation that is finishing.
+func (m *manager) clearStartWorker(vmid int, createdAt, deadline time.Time) {
+	_, err := m.store.UpdateIf(vmid, func(v *store.VM) bool {
+		return v.CreatedAt.Equal(createdAt) && v.StartWorkerDeadline.Equal(deadline)
+	}, func(v *store.VM) { v.StartWorkerDeadline = time.Time{} })
+	if err != nil {
+		m.log.Warn("clear start worker failed", "vmid", vmid, "err", err)
 	}
 }
 
@@ -2215,21 +2231,32 @@ func (m *manager) promoteN(ctx context.Context, profile string, n int) {
 			continue
 		}
 		// CAS warm -> booting; if lost, hand back the slot and the claim.
-		ok, err := m.store.UpdateState(w.VMID, store.StateWarm, store.StateBooting, func(v *store.VM) {
+		bootCtx, bootCancel := context.WithTimeout(m.workerCtx, 5*time.Minute)
+		deadline, _ := bootCtx.Deadline()
+		ok, err := m.store.UpdateIf(w.VMID, func(v *store.VM) bool {
+			return v.State == store.StateWarm && v.CreatedAt.Equal(w.CreatedAt) && v.StateSince.Equal(w.StateSince)
+		}, func(v *store.VM) {
+			v.State = store.StateBooting
+			v.StateSince = time.Now()
+			v.StartWorkerDeadline = deadline
 			v.PoolKind = store.PoolKindHot // promoted to hot budget
 		})
 		if err != nil || !ok {
+			bootCancel()
 			claim.release()
 			releaseWindowsBoot()
 			m.bootSem.Release(1)
 			continue
 		}
 		row := w
+		row.StartWorkerDeadline = deadline
 		m.wg.Add(1)
 		// runBoot derives its own context from m.workerCtx; the caller's
 		// ctx is for the reconcile tick, not the boot lifetime.
 		go func() { //nolint:contextcheck // boot outlives the reconcile-tick ctx
 			defer m.wg.Done()
+			defer bootCancel()
+			defer m.clearStartWorker(row.VMID, row.CreatedAt, deadline)
 			defer func() {
 				if r := recover(); r != nil {
 					// Whether or not the VM started, nothing will retire this
@@ -2241,7 +2268,7 @@ func (m *manager) promoteN(ctx context.Context, profile string, n int) {
 			}()
 			defer m.bootSem.Release(1)
 			defer releaseWindowsBoot()
-			m.runBoot(row, claim)
+			m.runBoot(bootCtx, row, deadline, claim)
 		}()
 	}
 }
@@ -2296,6 +2323,8 @@ func (m *manager) kickClone(ctx context.Context, profile string, kind store.Pool
 // (handleCloneFailure) parameterless beyond the prep itself.
 type clonePrep struct {
 	ctx           context.Context
+	createdAt     time.Time
+	deadline      time.Time
 	cancel        context.CancelFunc
 	span          trace.Span
 	ps            *profileState
@@ -2362,6 +2391,7 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 	defer prep.cancel()
 	defer prep.span.End()
 	defer prep.releaseWindowsBoot()
+	defer m.clearStartWorker(prep.vmid, prep.createdAt, prep.deadline)
 
 	// Snapshot-rollback mode clones NEVER auto-start: the clean
 	// snapshot must be taken while the VM is still stopped, before the
@@ -2428,24 +2458,31 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 	if prep.poweredOn {
 		target = store.StateBooting
 	}
-	updated, err := m.store.Update(prep.vmid, func(v *store.VM) {
+	transitioned, err := m.store.UpdateIf(prep.vmid, func(v *store.VM) bool {
+		return v.State == store.StateProvisioning && v.CreatedAt.Equal(prep.createdAt) && v.StartWorkerDeadline.Equal(prep.deadline)
+	}, func(v *store.VM) {
 		v.State = target
 		v.StateSince = time.Now()
 		v.HasRecycleSnapshot = hasSnapshot
 	})
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			// Row was deleted while Clone was in flight — typically by
-			// admin ForceDestroy or a stuck-state sweep that didn't see
-			// the in-flight clone. The Proxmox VM is real; without an
-			// immediate destroy it lives until sweepProxmoxOrphans picks
-			// it up (OrphanGrace + reconcile tick). Destroy it now.
-			m.log.Info("clone: row deleted mid-clone, destroying orphan vm",
-				"vmid", prep.vmid, "node", prep.node)
-			m.destroyOrSyncFallback(prep.vmid, prep.node, prep.profileName)
+	if err != nil || !transitioned {
+		if !transitioned && err == nil {
+			// Reserve a missing VMID with a destroying tombstone before
+			// cleaning the clone. If another generation owns the ID, the
+			// insert fails and its VM must be left alone.
+			tombstone := &store.VM{VMID: prep.vmid, Node: prep.node, Name: prep.name,
+				Profile: prep.profileName, PoolKind: prep.kind, State: store.StateDestroying, CreatedAt: prep.createdAt}
+			if insertErr := m.store.Insert(tombstone); insertErr == nil {
+				m.log.Info("clone: row vanished; destroying orphan vm", "vmid", prep.vmid, "node", prep.node)
+				m.destroyOrSyncFallback(prep.vmid, prep.node, prep.profileName)
+			}
 			return
 		}
 		m.log.Warn("clone: update row state failed", "vmid", prep.vmid, "err", err)
+		return
+	}
+	updated, err := m.store.Get(prep.vmid)
+	if err != nil {
 		return
 	}
 
@@ -2481,7 +2518,7 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 				return
 			}
 		}
-		m.runBootInline(prep.ctx, pv, updated)
+		m.runBootInline(prep.ctx, pv, updated, prep.deadline)
 	}
 	m.SignalRefill()
 }
@@ -2544,7 +2581,9 @@ func (m *manager) prepareClone(profile string, kind store.PoolKind, poweredOn bo
 		}
 	}()
 
-	vmid, name, templateVMID, templateClass, err := m.allocateVMIDAndInsertRow(ctx, ps, kind, node)
+	createdAt := time.Now()
+	deadline, _ := ctx.Deadline()
+	vmid, name, templateVMID, templateClass, err := m.allocateVMIDAndInsertRow(ctx, ps, kind, node, createdAt, deadline)
 	if err != nil {
 		m.log.Warn("clone: allocate/insert failed", "profile", profileName, "err", err)
 		releaseWindowsBoot()
@@ -2553,6 +2592,12 @@ func (m *manager) prepareClone(profile string, kind store.PoolKind, poweredOn bo
 		cancel()
 		return nil
 	}
+	workerHandedOff := false
+	defer func() {
+		if !workerHandedOff {
+			m.clearStartWorker(vmid, createdAt, deadline)
+		}
+	}()
 	// The Provisioning row now carries this dispatch's headroom; drop
 	// the reservation so the reconciler counts it exactly once.
 	rowInserted()
@@ -2576,6 +2621,8 @@ func (m *manager) prepareClone(profile string, kind store.PoolKind, poweredOn bo
 
 	prep := &clonePrep{
 		ctx:           ctx,
+		createdAt:     createdAt,
+		deadline:      deadline,
 		cancel:        cancel,
 		span:          span,
 		ps:            ps,
@@ -2619,6 +2666,7 @@ func (m *manager) prepareClone(profile string, kind store.PoolKind, poweredOn bo
 		prep.ipConfig = "ip=" + ipAssignment
 	}
 	bootHandedOff = true
+	workerHandedOff = true
 	return prep
 }
 
@@ -2629,7 +2677,7 @@ func (m *manager) prepareClone(profile string, kind store.PoolKind, poweredOn bo
 // only for the duration of this helper — IPAM and Proxmox calls
 // happen outside the lock. The defer guarantees release even on
 // panic, which would otherwise wedge every subsequent clone.
-func (m *manager) allocateVMIDAndInsertRow(ctx context.Context, ps *profileState, kind store.PoolKind, node string) (vmid int, name string, templateVMID int, templateClass string, err error) {
+func (m *manager) allocateVMIDAndInsertRow(ctx context.Context, ps *profileState, kind store.PoolKind, node string, createdAt, deadline time.Time) (vmid int, name string, templateVMID int, templateClass string, err error) {
 	m.allocMu.Lock()
 	defer m.allocMu.Unlock()
 
@@ -2653,13 +2701,15 @@ func (m *manager) allocateVMIDAndInsertRow(ctx context.Context, ps *profileState
 		}
 	}
 	row := &store.VM{
-		VMID:     vmid,
-		Node:     node,
-		Name:     name,
-		Profile:  ps.settings.Name,
-		Template: templateClass,
-		PoolKind: kind,
-		State:    store.StateProvisioning,
+		VMID:                vmid,
+		Node:                node,
+		Name:                name,
+		Profile:             ps.settings.Name,
+		Template:            templateClass,
+		PoolKind:            kind,
+		State:               store.StateProvisioning,
+		CreatedAt:           createdAt,
+		StartWorkerDeadline: deadline,
 	}
 	if err := m.store.Insert(row); err != nil {
 		return 0, "", 0, "", fmt.Errorf("create row: %w", err)
@@ -2685,23 +2735,25 @@ func (m *manager) handleCloneFailure(prep *clonePrep, err error, op string) {
 	// the capacity claim must go back to the pool rather than wait out
 	// its TTL.
 	prep.releaseCapacity()
-	if _, updErr := m.store.Update(prep.vmid, func(v *store.VM) {
+	ok, updErr := m.store.UpdateIf(prep.vmid, func(v *store.VM) bool {
+		return v.State == store.StateProvisioning && v.CreatedAt.Equal(prep.createdAt) && v.StartWorkerDeadline.Equal(prep.deadline)
+	}, func(v *store.VM) {
 		v.State = store.StateDestroying
 		v.StateSince = time.Now()
-	}); updErr != nil {
+	})
+	if updErr != nil {
 		m.log.Warn("clone: mark destroying failed", "vmid", prep.vmid, "op", op, "err", updErr)
 	}
-	m.destroyOrSyncFallback(prep.vmid, prep.node, prep.profileName)
+	if ok {
+		m.destroyOrSyncFallback(prep.vmid, prep.node, prep.profileName)
+	}
 }
 
 // runBoot is the body of a warm->hot promotion goroutine. claim is the
 // promotion's capacity reservation (inert when admission is disabled).
-// A successful start keeps it — the accountant retires it once the
-// powered-on guest shows up in its reading — while a failed start
-// releases it, because the VM never consumed the memory.
-func (m *manager) runBoot(row *store.VM, claim capacityClaim) {
-	ctx, cancel := context.WithTimeout(m.workerCtx, 5*time.Minute)
-	defer cancel()
+// An issued start keeps its capacity claim through the settling period,
+// even on an ambiguous error; failures before issuance release it.
+func (m *manager) runBoot(ctx context.Context, row *store.VM, deadline time.Time, claim capacityClaim) {
 	pv := &provisioner.VM{VMID: row.VMID, Node: row.Node, Name: row.Name, Profile: row.Profile}
 	startTime := time.Now()
 	err := m.cfg.WindowsBootBudget.pace(ctx, row.Node)
@@ -2724,12 +2776,12 @@ func (m *manager) runBoot(row *store.VM, claim capacityClaim) {
 		m.markPoisonOrDestroy(row)
 		return
 	}
-	m.runBootInline(ctx, pv, row)
+	m.runBootInline(ctx, pv, row, deadline)
 }
 
 // runBootInline waits for the guest agent and transitions Booting → Hot.
 // Shared by the clone(poweredOn=true) and warm-promotion paths.
-func (m *manager) runBootInline(ctx context.Context, pv *provisioner.VM, row *store.VM) {
+func (m *manager) runBootInline(ctx context.Context, pv *provisioner.VM, row *store.VM, deadline time.Time) {
 	ctx, span := tracer.Start(ctx, "pool.runBoot", trace.WithAttributes(
 		attribute.Int("vm.id", row.VMID),
 		attribute.String("vm.node", row.Node),
@@ -2750,7 +2802,9 @@ func (m *manager) runBootInline(ctx context.Context, pv *provisioner.VM, row *st
 	if m.metrics != nil {
 		m.metrics.BootDuration.WithLabelValues(m.cfg.ScaleSetName, row.Profile, row.Node).Observe(time.Since(bootStart).Seconds())
 	}
-	if _, err := m.store.Update(row.VMID, func(v *store.VM) {
+	if _, err := m.store.UpdateIf(row.VMID, func(v *store.VM) bool {
+		return v.State == store.StateBooting && v.CreatedAt.Equal(row.CreatedAt) && v.StartWorkerDeadline.Equal(deadline)
+	}, func(v *store.VM) {
 		v.State = store.StateHot
 		v.StateSince = time.Now()
 	}); err != nil {
@@ -2767,61 +2821,45 @@ func (m *manager) runBootInline(ctx context.Context, pv *provisioner.VM, row *st
 // rows whose profile no longer exists in config fall back to the
 // fleet-wide cfg value.
 func (m *manager) markPoisonOrDestroy(row *store.VM) {
-	updated, err := m.store.Update(row.VMID, func(v *store.VM) {
+	threshold := m.cfg.BootMaxAttempts
+	if ps := m.profileOf(row.Profile); ps != nil {
+		threshold = ps.settings.BootMaxAttempts
+	}
+	var attempts int
+	var poison bool
+	ok, err := m.store.UpdateIf(row.VMID, func(v *store.VM) bool {
+		return v.State == store.StateBooting && v.CreatedAt.Equal(row.CreatedAt) && v.StartWorkerDeadline.Equal(row.StartWorkerDeadline)
+	}, func(v *store.VM) {
 		v.BootAttempts++
+		attempts = v.BootAttempts
+		poison = attempts >= threshold
+		if poison {
+			v.State = store.StatePoison
+		} else {
+			v.State = store.StateDestroying
+		}
+		v.StateSince = time.Now()
 	})
 	if err != nil {
-		m.log.Warn("poison: inc attempts failed", "vmid", row.VMID, "profile", row.Profile, "err", err)
+		m.log.Warn("poison: transition failed", "vmid", row.VMID, "err", err)
 		return
 	}
-	// Feed the canary controller's failure counter — only fires
-	// when Template was stamped as "candidate" at clone time.
-	// When the cumulative rate trips the operator's threshold the
-	// controller returns true and we emit the
-	// scaleset_canary_reverted_total counter.
-	//
-	// Gate on the 0->1 BootAttempts transition so a clone contributes
-	// at most ONE failure. markPoisonOrDestroy runs once per failed
-	// boot attempt and increments BootAttempts each time, while
-	// RecordClone fires once per clone. Recording on every attempt let
-	// a single bad canary VM add up to BootMaxAttempts failures against
-	// one clone, pushing failures/clones above 1.0 and tripping the
-	// auto-revert far earlier than canary_max_failure_rate intends
-	// (#353).
-	if m.cfg.Canary != nil && row.Template != "" && updated.BootAttempts == 1 {
+	if !ok {
+		return
+	}
+	if m.cfg.Canary != nil && row.Template != "" && attempts == 1 {
 		if reverted := m.cfg.Canary.RecordFailure(row.Profile, canary.Template(row.Template)); reverted {
-			m.log.Warn("canary: auto-reverted percent to 0; investigate canary template",
-				"profile", row.Profile, "vmid", row.VMID)
+			m.log.Warn("canary: auto-reverted percent to 0; investigate canary template", "profile", row.Profile, "vmid", row.VMID)
 			if m.metrics != nil {
 				m.metrics.CanaryReverts.WithLabelValues(m.cfg.ScaleSetName, row.Profile).Inc()
 			}
 		}
 	}
-	threshold := m.cfg.BootMaxAttempts
-	if ps := m.profileOf(row.Profile); ps != nil {
-		threshold = ps.settings.BootMaxAttempts
-	}
-	if updated.BootAttempts >= threshold {
-		if _, updErr := m.store.Update(row.VMID, func(v *store.VM) {
-			v.State = store.StatePoison
-			v.StateSince = time.Now()
-		}); updErr != nil {
-			m.log.Warn("poison: mark poison failed", "vmid", row.VMID, "profile", row.Profile, "err", updErr)
-		}
-		// Page-worthy: a VM has exhausted its boot-retry budget and is
-		// quarantined until an operator triages the underlying failure
-		// (template image regression, networking misconfig, etc.).
-		m.log.Error("vm marked poison; manual intervention required",
-			"vmid", row.VMID, "profile", row.Profile, "attempts", updated.BootAttempts)
+	if poison {
+		m.log.Error("vm marked poison; manual intervention required", "vmid", row.VMID, "profile", row.Profile, "attempts", attempts)
 		return
 	}
-	if _, updErr := m.store.Update(row.VMID, func(v *store.VM) {
-		v.State = store.StateDestroying
-		v.StateSince = time.Now()
-	}); updErr != nil {
-		m.log.Warn("poison: mark destroying failed", "vmid", row.VMID, "profile", row.Profile, "err", updErr)
-	}
-	m.destroyAsync(updated.VMID, updated.Node, updated.Profile)
+	m.destroyAsync(row.VMID, row.Node, row.Profile)
 }
 
 // destroyRequest is the unit of work the destroy dispatcher consumes.

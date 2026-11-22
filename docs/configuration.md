@@ -113,8 +113,13 @@ minutes after the start request, or `clone_inflight_grace` if longer. This is a
 bounded settling assumption, not a measurement of individual guest RAM. It can
 temporarily double count memory that has already appeared in host usage.
 After each leader election, start pacing and host-memory admission pause for
-the same window to let requests from the previous leader settle. Work can wait
-longer than usual after restart. This policy assumes Proxmox start tasks and
+the same window to let requests from the previous leader settle. This initial
+quiet period is intentional even on a fresh controller: with pacing enabled,
+new starts wait at least 15 minutes after election; host-available admission
+also waits when capacity accounting is enabled. Queued work can remain queued
+throughout this period and LXC JIT delivery can wait for the budget, increasing
+listener response time. Plan the isolated canary around that delay rather than
+interpreting it as a failed start. This policy assumes Proxmox start tasks and
 memory ramp complete within that window; raise `clone_inflight_grace` if that
 is not conservative enough. Keep host reserve for other workloads.
 
@@ -140,7 +145,10 @@ Watch `scaleset_pool_size`, `scaleset_acquire_duration_seconds`,
 `scaleset_boot_duration_seconds`, `scaleset_startup_stage_duration_seconds`,
 `scaleset_reconcile_errors_total`, host MemAvailable, Proxmox task timestamps,
 and controller logs for deferred admission, reservation expiry and force
-destroy. Stop the canary if memory pressure, failed jobs, excessive waiting,
+destroy. An offline runner still reported busy is deliberately not reaped;
+watch for `runner offline but still reported busy` warnings and investigate
+these ambiguous cases using authoritative job and runner evidence. Stop the
+canary if memory pressure, failed jobs, excessive waiting,
 or unexpected destroys appear. Roll back by restoring the previous controller
 image and configuration together, then confirm the old leader has stopped and
 inspect in-flight Proxmox tasks before resuming demand. A rollback removes these

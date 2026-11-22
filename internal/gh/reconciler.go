@@ -138,7 +138,8 @@ type Reconciler struct {
 
 	// Offline observations are deliberately process-local: after a restart a
 	// runner must complete a new grace period before it can be reaped.
-	offlineSince map[string]offlineObservation
+	offlineSince       map[string]offlineObservation
+	busyOfflineLastLog map[string]time.Time
 
 	now func() time.Time // injected for tests
 }
@@ -181,6 +182,7 @@ func New(cfg Config, gh *github.Client, p pool.Manager, prov provisioner.Provisi
 		orphanFirstSeen:        make(map[string]time.Time),
 		orphanProxmoxFirstSeen: make(map[int]time.Time),
 		offlineSince:           make(map[string]offlineObservation),
+		busyOfflineLastLog:     make(map[string]time.Time),
 		now:                    time.Now,
 	}, nil
 }
@@ -589,6 +591,14 @@ func (r *Reconciler) applyMatrix(ctx context.Context, rows []pool.RowSnapshot, r
 			continue
 		}
 		gr, present := runners[row.Name]
+		if present && !gr.Unknown && !gr.Online && gr.Busy && (row.State == "assigned" || row.State == "running") {
+			if last, ok := r.busyOfflineLastLog[row.Name]; !ok || now.Sub(last) >= 5*time.Minute {
+				r.log.Warn("reconcile: runner offline but still reported busy; deferring cleanup", "vmid", row.VMID, "runner_id", gr.ID)
+				r.busyOfflineLastLog[row.Name] = now
+			}
+			continue
+		}
+		delete(r.busyOfflineLastLog, row.Name)
 		if present && gr.Online {
 			r.metrics.RunnerObservedOnline(r.cfg.ScaleSetName, row.Name)
 		}
@@ -662,6 +672,18 @@ func (r *Reconciler) applyMatrix(ctx context.Context, rows []pool.RowSnapshot, r
 			delete(r.offlineSince, name)
 		}
 	}
+	for name := range r.busyOfflineLastLog {
+		found := false
+		for _, row := range rows {
+			if row.Name == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			delete(r.busyOfflineLastLog, name)
+		}
+	}
 }
 
 // confirmRunnerState requires a fresh successful listing and an unchanged pool
@@ -672,7 +694,7 @@ func (r *Reconciler) confirmRunnerState(ctx context.Context, row pool.RowSnapsho
 		return false
 	}
 	gr, ok := runners[row.Name]
-	if !ok || gr.ID != id || ghStateLabel(gr, true) != want {
+	if !ok || gr.ID != id || gr.Busy || ghStateLabel(gr, true) != want {
 		return false
 	}
 	rows, err := r.pool.ListRows(ctx)

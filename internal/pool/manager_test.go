@@ -1374,7 +1374,7 @@ func TestMarkPoisonOrDestroy_CanaryFailureCountedOncePerVMID(t *testing.T) {
 		Name:     "cand-broken",
 		Profile:  "p",
 		PoolKind: store.PoolKindWarm,
-		State:    store.StateWarm,
+		State:    store.StateBooting,
 		Template: string(canary.Candidate),
 	}))
 
@@ -1401,6 +1401,10 @@ func TestMarkPoisonOrDestroy_CanaryFailureCountedOncePerVMID(t *testing.T) {
 	require.NoError(t, err)
 	// Three failed boot attempts on the SAME VMID (all sub-threshold).
 	for i := 0; i < 3; i++ {
+		if i > 0 {
+			row, err = st.Update(12000, func(v *store.VM) { v.State = store.StateBooting })
+			require.NoError(t, err)
+		}
 		mgr.markPoisonOrDestroy(row)
 	}
 
@@ -3955,4 +3959,49 @@ func TestComputeCloneNeedsBlocksWhileCleanupPending(t *testing.T) {
 	}
 	hot, _ := computeCloneNeeds(Stats{}, 0, 0, 0, 0, 0, 2, 2, returningCredit{})
 	require.Equal(t, 2, hot, "demand resumes once cleanup actually completes")
+}
+
+func TestStuckSweepHonorsWorkerAndRowGeneration(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Now()
+	old := now.Add(-10 * time.Minute)
+	require.NoError(t, st.Insert(&store.VM{VMID: 21011, Node: "pve1", Name: "gh-runner-test-21011", PoolKind: store.PoolKindHot, State: store.StateBooting, CreatedAt: old, UpdatedAt: old, StateSince: old, StartWorkerDeadline: now.Add(time.Minute)}))
+	fp := &fakeProv{}
+	mgr := newTestManager(t, st, fp, Config{})
+	active, err := st.Get(21011)
+	require.NoError(t, err)
+	mgr.sweepStuckCandidate(active, now, 5*time.Minute)
+	row, err := st.Get(21011)
+	require.NoError(t, err)
+	require.Equal(t, store.StateBooting, row.State)
+	// A stale sweep snapshot cannot clobber the same boot becoming Hot.
+	_, err = st.Update(21011, func(v *store.VM) { v.StartWorkerDeadline = now.Add(-time.Second) })
+	require.NoError(t, err)
+	stale, err := st.Get(21011)
+	require.NoError(t, err)
+	_, err = st.Update(21011, func(v *store.VM) { v.State = store.StateHot })
+	require.NoError(t, err)
+	mgr.sweepStuckCandidate(stale, now.Add(10*time.Minute), 5*time.Minute)
+	row, err = st.Get(21011)
+	require.NoError(t, err)
+	require.Equal(t, store.StateHot, row.State)
+	// A recycled VMID must not match the old worker's snapshot either.
+	require.NoError(t, st.Delete(21011))
+	require.NoError(t, st.Insert(&store.VM{VMID: 21011, Node: "pve1", Name: "gh-runner-test-21011", PoolKind: store.PoolKindHot, State: store.StateHot, CreatedAt: now, UpdatedAt: old, StateSince: old}))
+	mgr.sweepStuckCandidate(stale, now, 5*time.Minute)
+	row, err = st.Get(21011)
+	require.NoError(t, err)
+	require.Equal(t, store.StateHot, row.State)
+	// An expired worker remains eligible for bounded cleanup.
+	require.NoError(t, st.Insert(&store.VM{VMID: 21012, Node: "pve1", Name: "gh-runner-test-21012", PoolKind: store.PoolKindHot, State: store.StateProvisioning, CreatedAt: old, UpdatedAt: old, StateSince: old, StartWorkerDeadline: now.Add(-time.Second)}))
+	expired, err := st.Get(21012)
+	require.NoError(t, err)
+	mgr.sweepStuckCandidate(expired, now, 5*time.Minute)
+	require.Eventually(t, func() bool { fp.mu.Lock(); defer fp.mu.Unlock(); return len(fp.destroys) == 1 }, 2*time.Second, 10*time.Millisecond)
+	// A reconstructed stale row with no local worker is also reaped.
+	require.NoError(t, st.Insert(&store.VM{VMID: 21013, Node: "pve1", Name: "gh-runner-test-21013", PoolKind: store.PoolKindHot, State: store.StateBooting, CreatedAt: old, UpdatedAt: old, StateSince: old}))
+	recovered, err := st.Get(21013)
+	require.NoError(t, err)
+	mgr.sweepStuckCandidate(recovered, now, 5*time.Minute)
+	require.Eventually(t, func() bool { fp.mu.Lock(); defer fp.mu.Unlock(); return len(fp.destroys) == 2 }, 2*time.Second, 10*time.Millisecond)
 }
