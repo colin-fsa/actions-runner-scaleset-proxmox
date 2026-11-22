@@ -1522,7 +1522,7 @@ func TestAdopt_PoweredOff_BecomesWarm(t *testing.T) {
 		listOwnedRet: []*provisioner.VM{{VMID: 12345, Node: "pve1", Name: "gh-runner-test-12345"}},
 		powerStateBy: map[int]string{12345: "stopped"},
 	}
-	mgr := newTestManager(t, st, fp, Config{})
+	mgr := newTestManager(t, st, fp, Config{RunnerLister: func(context.Context) (map[string]RunnerInfo, error) { return map[string]RunnerInfo{}, nil }})
 
 	require.NoError(t, mgr.Adopt(context.Background()))
 
@@ -1671,7 +1671,7 @@ func TestAdopt_OneHungVMDoesNotBlockStartup(t *testing.T) {
 		powerStateHangBy: map[int]bool{10010: true},
 		powerStateBy:     map[int]string{10011: "running"},
 	}
-	mgr := newTestManager(t, st, fp, Config{})
+	mgr := newTestManager(t, st, fp, Config{RunnerLister: func(context.Context) (map[string]RunnerInfo, error) { return map[string]RunnerInfo{}, nil }})
 
 	start := time.Now()
 	require.NoError(t, mgr.Adopt(context.Background()))
@@ -1682,8 +1682,8 @@ func TestAdopt_OneHungVMDoesNotBlockStartup(t *testing.T) {
 	// Hung VM still got adopted, defaulting to Hot.
 	row, err := st.Get(10010)
 	require.NoError(t, err)
-	require.Equal(t, store.StateHot, row.State,
-		"power-state timeout must fall back to Hot, not skip the VM")
+	require.Equal(t, store.StateAssigned, row.State)
+	require.True(t, row.AdoptionProtected)
 	// Fast VM classified normally.
 	row, err = st.Get(10011)
 	require.NoError(t, err)
@@ -1708,7 +1708,8 @@ func TestAdopt_PowerQueryFailure_DefaultsToHot(t *testing.T) {
 
 	row, err := st.Get(10005)
 	require.NoError(t, err)
-	require.Equal(t, store.StateHot, row.State)
+	require.Equal(t, store.StateAssigned, row.State)
+	require.True(t, row.AdoptionProtected)
 	require.Equal(t, store.PoolKindHot, row.PoolKind)
 }
 
@@ -1735,11 +1736,13 @@ func TestAdopt_GitHubListFailure_FallsBackToPowerOnly(t *testing.T) {
 
 	hot, err := st.Get(10006)
 	require.NoError(t, err)
-	require.Equal(t, store.StateHot, hot.State)
+	require.Equal(t, store.StateAssigned, hot.State)
+	require.True(t, hot.AdoptionProtected)
 
 	warm, err := st.Get(10007)
 	require.NoError(t, err)
-	require.Equal(t, store.StateWarm, warm.State)
+	require.Equal(t, store.StateAssigned, warm.State)
+	require.True(t, warm.AdoptionProtected)
 }
 
 // TestAdopt_NilRunnerLister_OK: a nil lister is treated as "GitHub
@@ -1758,7 +1761,8 @@ func TestAdopt_NilRunnerLister_OK(t *testing.T) {
 
 	row, err := st.Get(10008)
 	require.NoError(t, err)
-	require.Equal(t, store.StateHot, row.State)
+	require.Equal(t, store.StateAssigned, row.State)
+	require.True(t, row.AdoptionProtected)
 }
 
 // TestAdopt_NoVMs_IsNoop: a clean startup (no inherited VMs) is a
@@ -3770,8 +3774,9 @@ func TestAdopt_SnapshotRollbackRollsBackStoppedVM(t *testing.T) {
 		powerStateBy: map[int]string{30000: "stopped"},
 	}
 	mgr := newTestManager(t, st, fp, Config{
-		HotSize:     0,
-		RecycleMode: config.RecycleModeSnapshotRollback,
+		HotSize:      0,
+		RecycleMode:  config.RecycleModeSnapshotRollback,
+		RunnerLister: func(context.Context) (map[string]RunnerInfo, error) { return map[string]RunnerInfo{}, nil },
 	})
 
 	require.NoError(t, mgr.Adopt(context.Background()))
@@ -3806,8 +3811,9 @@ func TestAdopt_SnapshotRollbackFailureDestroysStoppedVM(t *testing.T) {
 		rollbackErr:  errors.New("snapshot 'scaleset-clean' does not exist"),
 	}
 	mgr := newTestManager(t, st, fp, Config{
-		HotSize:     0,
-		RecycleMode: config.RecycleModeSnapshotRollback,
+		HotSize:      0,
+		RecycleMode:  config.RecycleModeSnapshotRollback,
+		RunnerLister: func(context.Context) (map[string]RunnerInfo, error) { return map[string]RunnerInfo{}, nil },
 	})
 
 	require.NoError(t, mgr.Adopt(context.Background()))
@@ -3934,7 +3940,7 @@ func TestAdoptWindowsJITReadback(t *testing.T) {
 			st := newTestStore(t)
 			fp := &adoptWindowsProv{fakeProv: &fakeProv{}, jit: tc.jit, readErr: tc.err}
 			mgr := newTestManager(t, st, fp, Config{Profiles: []ProfileSettings{{Name: "win", GuestOS: "windows", MaxConcurrentRunners: 10}}})
-			mgr.adoptOne(context.Background(), &provisioner.VM{VMID: 10001, Node: "pve1", Name: "runner", Profile: "win"}, nil)
+			mgr.adoptOne(context.Background(), &provisioner.VM{VMID: 10001, Node: "pve1", Name: "runner", Profile: "win"}, map[string]RunnerInfo{})
 			row, err := st.Get(10001)
 			require.NoError(t, err)
 			require.Equal(t, tc.state, row.State)
@@ -3946,7 +3952,7 @@ func TestAdoptStoppedWindowsDestroysUnverifiedDisk(t *testing.T) {
 	st := newTestStore(t)
 	fp := &fakeProv{powerStateBy: map[int]string{10001: "stopped"}}
 	mgr := newTestManager(t, st, fp, Config{Profiles: []ProfileSettings{{Name: "win", GuestOS: "windows", MaxConcurrentRunners: 10}}})
-	mgr.adoptOne(context.Background(), &provisioner.VM{VMID: 10001, Node: "pve1", Name: "runner", Profile: "win"}, nil)
+	mgr.adoptOne(context.Background(), &provisioner.VM{VMID: 10001, Node: "pve1", Name: "runner", Profile: "win"}, map[string]RunnerInfo{})
 	require.Eventually(t, func() bool { fp.mu.Lock(); defer fp.mu.Unlock(); return len(fp.destroys) > 0 }, time.Second, time.Millisecond)
 }
 
@@ -4004,4 +4010,44 @@ func TestStuckSweepHonorsWorkerAndRowGeneration(t *testing.T) {
 	require.NoError(t, err)
 	mgr.sweepStuckCandidate(recovered, now, 5*time.Minute)
 	require.Eventually(t, func() bool { fp.mu.Lock(); defer fp.mu.Unlock(); return len(fp.destroys) == 2 }, 2*time.Second, 10*time.Millisecond)
+}
+
+func TestAdoptPausedBusyPreservesGuestUntilJobAndPowerResolve(t *testing.T) {
+	st := newTestStore(t)
+	const vmid = 30101
+	const runnerID int64 = 4123
+	name := "gh-runner-test-30101"
+	fp := &fakeProv{listOwnedRet: []*provisioner.VM{{VMID: vmid, Node: "pve1", Name: name, Profile: "win"}}, powerStateBy: map[int]string{vmid: "paused"}}
+	var busy atomic.Bool
+	busy.Store(true)
+	mgr := newTestManager(t, st, fp, Config{
+		RecycleMode: config.RecycleModeSnapshotRollback,
+		Profiles:    []ProfileSettings{{Name: "win", GuestOS: "windows", MaxConcurrentRunners: 10}},
+		RunnerLister: func(context.Context) (map[string]RunnerInfo, error) {
+			return map[string]RunnerInfo{name: {ID: runnerID, Online: false, Busy: busy.Load()}}, nil
+		},
+	})
+	require.NoError(t, mgr.Adopt(context.Background()))
+	row, err := st.Get(vmid)
+	require.NoError(t, err)
+	require.Equal(t, store.StateRunning, row.State)
+	require.True(t, row.AdoptionProtected)
+	require.Equal(t, runnerID, row.RunnerID)
+	_, err = st.Update(vmid, func(v *store.VM) { v.StateSince = v.StateSince.Add(time.Second) })
+	require.NoError(t, err)
+	mgr.completeProtectedAdoption(row) // stale observation must lose the CAS
+	mgr.powerPollOnce(context.Background())
+	fp.mu.Lock()
+	require.Empty(t, fp.rollbacks)
+	require.Empty(t, fp.destroys)
+	fp.powerStateBy[vmid] = "stopped"
+	fp.mu.Unlock()
+	mgr.powerPollOnce(context.Background())
+	row, err = st.Get(vmid)
+	require.NoError(t, err)
+	require.True(t, row.AdoptionProtected, "even stopped cannot override a busy runner")
+	busy.Store(false)
+	mgr.adoptionNextCheck = time.Time{}
+	mgr.powerPollOnce(context.Background())
+	require.Eventually(t, func() bool { fp.mu.Lock(); defer fp.mu.Unlock(); return len(fp.rollbacks) == 1 }, 2*time.Second, 10*time.Millisecond)
 }

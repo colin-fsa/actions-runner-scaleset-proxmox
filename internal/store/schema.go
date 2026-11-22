@@ -110,6 +110,9 @@ type VM struct {
 	HasRecycleSnapshot bool
 	JITPending         bool
 	JITAssignedAt      time.Time
+	// AdoptionProtected prevents cleanup or reuse while restart observations
+	// cannot establish that an inherited guest's job is no longer busy.
+	AdoptionProtected bool
 	// StartWorkerDeadline is set atomically with Provisioning/Booting while
 	// the local clone or boot worker owns the row. The in-memory store is
 	// rebuilt on restart; a zero value denotes no tracked worker.

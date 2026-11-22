@@ -807,7 +807,9 @@ func runOneScaleset(leaderCtx context.Context, deps runOneScalesetDeps, entry co
 	}()
 
 	if err := mgr.Adopt(leaderCtx); err != nil {
-		log.Warn("adopt: list-owned-vms failed; starting with empty pool", "scaleset", entry.Name, "err", err)
+		// An empty store after failed discovery makes live guests look like
+		// orphans. Let the supervisor retry adoption before any sweeper runs.
+		return fmt.Errorf("adopt inherited guests: %w", err)
 	}
 	health.MarkScalesetRecoveryDone(entry.Name)
 	health.MarkProxmoxOK()

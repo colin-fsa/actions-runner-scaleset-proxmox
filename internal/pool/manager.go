@@ -379,6 +379,8 @@ type manager struct {
 	// the real signal). Only the power-poll goroutine touches this
 	// map, so no synchronisation is needed.
 	powerPollErrLastLog map[int]time.Time
+	// Only the power-poll goroutine touches this throttle.
+	adoptionNextCheck time.Time
 }
 
 // normaliseProfiles returns the profile slice the manager will
@@ -957,7 +959,7 @@ func (m *manager) ForceDestroyUnchanged(_ context.Context, expected RowSnapshot,
 	matched := false
 	row, err := m.store.Update(expected.VMID, func(v *store.VM) {
 		if v.Name != expected.Name || string(v.State) != expected.State || v.JobID != expected.JobID ||
-			v.RunnerID != expected.RunnerID || v.JITPending || !v.CreatedAt.Equal(expected.CreatedAt) || !v.StateSince.Equal(expected.StateSince) {
+			v.RunnerID != expected.RunnerID || v.JITPending || v.AdoptionProtected || !v.CreatedAt.Equal(expected.CreatedAt) || !v.StateSince.Equal(expected.StateSince) {
 			return
 		}
 		matched = true
@@ -996,10 +998,16 @@ func (m *manager) Preempt(_ context.Context, vmid int, reason string) error {
 		}
 		return fmt.Errorf("preempt: lookup: %w", err)
 	}
+	if target.AdoptionProtected {
+		return fmt.Errorf("%w: vmid %d is protected during ambiguous adoption", ErrPreemptRefused, vmid)
+	}
 	if target.State != store.StateAssigned {
 		return fmt.Errorf("%w: vmid %d is in state %s", ErrPreemptRefused, vmid, target.State)
 	}
-	ok, err := m.store.UpdateState(vmid, store.StateAssigned, store.StateDraining, func(v *store.VM) {
+	ok, err := m.store.UpdateIf(vmid, func(v *store.VM) bool {
+		return v.State == store.StateAssigned && !v.AdoptionProtected && v.CreatedAt.Equal(target.CreatedAt) && v.StateSince.Equal(target.StateSince)
+	}, func(v *store.VM) {
+		v.State = store.StateDraining
 		v.StateSince = time.Now()
 	})
 	if err != nil {
@@ -1054,17 +1062,18 @@ func (m *manager) ListRows(_ context.Context) ([]RowSnapshot, error) {
 	out := make([]RowSnapshot, 0, len(rows))
 	for _, r := range rows {
 		out = append(out, RowSnapshot{
-			VMID:         r.VMID,
-			Node:         r.Node,
-			Name:         r.Name,
-			Profile:      r.Profile,
-			State:        string(r.State),
-			JobID:        r.JobID,
-			RunnerID:     r.RunnerID,
-			RecycleCount: r.RecycleCount,
-			StateSince:   r.StateSince,
-			CreatedAt:    r.CreatedAt,
-			JITPending:   r.JITPending,
+			VMID:              r.VMID,
+			Node:              r.Node,
+			Name:              r.Name,
+			Profile:           r.Profile,
+			State:             string(r.State),
+			JobID:             r.JobID,
+			RunnerID:          r.RunnerID,
+			RecycleCount:      r.RecycleCount,
+			StateSince:        r.StateSince,
+			CreatedAt:         r.CreatedAt,
+			JITPending:        r.JITPending,
+			AdoptionProtected: r.AdoptionProtected,
 		})
 	}
 	return out, nil
@@ -1196,23 +1205,20 @@ func (m *manager) shouldRecycle(row *store.VM) bool {
 // for every owner-tagged VM the previous leader (or this process's
 // prior incarnation) left behind. The classification matrix is:
 //
-//	power=stopped                          → Warm   / PoolKindWarm
+//	power=stopped, runner known nonbusy or absent → Warm / PoolKindWarm
 //	power=running, no GitHub runner        → Hot    / PoolKindHot
 //	power=running, runner busy             → Running  / PoolKindHot (with RunnerID)
 //	power=running, runner online & idle    → Assigned / PoolKindHot (with RunnerID)
 //	power=running, runner offline          → Assigned / PoolKindHot (with RunnerID)
-//	power query failed                     → Hot    / PoolKindHot (safe fallback)
+//	busy or ambiguous power/runner data   → protected Assigned/Running
 //
 // The gh.Reconciler's matrix converges any misclassifications on its
 // next tick (Hot+busy → promote to Running, Assigned/Running grace
 // timers, etc.), so adoption only needs to be approximately right.
 //
-// Best-effort by design: a per-VM PowerState or store.Insert failure
-// is logged and the loop continues. The whole-pass error is returned
-// only when ListOwnedVMs itself fails — Proxmox is unreachable, no
-// classification is possible. The caller (app.runLeaderPlane) logs
-// and continues with an empty pool; the orphan-sweep in gh.Reconciler
-// will reap any stranded VMs once Proxmox recovers.
+// Power-state errors result in protected rows. Discovery or insertion
+// failures abort adoption; the caller retries before starting orphan
+// sweeps, so inherited guests are not mistaken for orphans.
 //
 // JobID is intentionally left 0: we don't know which GitHub job an
 // in-flight runner is executing, and the power-poller / reconciler
@@ -1223,21 +1229,21 @@ func (m *manager) Adopt(ctx context.Context) error {
 		return fmt.Errorf("adopt: list owned vms: %w", err)
 	}
 
-	// Best-effort GitHub runner snapshot. A whole-pass failure here is
-	// non-fatal: power-state-only classification still preserves every
-	// inherited VM; the next gh.Reconciler tick reclassifies Hot rows
-	// whose runners turn out to be busy.
+	// A failed GitHub listing leaves inherited VMs protected until both
+	// power and runner observations establish a safe state.
 	var runners map[string]RunnerInfo
 	if m.cfg.RunnerLister != nil {
 		runners, err = m.cfg.RunnerLister(ctx)
 		if err != nil {
-			m.log.Warn("adopt: github runner list failed; classifying by power-state only", "err", err)
+			m.log.Warn("adopt: github runner list failed; preserving inherited guests", "err", err)
 			runners = nil
 		}
 	}
 
 	for _, pv := range pmoxVMs {
-		m.adoptOne(ctx, pv, runners)
+		if err := m.adoptOne(ctx, pv, runners); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -1282,14 +1288,16 @@ func (m *manager) adoptLXCState(ctx context.Context, pv *provisioner.VM, profile
 // adoptOne classifies a single inherited VM and inserts it into the
 // store. Extracted so the per-VM error paths can `return` cleanly
 // without leaking the loop control structure into the classification.
-func (m *manager) adoptOne(ctx context.Context, pv *provisioner.VM, runners map[string]RunnerInfo) {
-	state, kind, runnerID := m.classifyAdoption(ctx, pv, runners)
+func (m *manager) adoptOne(ctx context.Context, pv *provisioner.VM, runners map[string]RunnerInfo) error {
+	state, kind, runnerID, protected := m.classifyAdoption(ctx, pv, runners)
 	profile := pv.Profile
 	unknownProfile := profile != "" && m.profileOf(profile) == nil
 	if profile == "" || unknownProfile {
 		profile = m.defaultProfile()
 	}
-	if unknownProfile {
+	if protected {
+		m.log.Warn("adopt: preserving inherited guest pending unambiguous job and power state", "vmid", pv.VMID, "node", pv.Node, "runner_id", runnerID, "unknown_profile", unknownProfile)
+	} else if unknownProfile {
 		m.log.Warn("adopt: unknown profile; destroying inherited vm", "vmid", pv.VMID, "profile", pv.Profile)
 		state = store.StateDestroying
 	} else if ps := m.profileOf(profile); ps != nil && ps.settings.GuestType == config.GuestTypeLXC {
@@ -1329,13 +1337,14 @@ func (m *manager) adoptOne(ctx context.Context, pv *provisioner.VM, runners map[
 		}
 	}
 	row := &store.VM{
-		VMID:     pv.VMID,
-		Node:     pv.Node,
-		Name:     pv.Name,
-		Profile:  profile,
-		PoolKind: kind,
-		State:    state,
-		RunnerID: runnerID,
+		VMID:              pv.VMID,
+		Node:              pv.Node,
+		Name:              pv.Name,
+		Profile:           profile,
+		PoolKind:          kind,
+		State:             state,
+		RunnerID:          runnerID,
+		AdoptionProtected: protected,
 		// Optimistic in recycle mode: an inherited VM was cloned by a
 		// recycle-mode leader, so the clone-time snapshot almost
 		// certainly exists — and BEFORE this field existed, adopted
@@ -1348,9 +1357,7 @@ func (m *manager) adoptOne(ctx context.Context, pv *provisioner.VM, runners map[
 		HasRecycleSnapshot: m.snapshotRecycle(),
 	}
 	if err := m.store.Insert(row); err != nil {
-		m.log.Warn("adopt: insert failed; skipping",
-			"vmid", pv.VMID, "node", pv.Node, "state", state, "err", err)
-		return
+		return fmt.Errorf("adopt: insert vm %d on %s: %w", pv.VMID, pv.Node, err)
 	}
 	m.log.Info("adopt: inherited vm",
 		"vmid", pv.VMID, "node", pv.Node, "name", pv.Name, "profile", profile,
@@ -1363,6 +1370,7 @@ func (m *manager) adoptOne(ctx context.Context, pv *provisioner.VM, runners map[
 	} else if state == store.StateDestroying {
 		m.destroyOrSyncFallback(pv.VMID, pv.Node, profile) //nolint:contextcheck // destruction is owned by the manager worker context, surviving the adoption request
 	}
+	return nil
 }
 
 // adoptionKey is the explicit state matrix axis: each cell maps a
@@ -1385,12 +1393,13 @@ type adoptionClass struct {
 	withRunnerID bool
 }
 
-// adoptionMatrix exhaustively enumerates every (powerRunning,
+// adoptionMatrix is consulted only after busy and ambiguous observations
+// have been diverted to protected states. It enumerates every (powerRunning,
 // runnerPresent, runnerBusy) triple. Listing all eight cells (over an
 // "any" sentinel) keeps the table grep-friendly and forces a new
 // classification to be a single-line addition.
 var adoptionMatrix = map[adoptionKey]adoptionClass{
-	// power != "running" → Warm regardless of runner snapshot.
+	// Only an explicitly stopped guest reaches these non-running cells.
 	{powerRunning: false, runnerPresent: false, runnerBusy: false}: {store.StateWarm, store.PoolKindWarm, false},
 	{powerRunning: false, runnerPresent: false, runnerBusy: true}:  {store.StateWarm, store.PoolKindWarm, false},
 	{powerRunning: false, runnerPresent: true, runnerBusy: false}:  {store.StateWarm, store.PoolKindWarm, false},
@@ -1409,23 +1418,26 @@ var adoptionMatrix = map[adoptionKey]adoptionClass{
 // VM from observable Proxmox power state and the GitHub runner snapshot
 // (which may be nil when GitHub was unreachable).
 //
-// The PowerState query failure path defaults to Hot (NOT Warm) so the
-// reconciler's hot+busy → promote-to-Running rule can recover any
-// in-flight job if a runner does turn out to be registered. Defaulting
-// to Warm would hide the VM from the reconciler's matrix entirely.
-func (m *manager) classifyAdoption(ctx context.Context, pv *provisioner.VM, runners map[string]RunnerInfo) (store.State, store.PoolKind, int64) {
+// Busy and ambiguous observations are retained in a protected busy state,
+// preventing reuse, reaping or rollback until fresh evidence resolves them.
+func (m *manager) classifyAdoption(ctx context.Context, pv *provisioner.VM, runners map[string]RunnerInfo) (store.State, store.PoolKind, int64, bool) {
 	// Per-VM timeout so one stuck node doesn't pin the leader-plane
 	// startup. The default-to-hot fallback below absorbs the timeout
 	// cleanly — the gh.Reconciler reclassifies on its first tick.
 	vmCtx, cancel := context.WithTimeout(ctx, adoptPowerStateTimeoutPerVM)
 	defer cancel()
 	power, err := m.prov.PowerState(vmCtx, pv)
-	if err != nil {
-		m.log.Warn("adopt: power-state query failed; defaulting to hot",
-			"vmid", pv.VMID, "node", pv.Node, "err", err)
-		return store.StateHot, store.PoolKindHot, 0
-	}
 	gr, present := runners[pv.Name]
+	if err != nil || (power != "running" && power != "stopped") || runners == nil || (present && (gr.Busy || gr.Unknown)) {
+		if err != nil {
+			m.log.Warn("adopt: power-state query failed", "vmid", pv.VMID, "node", pv.Node, "err", err)
+		}
+		state := store.StateAssigned
+		if present && gr.Busy {
+			state = store.StateRunning
+		}
+		return state, store.PoolKindHot, gr.ID, true
+	}
 	key := adoptionKey{
 		powerRunning:  power == "running",
 		runnerPresent: present,
@@ -1436,7 +1448,7 @@ func (m *manager) classifyAdoption(ctx context.Context, pv *provisioner.VM, runn
 	if class.withRunnerID {
 		runnerID = gr.ID
 	}
-	return class.state, class.kind, runnerID
+	return class.state, class.kind, runnerID, false
 }
 
 // Run is the reconcile loop.
@@ -1586,6 +1598,9 @@ func (m *manager) powerPollOnce(ctx context.Context) {
 	now := time.Now()
 	seen := make(map[int]struct{}, len(rows))
 	suppressed := 0
+	var adoptionRunners map[string]RunnerInfo
+	var adoptionErr error
+	adoptionChecked := false
 	for _, row := range rows {
 		seen[row.VMID] = struct{}{}
 		if row.JITPending {
@@ -1608,8 +1623,55 @@ func (m *manager) powerPollOnce(ctx context.Context) {
 			}
 			continue
 		}
-		// Empty string means "unknown" (VM not found). Skip — the
-		// stuck-state sweep will reap genuinely-missing rows.
+		if row.AdoptionProtected {
+			if last, ok := m.powerPollErrLastLog[row.VMID]; !ok || now.Sub(last) >= 5*time.Minute {
+				m.log.Warn("adopt: guest remains protected pending confirmed nonbusy runner and known power state", "vmid", row.VMID, "power", state, "runner_id", row.RunnerID)
+				m.powerPollErrLastLog[row.VMID] = now
+			}
+			// Paused, missing and unknown power states never establish job
+			// completion. Check GitHub only on a known power state, at most
+			// once per 30 seconds across all protected guests.
+			if state != "running" && state != "stopped" {
+				continue
+			}
+			if !adoptionChecked && !now.Before(m.adoptionNextCheck) && m.cfg.RunnerLister != nil {
+				adoptionChecked = true
+				m.adoptionNextCheck = now.Add(30 * time.Second)
+				checkCtx, checkCancel := context.WithTimeout(ctx, 10*time.Second)
+				adoptionRunners, adoptionErr = m.cfg.RunnerLister(checkCtx)
+				checkCancel()
+				if adoptionErr != nil {
+					m.log.Warn("adopt: runner recheck failed; preserving protected guests", "err", adoptionErr)
+				}
+			}
+			gr, found := adoptionRunners[row.Name]
+			if !adoptionChecked || adoptionErr != nil || !found || gr.Unknown || gr.ID == 0 || gr.Busy || (row.RunnerID != 0 && row.RunnerID != gr.ID) {
+				continue
+			}
+			if state == "stopped" {
+				// GitHub was queried after the first power observation. Refresh
+				// power before taking the destructive transition as well.
+				checkCtx, checkCancel := context.WithTimeout(ctx, powerPollTimeoutPerVM)
+				confirmed, confirmErr := m.prov.PowerState(checkCtx, &provisioner.VM{VMID: row.VMID, Node: row.Node, Name: row.Name, Profile: row.Profile})
+				checkCancel()
+				if confirmErr == nil && confirmed == "stopped" {
+					m.completeProtectedAdoption(row)
+				}
+				continue
+			}
+			ok, clearErr := m.store.UpdateIf(row.VMID, func(v *store.VM) bool {
+				return v.AdoptionProtected && !v.JITPending && v.State == row.State && v.CreatedAt.Equal(row.CreatedAt) && v.StateSince.Equal(row.StateSince) && v.RunnerID == row.RunnerID && v.JobID == row.JobID
+			}, func(v *store.VM) { v.AdoptionProtected = false })
+			if clearErr != nil {
+				m.log.Warn("adopt: release protection failed", "vmid", row.VMID, "err", clearErr)
+			}
+			if ok {
+				delete(m.powerPollErrLastLog, row.VMID)
+				m.log.Info("adopt: runner confirmed nonbusy on running guest; protection released", "vmid", row.VMID)
+			}
+			continue
+		}
+		// Empty and other unrecognised power states are unknown.
 		if state != "stopped" {
 			continue
 		}
@@ -1638,6 +1700,36 @@ func (m *manager) powerPollOnce(ctx context.Context) {
 			delete(m.powerPollErrLastLog, vmid)
 		}
 	}
+}
+
+// completeProtectedAdoption only cleans up the exact protected generation
+// after both the guest is stopped and its GitHub runner is confirmed nonbusy.
+func (m *manager) completeProtectedAdoption(row *store.VM) {
+	recycle := m.shouldRecycle(row)
+	ok, err := m.store.UpdateIf(row.VMID, func(v *store.VM) bool {
+		return v.AdoptionProtected && !v.JITPending && v.State == row.State && v.CreatedAt.Equal(row.CreatedAt) && v.StateSince.Equal(row.StateSince) && v.RunnerID == row.RunnerID && v.JobID == row.JobID
+	}, func(v *store.VM) {
+		v.AdoptionProtected = false
+		if recycle {
+			v.State = store.StateRecycling
+		} else {
+			v.State = store.StateDraining
+		}
+		v.StateSince = time.Now()
+	})
+	if err != nil {
+		m.log.Warn("adopt: protected completion failed", "vmid", row.VMID, "err", err)
+		return
+	}
+	if !ok {
+		return
+	}
+	if recycle {
+		m.rollbackAsync(row.VMID, row.Node, row.Name, row.Profile)
+	} else {
+		m.destroyAsync(row.VMID, row.Node, row.Profile)
+	}
+	m.SignalRefill()
 }
 
 // reconcileOnce is kept as a thin wrapper that delegates to the

@@ -31,7 +31,7 @@ func TestAdoptLXCJITReadback(t *testing.T) {
 			st := newTestStore(t)
 			fp := &adoptWindowsProv{fakeProv: &fakeProv{}, jit: tc.jit, readErr: tc.err}
 			mgr := newTestManager(t, st, fp, Config{Profiles: []ProfileSettings{{Name: "ct", GuestType: config.GuestTypeLXC, MaxConcurrentRunners: 10}}})
-			mgr.adoptOne(context.Background(), &provisioner.VM{VMID: 10001, Node: "pve1", Name: "runner", Profile: "ct", GuestType: config.GuestTypeLXC}, nil)
+			mgr.adoptOne(context.Background(), &provisioner.VM{VMID: 10001, Node: "pve1", Name: "runner", Profile: "ct", GuestType: config.GuestTypeLXC}, map[string]RunnerInfo{})
 			row, err := st.Get(10001)
 			require.NoError(t, err)
 			require.Equal(t, tc.state, row.State)
@@ -64,7 +64,7 @@ func TestAdoptStoppedLXC(t *testing.T) {
 			st := newTestStore(t)
 			fp := &adoptWindowsProv{fakeProv: &fakeProv{powerStateBy: map[int]string{10001: "stopped"}}, jit: tc.jit, readErr: tc.err}
 			mgr := newTestManager(t, st, fp, Config{Profiles: []ProfileSettings{{Name: "ct", GuestType: config.GuestTypeLXC, MaxConcurrentRunners: 10}}})
-			mgr.adoptOne(context.Background(), &provisioner.VM{VMID: 10001, Node: "pve1", Name: "runner", Profile: "ct", GuestType: config.GuestTypeLXC}, nil)
+			mgr.adoptOne(context.Background(), &provisioner.VM{VMID: 10001, Node: "pve1", Name: "runner", Profile: "ct", GuestType: config.GuestTypeLXC}, map[string]RunnerInfo{})
 			if !tc.destroy {
 				row, err := st.Get(10001)
 				require.NoError(t, err)

@@ -466,7 +466,14 @@ func isTransientListError(err error, resp *github.Response) bool {
 // independently via listOurRunners.
 func NewRunnerLister(gh *github.Client, scope githubauth.Scope, prefix string, log *slog.Logger) pool.RunnerLister {
 	return func(ctx context.Context) (map[string]pool.RunnerInfo, error) {
-		return ListRunnersByPrefix(ctx, gh, scope, prefix, log)
+		runners, truncated, err := listRunnersByPrefix(ctx, gh, scope, prefix, log)
+		if err != nil {
+			return nil, err
+		}
+		if truncated {
+			return nil, errors.New("runner listing truncated; adoption state is unknown")
+		}
+		return runners, nil
 	}
 }
 
@@ -587,7 +594,7 @@ func (r *Reconciler) applyMatrix(ctx context.Context, rows []pool.RowSnapshot, r
 	now := r.now()
 	seen := make(map[string]bool, len(rows))
 	for _, row := range rows {
-		if row.JITPending {
+		if row.JITPending || row.AdoptionProtected {
 			continue
 		}
 		gr, present := runners[row.Name]
@@ -702,7 +709,7 @@ func (r *Reconciler) confirmRunnerState(ctx context.Context, row pool.RowSnapsho
 		return false
 	}
 	for _, current := range rows {
-		if !current.JITPending && current.VMID == row.VMID && current.Name == row.Name && current.State == row.State &&
+		if !current.JITPending && !current.AdoptionProtected && current.VMID == row.VMID && current.Name == row.Name && current.State == row.State &&
 			current.RunnerID == row.RunnerID && current.JobID == row.JobID && current.CreatedAt.Equal(row.CreatedAt) && current.StateSince.Equal(row.StateSince) {
 			return true
 		}

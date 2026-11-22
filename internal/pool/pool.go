@@ -106,17 +106,18 @@ type VM struct {
 // int64 with 0 meaning "unset". RecycleCount mirrors the store row's
 // snapshot-rollback recycle counter (always 0 in destroy mode).
 type RowSnapshot struct {
-	VMID         int
-	Node         string
-	Name         string
-	Profile      string
-	State        string
-	JobID        int64
-	RunnerID     int64
-	RecycleCount int
-	StateSince   time.Time
-	CreatedAt    time.Time
-	JITPending   bool
+	VMID              int
+	Node              string
+	Name              string
+	Profile           string
+	State             string
+	JobID             int64
+	RunnerID          int64
+	RecycleCount      int
+	StateSince        time.Time
+	CreatedAt         time.Time
+	JITPending        bool
+	AdoptionProtected bool
 }
 
 // RunnerInfo is the subset of GitHub's per-runner state that the

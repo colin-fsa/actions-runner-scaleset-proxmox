@@ -153,3 +153,11 @@ or unexpected destroys appear. Roll back by restoring the previous controller
 image and configuration together, then confirm the old leader has stopped and
 inspect in-flight Proxmox tasks before resuming demand. A rollback removes these
 protections; do not use it as a substitute for controlling incoming load.
+
+After restart, a busy runner or ambiguous guest power or GitHub state is
+adopted as protected, not returned to the warm or hot pool. The controller
+logs `adopt: guest remains protected` and waits for a known power state and a
+fresh, matching, nonbusy runner observation before resolving it. If GitHub
+data stays missing or inconsistent, the guest can remain protected
+indefinitely and requires operator investigation. Failed owned-guest discovery
+is retried before orphan cleanup starts.
