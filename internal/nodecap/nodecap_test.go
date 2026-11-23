@@ -1465,3 +1465,25 @@ func TestHostMemoryAdmissionWaitsForLeaderRecovery(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 }
+
+func TestConfirmedDestroyReleasesOnlyCapturedGuestClaims(t *testing.T) {
+	a := &Accountant{res: make(map[uint64]*reservation)}
+	add := func(id uint64, node string, vmid int) *reservation {
+		r := &reservation{id: id, node: node, vmid: vmid, acct: a, started: true}
+		a.res[id] = r
+		return r
+	}
+	cold := add(1, "pve1", 10001)
+	jit := add(2, "pve1", 10001)
+	other := add(3, "pve2", 10001)
+	unbound := add(4, "pve1", 0)
+	confirmed := a.ReservationsBeforeDestroy("pve1", 10001)
+	require.Len(t, a.res, 4, "capturing before an ambiguous or failed destroy does not credit RAM")
+	replacement := add(5, "pve1", 10001)
+	unbound.Bind(10001)
+	confirmed()
+	confirmed()
+	require.True(t, cold.released)
+	require.True(t, jit.released)
+	require.Equal(t, map[uint64]*reservation{3: other, 4: unbound, 5: replacement}, a.res)
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -246,6 +247,16 @@ func (p *pmox) injectJITConfigInner(ctx context.Context, vm *VM, jitConfig strin
 	return nil
 }
 
+type agentExecExitError struct {
+	command []string
+	code    int
+	stderr  string
+}
+
+func (e *agentExecExitError) Error() string {
+	return fmt.Sprintf("agent exec %v failed: exit=%d stderr=%q", e.command, e.code, e.stderr)
+}
+
 // agentExecWait runs a command inside the VM and waits for it to exit
 // successfully. Returns an error if the command exits non-zero (the
 // command's stderr is included in the error message) or if ctx is
@@ -274,7 +285,7 @@ func (p *pmox) agentExecWait(ctx context.Context, node string, vmid int, command
 	for {
 		var statusResp struct {
 			Exited   any    `json:"exited"`
-			Exitcode int    `json:"exitcode"`
+			Exitcode *int   `json:"exitcode"`
 			ErrData  string `json:"err-data"`
 		}
 		if err := p.cli.GetWithParams(pollCtx, statusPath, map[string]int{"pid": startResp.Data.PID}, &statusResp); err != nil {
@@ -295,8 +306,11 @@ func (p *pmox) agentExecWait(ctx context.Context, node string, vmid int, command
 			exited = v == 1
 		}
 		if exited {
-			if statusResp.Exitcode != 0 {
-				return fmt.Errorf("agent exec %v failed: exit=%d stderr=%q", command, statusResp.Exitcode, statusResp.ErrData)
+			if statusResp.Exitcode == nil {
+				return errors.New("agent exec reported completion without an exit code")
+			}
+			if *statusResp.Exitcode != 0 {
+				return &agentExecExitError{command: command, code: *statusResp.Exitcode, stderr: statusResp.ErrData}
 			}
 			return nil
 		}
@@ -306,6 +320,54 @@ func (p *pmox) agentExecWait(ctx context.Context, node string, vmid int, command
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
+}
+
+// WindowsJITHandoffState checks the installed standard watcher without reading
+// any JIT payload. "pristine" requires a running watcher with no published,
+// temporary, or consumed handoff; filesystem/agent/task uncertainty is not
+// evidence that the guest can be reused.
+func (p *pmox) WindowsJITHandoffState(ctx context.Context, vm *VM) (string, error) {
+	if vm == nil {
+		return "unknown", errors.New("missing Windows guest")
+	}
+	os, path, err := p.guestJITSettings(vm)
+	if err != nil || os != "windows" || !strings.EqualFold(path, defaultWindowsJITPath) {
+		return "unknown", errors.New("unsupported Windows watcher configuration")
+	}
+	const occupiedExit = 41
+	script := `$ErrorActionPreference = 'Stop'
+try {
+    $dir = 'C:\ProgramData\ActionsRunnerScaleSet'
+    $item = Get-Item -LiteralPath $dir -Force
+    if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { exit 42 }
+    $names = @(Get-ChildItem -LiteralPath $dir -Force | ForEach-Object Name)
+    if ($names -contains 'jitconfig' -or $names -contains 'jitconfig.tmp' -or $names -contains 'started') { exit 41 }
+    foreach ($expected in @('Watch-JitRunner.ps1', 'Test-JitConfig.ps1')) {
+        $file = Get-Item -LiteralPath (Join-Path $dir $expected) -Force
+        if ($file.PSIsContainer -or ($file.Attributes -band [IO.FileAttributes]::ReparsePoint)) { exit 42 }
+    }
+    $task = Get-ScheduledTask -TaskPath '\' -TaskName 'ActionsRunnerScaleSetWatcher'
+    $actions = @($task.Actions)
+    if ($task.State -ne 'Running' -or $actions.Count -ne 1) { exit 42 }
+    $expectedExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if ($actions[0].Execute -ine $expectedExe) { exit 42 }
+    if ($actions[0].Arguments -notlike '*-File "C:\ProgramData\ActionsRunnerScaleSet\Watch-JitRunner.ps1"*' -or
+        $actions[0].Arguments -notlike '*-JitPath "C:\ProgramData\ActionsRunnerScaleSet\jitconfig"') { exit 42 }
+    # Check again after querying the task, without opening any handoff file.
+    $names = @(Get-ChildItem -LiteralPath $dir -Force | ForEach-Object Name)
+    if ($names -contains 'jitconfig' -or $names -contains 'jitconfig.tmp' -or $names -contains 'started') { exit 41 }
+    exit 0
+} catch { exit 42 }`
+	err = p.agentExecWait(ctx, vm.Node, vm.VMID, psEncodedCommand(script))
+	if err == nil {
+		return "pristine", nil
+	}
+	var exitErr *agentExecExitError
+	if errors.As(err, &exitErr) && exitErr.code == occupiedExit {
+		return "occupied", nil
+	}
+	// Never send guest command output or Proxmox error bodies downstream.
+	return "unknown", errors.New("could not verify pristine Windows watcher")
 }
 
 // ReadJITConfig reads the canonical JIT-config env file from inside the

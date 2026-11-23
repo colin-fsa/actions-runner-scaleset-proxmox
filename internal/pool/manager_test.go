@@ -3920,30 +3920,45 @@ func TestSweepStuckRows_RecyclingRowSelfHealsToDestroy(t *testing.T) {
 
 type adoptWindowsProv struct {
 	*fakeProv
-	jit     []byte
-	readErr error
+	handoff  string
+	probeErr error
+	jit      []byte
+	readErr  error
 }
 
 func (p *adoptWindowsProv) ReadJITConfig(_ context.Context, _ *provisioner.VM) ([]byte, error) {
 	return p.jit, p.readErr
 }
-func TestAdoptWindowsJITReadback(t *testing.T) {
+
+func (p *adoptWindowsProv) WindowsJITHandoffState(_ context.Context, _ *provisioner.VM) (string, error) {
+	return p.handoff, p.probeErr
+}
+
+func TestAdoptWindowsJITHandoff(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		jit   []byte
-		err   error
-		state store.State
+		name      string
+		handoff   string
+		probeErr  error
+		registry  map[string]RunnerInfo
+		state     store.State
+		protected bool
 	}{
-		{"clean", nil, nil, store.StateHot}, {"consumed", []byte("jit"), nil, store.StateAssigned}, {"unavailable", nil, errors.New("agent unavailable"), store.StateAssigned},
+		{"pristine missing file", "pristine", nil, map[string]RunnerInfo{}, store.StateHot, false},
+		{"occupied", "occupied", nil, map[string]RunnerInfo{}, store.StateAssigned, false},
+		{"agent unavailable", "pristine", errors.New("agent unavailable"), map[string]RunnerInfo{}, store.StateAssigned, false},
+		{"unknown", "unexpected", nil, map[string]RunnerInfo{}, store.StateAssigned, false},
+		{"missing registry", "pristine", nil, nil, store.StateAssigned, true},
+		{"registry busy", "pristine", nil, map[string]RunnerInfo{"runner": {ID: 12, Busy: true}}, store.StateRunning, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			st := newTestStore(t)
-			fp := &adoptWindowsProv{fakeProv: &fakeProv{}, jit: tc.jit, readErr: tc.err}
+			fp := &adoptWindowsProv{fakeProv: &fakeProv{}, handoff: tc.handoff, probeErr: tc.probeErr, readErr: errors.New("legacy guest file read reports missing file as an error")}
 			mgr := newTestManager(t, st, fp, Config{Profiles: []ProfileSettings{{Name: "win", GuestOS: "windows", MaxConcurrentRunners: 10}}})
-			mgr.adoptOne(context.Background(), &provisioner.VM{VMID: 10001, Node: "pve1", Name: "runner", Profile: "win"}, map[string]RunnerInfo{})
+			require.NoError(t, mgr.adoptOne(context.Background(), &provisioner.VM{VMID: 10001, Node: "pve1", Name: "runner", Profile: "win"}, tc.registry))
 			row, err := st.Get(10001)
 			require.NoError(t, err)
 			require.Equal(t, tc.state, row.State)
+			require.Equal(t, tc.protected, row.AdoptionProtected)
 		})
 	}
 }
