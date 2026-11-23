@@ -306,6 +306,11 @@ pool:
   #   # the host (0.7 admits a 4 GiB guest against 2.8 GiB of free). 0 means
   #   # 1.0. Ignored in allocated mode.
   #   memory_overcommit: 1.0
+  #   windows_online_settle_after: 0s  # off by default; 2m pilot, minimum 30s
+  #   # Shorten only successful Windows starts confirmed online by GitHub.
+  #   # Fresh Proxmox host accounting is required. Up to 16 GiB per node
+  #   # may stop being held for future growth; this is not measured RAM.
+  #   # The host reserve, recovery window and boot pacing do not change.
   #   # Let a queued job reclaim capacity from an idle pool VM. When a
   #   # job's clone cannot be placed anywhere and the node is full of
   #   # idle hot/warm VMs, the oldest idle one (warm before hot) is

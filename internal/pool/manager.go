@@ -178,6 +178,8 @@ type Config struct {
 	WindowsBootBudget *WindowsBootBudget
 
 	Capacity CapacityAdmitter
+	// ObserveWindowsOnline records exact post-JIT identities for opt-in settling.
+	ObserveWindowsOnline bool
 
 	// EvictIdleForDemand lets a queued job reclaim capacity from an idle
 	// pool VM. When a DEMAND-DRIVEN clone can't be admitted anywhere and

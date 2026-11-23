@@ -596,7 +596,9 @@ func buildCapacityAccountant(cfg *config.Config, prov provisioner.Provisioner, l
 		// assume a clone that never came back is gone"; a reservation
 		// outliving its clone is the same question, so it reuses the
 		// same knob rather than adding a near-duplicate one.
-		ReservationTTL: max(15*time.Minute, cfg.Pool.CloneInflightGrace.D()),
+		ReservationTTL:           max(15*time.Minute, cfg.Pool.CloneInflightGrace.D()),
+		WindowsOnlineSettleAfter: cc.WindowsOnlineSettleAfter.D(),
+		WindowsOnlineFreshness:   2 * cfg.GitHub.PollInterval.D(),
 		// How the accountant recognises our own guests, which count even
 		// when powered off — the warm tier is stopped by design — while
 		// foreign guests count only while they actually hold memory.
@@ -786,6 +788,7 @@ func runOneScaleset(leaderCtx context.Context, deps runOneScalesetDeps, entry co
 		OnRunnerOrphaned:     ghClient.RemoveRunner,
 		RunnerLister:         gh.NewRunnerLister(restCli, scope, state.vmPrefix, log),
 		Capacity:             deps.capacity,
+		ObserveWindowsOnline: cfg.Pool.Capacity.WindowsOnlineSettleAfter.D() > 0,
 		WindowsBootBudget:    deps.windowsBootBudget,
 		EvictIdleForDemand:   cfg.Pool.Capacity.EvictIdleForDemand,
 		// The same universe handed to the nodeselector wrappers, so the

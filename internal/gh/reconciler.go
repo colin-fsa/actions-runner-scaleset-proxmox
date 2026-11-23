@@ -249,8 +249,21 @@ func (r *Reconciler) Tick(ctx context.Context) error {
 	ctx, span := tracer.Start(ctx, "gh.Reconciler.Tick")
 	defer span.End()
 
+	pollStarted := r.now()
 	runners, truncated, err := r.listOurRunners(ctx)
+	observer, watching := r.pool.(interface {
+		WindowsOnlineSettleEnabled() bool
+		ObserveWindowsRunner(pool.RowSnapshot, pool.RunnerInfo, time.Time)
+	})
+	watching = watching && observer.WindowsOnlineSettleEnabled()
 	if err != nil {
+		if watching {
+			if rows, readErr := r.pool.ListRows(ctx); readErr == nil {
+				for _, row := range rows {
+					observer.ObserveWindowsRunner(row, pool.RunnerInfo{}, pollStarted)
+				}
+			}
+		}
 		clear(r.offlineSince)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "list runners failed")
@@ -269,6 +282,15 @@ func (r *Reconciler) Tick(ctx context.Context) error {
 		attribute.Int("db.rows", len(rows)),
 	)
 
+	if watching {
+		for _, row := range rows {
+			var gr pool.RunnerInfo
+			if !truncated {
+				gr = runners[row.Name]
+			}
+			observer.ObserveWindowsRunner(row, gr, pollStarted)
+		}
+	}
 	r.applyMatrix(ctx, rows, runners, truncated)
 	r.cleanupOrphanRunners(ctx, rows, runners, truncated)
 

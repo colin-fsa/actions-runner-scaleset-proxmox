@@ -195,6 +195,9 @@ type Options struct {
 	// without retiring. It is a leak guard for a clone that hangs or
 	// dies past the pool's panic recovery, not a normal expiry path.
 	ReservationTTL time.Duration
+	// WindowsOnlineSettleAfter enables a bounded early-release policy.
+	WindowsOnlineSettleAfter time.Duration
+	WindowsOnlineFreshness   time.Duration
 	// RecoveryDelay pauses host-memory admission after controller startup,
 	// allowing starts submitted by the previous process to settle.
 	RecoveryDelay time.Duration
@@ -357,6 +360,7 @@ type snapshot struct {
 	// reservation's RAM counts as "already in free" only once its guest is
 	// powered on, not the moment its configured memory is raised.
 	guestPowered map[int]bool
+	qemuRunning  map[int]qemuIdentity
 	takenAt      time.Time
 }
 
@@ -374,6 +378,7 @@ type nodeTotals struct {
 	// and admission for the node must fail closed. Both are inert in the
 	// allocated mode, which never consults the live reading.
 	memAvailable uint64
+	memReadAt    time.Time
 	memMissing   bool
 	cpuUsage     float64
 	cpuMissing   bool
@@ -403,6 +408,8 @@ type reservation struct {
 	// it retires on observation alone (see ExpectPoweredOff).
 	poweredOff bool
 	started    bool
+	startedAt  time.Time
+	online     windowsOnlineProof
 }
 
 func (r *reservation) Bind(vmid int) {
@@ -439,8 +446,19 @@ func (r *reservation) BeginStart() bool {
 	if r.released || time.Now().After(r.expires) {
 		return false
 	}
-	r.expires = time.Now().Add(r.acct.opts.ReservationTTL)
+	now := time.Now()
+	r.expires = now.Add(r.acct.opts.ReservationTTL)
 	r.started = true
+	r.startedAt = now
+	r.online = windowsOnlineProof{}
+	if r.acct.opts.WindowsOnlineSettleAfter > 0 && !r.generation.IsZero() {
+		for _, previous := range r.acct.res {
+			if previous != r && previous.node == r.node && previous.vmid == r.vmid &&
+				previous.generation.Equal(r.generation) {
+				previous.online = windowsOnlineProof{}
+			}
+		}
+	}
 	return true
 }
 
@@ -904,6 +922,7 @@ func (a *Accountant) holdsAndCreditsLocked(snap *snapshot, node string) (holds, 
 			credit += a.freeingCreditLocked(snap, v)
 		}
 	}
+	holds = saturatingSub(holds, a.windowsSettledCreditLocked(snap, node))
 	return holds, credit
 }
 
@@ -1131,7 +1150,10 @@ func (a *Accountant) fetch(ctx context.Context) (*snapshot, error) {
 		guestMem:     map[int]uint64{},
 		guestVCPU:    map[int]int{},
 		guestPowered: map[int]bool{},
-		takenAt:      time.Now(),
+		takenAt:      a.now(),
+	}
+	if a.opts.WindowsOnlineSettleAfter > 0 {
+		snap.qemuRunning = make(map[int]qemuIdentity)
 	}
 	want := func(name string) bool {
 		return len(a.opts.Nodes) == 0 || slices.Contains(a.opts.Nodes, name)
@@ -1166,6 +1188,9 @@ func (a *Accountant) fetch(ctx context.Context) (*snapshot, error) {
 			// faithful record of who is actually consuming live host RAM — the
 			// thing host_available mode keys its holds and retirement on.
 			snap.guestPowered[vmid] = r.Status != guestStopped
+			if snap.qemuRunning != nil && r.Type == "qemu" && r.Status == "running" {
+				snap.qemuRunning[vmid] = qemuIdentity{node: r.Node, name: r.Name, uptime: r.Uptime}
+			}
 			if !a.holdsMemory(r.Status, r.Tags, vmid) {
 				continue
 			}
@@ -1185,6 +1210,7 @@ func (a *Accountant) fetch(ctx context.Context) (*snapshot, error) {
 			// Admission plans against the node's live available RAM, which only the
 			// per-node status endpoint reports. A failed reading marks the node
 			// as missing so stateLocked fails closed rather than admit blind.
+			totals.memReadAt = a.now()
 			st, err := a.nodeLiveStatus(ctx, node)
 			free, ok := st.availableMemory()
 			totals.memAvailable = free
