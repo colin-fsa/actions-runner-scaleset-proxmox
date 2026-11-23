@@ -388,6 +388,24 @@ func (s *Store) Delete(vmid int) error {
 	return nil
 }
 
+// DeleteIf atomically removes the row only if it still matches match.
+func (s *Store) DeleteIf(vmid int, match func(*VM) bool) (bool, error) {
+	txn := s.db.Txn(true)
+	defer txn.Abort()
+	existing, err := txn.First(tableVM, "id", vmid)
+	if err != nil {
+		return false, fmt.Errorf("store: delete-if lookup %d: %w", vmid, err)
+	}
+	if existing == nil || !match(existing.(*VM).Clone()) {
+		return false, nil
+	}
+	if err := txn.Delete(tableVM, existing); err != nil {
+		return false, fmt.Errorf("store: delete-if %d: %w", vmid, err)
+	}
+	txn.Commit()
+	return true, nil
+}
+
 // DeleteAndReturn removes the row with the given VMID and returns a
 // snapshot of it as it existed at the instant of deletion. A missing
 // row returns (nil, nil) so callers can treat double-delete as a no-op.

@@ -952,6 +952,25 @@ func (m *manager) ForceDestroy(_ context.Context, vmid int, reason string) error
 	return nil
 }
 
+// ForgetAbsentAssigned drops only the exact unclaimed adopted record. It
+// must not call the destroy path: the VM is already gone and IDs can be reused.
+func (m *manager) ForgetAbsentAssigned(_ context.Context, expected RowSnapshot) (bool, error) {
+	if expected.State != string(store.StateAssigned) || !expected.AdoptionProtected ||
+		expected.JITPending || expected.RunnerID != 0 || expected.JobID != 0 {
+		return false, nil
+	}
+	removed, err := m.store.DeleteIf(expected.VMID, func(v *store.VM) bool {
+		return v.State == store.StateAssigned && v.AdoptionProtected && !v.JITPending &&
+			v.RunnerID == 0 && v.JobID == 0 && v.Name == expected.Name && v.Node == expected.Node &&
+			v.Profile == expected.Profile && v.RecycleCount == expected.RecycleCount &&
+			v.CreatedAt.Equal(expected.CreatedAt) && v.StateSince.Equal(expected.StateSince)
+	})
+	if removed {
+		m.SignalRefill()
+	}
+	return removed, err
+}
+
 // ForceDestroyUnchanged only reaps the exact row checked by the reconciler.
 // The check and transition run inside the store's write transaction, so a
 // concurrent completion, reassignment, or VMID reuse wins safely.

@@ -107,3 +107,45 @@ func TestInFlightCloneTracker_ClearedOnCloneSuccess(t *testing.T) {
 	require.Equal(t, 0, p.InFlightCloneCount(),
 		"a completed clone must leave no in-flight entry behind")
 }
+
+func TestConfirmGuestAbsentRequiresExactFreeIDAndQuorum(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		healthy bool
+		body    string
+		code    int
+		want    bool
+	}{
+		{"free", true, `{"data":"12002"}`, 200, true},
+		{"wrong id", true, `{"data":12003}`, 200, false},
+		{"occupied", true, `{"errors":{"vmid":"already exists"}}`, 400, false},
+		{"not authorized", true, `{"data":"12002"}`, 403, false},
+		{"invalid data", true, `{"data":null}`, 200, false},
+		{"no quorum", false, `{"data":"12002"}`, 200, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				require.Equal(t, http.MethodGet, r.Method)
+				if r.URL.Path == "/cluster/status" {
+					q := "1"
+					if !tc.healthy {
+						q = "0"
+					}
+					_, _ = io.WriteString(w, `{"data":[{"type":"cluster","quorate":`+q+`},{"type":"node","name":"pve1","online":1,"local":1}]}`)
+					return
+				}
+				require.Equal(t, "/cluster/nextid", r.URL.Path)
+				require.Equal(t, "12002", r.URL.Query().Get("vmid"))
+				w.WriteHeader(tc.code)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer s.Close()
+			p := newTestProvisioner(t, s, "pve1")
+			got, err := p.ConfirmGuestAbsent(context.Background(), &VM{VMID: 12002, Node: "pve1"})
+			require.Equal(t, tc.want, got)
+			if tc.want {
+				require.NoError(t, err)
+			}
+		})
+	}
+}

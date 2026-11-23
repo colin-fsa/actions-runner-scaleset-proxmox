@@ -11,6 +11,7 @@ package provisioner
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -1221,6 +1222,55 @@ func (p *pmox) PowerState(ctx context.Context, vm *VM) (string, error) {
 		return "", err
 	}
 	return pVM.Status, nil
+}
+
+// ConfirmGuestAbsent uses PVE's exact-ID nextid lookup, which checks the
+// cluster guest namespace (including other nodes and both guest types).
+// It does not reserve an ID. A failed or ambiguous lookup is not absence.
+func (p *pmox) ConfirmGuestAbsent(ctx context.Context, vm *VM) (bool, error) {
+	if vm == nil || vm.VMID <= 0 || vm.Node == "" {
+		return false, nil
+	}
+	var status []struct {
+		Type    string `json:"type"`
+		Name    string `json:"name"`
+		Online  int    `json:"online"`
+		Local   int    `json:"local"`
+		Quorate int    `json:"quorate"`
+	}
+	if err := p.cli.Get(ctx, "/cluster/status", &status); err != nil {
+		return false, err
+	}
+	nodes, matching, local, clusters := 0, 0, false, 0
+	for _, item := range status {
+		switch item.Type {
+		case "node":
+			nodes++
+			if item.Name == vm.Node {
+				if item.Online != 1 {
+					return false, nil
+				}
+				matching++
+				local = item.Local == 1
+			}
+		case "cluster":
+			if item.Quorate != 1 {
+				return false, nil
+			}
+			clusters++
+		}
+	}
+	if matching != 1 || clusters > 1 || (clusters == 0 && (nodes != 1 || !local)) {
+		return false, nil
+	}
+	var raw json.RawMessage
+	if err := p.cli.GetWithParams(ctx, "/cluster/nextid", map[string]int{"vmid": vm.VMID}, &raw); err != nil {
+		return false, err
+	}
+	// PVE's endpoint schema announces a string; accept the same exact
+	// integer representation from servers serializing it as a JSON number.
+	id := strconv.Itoa(vm.VMID)
+	return string(raw) == id || string(raw) == strconv.Quote(id), nil
 }
 
 // WaitReady blocks until the qemu-guest-agent inside the VM is responsive

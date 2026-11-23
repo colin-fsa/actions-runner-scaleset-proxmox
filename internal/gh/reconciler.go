@@ -598,10 +598,16 @@ func (r *Reconciler) applyMatrix(ctx context.Context, rows []pool.RowSnapshot, r
 	seen := make(map[string]bool, len(rows))
 	assignedMissing := make(map[string]bool)
 	for _, row := range rows {
-		if row.JITPending || row.AdoptionProtected {
+		gr, present := runners[row.Name]
+		if row.AdoptionProtected {
+			if !truncated && !present && r.reconcileMissingAdoption(ctx, row, now) {
+				seen[row.Name] = true
+			}
 			continue
 		}
-		gr, present := runners[row.Name]
+		if row.JITPending {
+			continue
+		}
 		if present && !gr.Unknown && !gr.Online && gr.Busy && (row.State == "assigned" || row.State == "running") {
 			if last, ok := r.busyOfflineLastLog[row.Name]; !ok || now.Sub(last) >= 5*time.Minute {
 				r.log.Warn("reconcile: runner offline but still reported busy; deferring cleanup", "vmid", row.VMID, "runner_id", gr.ID)
@@ -720,6 +726,63 @@ func (r *Reconciler) applyMatrix(ctx context.Context, rows []pool.RowSnapshot, r
 			delete(r.busyOfflineLastLog, name)
 		}
 	}
+}
+
+// reconcileMissingAdoption handles orphaned bookkeeping only. Other
+// protected rows remain untouched, even if their power state is unknown.
+func (r *Reconciler) reconcileMissingAdoption(ctx context.Context, row pool.RowSnapshot, now time.Time) bool {
+	if row.State != "assigned" || !row.AdoptionProtected || row.RunnerID != 0 ||
+		row.JobID != 0 || row.JITPending || row.Name == "" {
+		return false
+	}
+	prov, ok := r.prov.(interface {
+		ConfirmGuestAbsent(context.Context, *provisioner.VM) (bool, error)
+	})
+	if !ok {
+		return false
+	}
+	mgr, ok := r.pool.(interface {
+		ForgetAbsentAssigned(context.Context, pool.RowSnapshot) (bool, error)
+	})
+	if !ok {
+		return false
+	}
+	absent := func() bool {
+		probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		yes, err := prov.ConfirmGuestAbsent(probeCtx, &provisioner.VM{
+			VMID: row.VMID, Node: row.Node, Name: row.Name, Profile: row.Profile,
+		})
+		return err == nil && yes
+	}
+	if !absent() {
+		return false
+	}
+	const reason = "protected_missing"
+	first, ok := r.offlineSince[row.Name]
+	if !ok || first.status != reason || !first.created.Equal(row.CreatedAt) || !first.assigned.Equal(row.StateSince) {
+		r.offlineSince[row.Name] = offlineObservation{created: row.CreatedAt, assigned: row.StateSince, since: now, status: reason}
+		return true
+	}
+	if now.Sub(first.since) < r.cfg.AssignedGrace {
+		return true
+	}
+	readCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	fresh, truncated, err := r.listOurRunners(readCtx)
+	cancel()
+	if err != nil || truncated {
+		return false
+	}
+	if _, found := fresh[row.Name]; found || !absent() {
+		return false
+	}
+	removed, err := mgr.ForgetAbsentAssigned(ctx, row)
+	if err != nil {
+		r.log.Warn("reconcile: forget absent adopted runner failed", "vmid", row.VMID, "err", err)
+	} else if removed {
+		r.log.Info("reconcile: forgot absent adopted runner", "vmid", row.VMID)
+	}
+	return false
 }
 
 // runnerStopped checks Proxmox explicitly. Missing or unknown guest status
