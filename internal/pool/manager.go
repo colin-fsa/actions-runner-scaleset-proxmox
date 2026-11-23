@@ -2728,6 +2728,7 @@ func (m *manager) prepareClone(profile string, kind store.PoolKind, poweredOn bo
 	// provisioner raises it in a later Config call, so the guest row
 	// understates the VM for a few seconds).
 	claim.bind(vmid)
+	claim.setGeneration(createdAt)
 	// Publish the allocated id to the caller so a panic later in this
 	// function logs the real vmid rather than 0.
 	if vmidRef != nil {

@@ -19,6 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/config"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/nodecap"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/tags"
 )
 
@@ -450,6 +451,74 @@ func TestLXC_InjectJITConfigStartsStoppedContainer(t *testing.T) {
 	require.Len(t, f.find(http.MethodPost, "/nodes/pve1/lxc/10061/status/start"), 1)
 	require.Empty(t, f.find(http.MethodPost, "/nodes/pve1/lxc/10061/status/reboot"))
 	require.True(t, f.cts[10061].Running)
+}
+
+type lxcStartClaim struct {
+	valid             bool
+	started, released bool
+}
+
+func (*lxcStartClaim) Bind(int)           {}
+func (*lxcStartClaim) ExpectPoweredOff()  {}
+func (c *lxcStartClaim) Release()         { c.released = true }
+func (c *lxcStartClaim) BeginStart() bool { c.started = c.valid; return c.valid }
+
+type lxcStartCapacity struct {
+	t          *testing.T
+	generation time.Time
+	claims     []*lxcStartClaim
+}
+
+func (c *lxcStartCapacity) ReserveExisting(context.Context, string, nodecap.Shape, int) (nodecap.Reservation, bool, error) {
+	c.t.Fatal("JIT did not use the generation-aware admission route")
+	return nil, false, nil
+}
+
+func (c *lxcStartCapacity) ReserveExistingForJIT(_ context.Context, node string, _ nodecap.Shape, vmid int, generation time.Time) (nodecap.Reservation, bool, error) {
+	require.Equal(c.t, "pve1", node)
+	require.Equal(c.t, 10061, vmid)
+	require.True(c.t, c.generation.Equal(generation))
+	if len(c.claims) != 0 {
+		require.True(c.t, c.claims[0].released, "expired candidate is released before admission is retried")
+	}
+	claim := &lxcStartClaim{valid: len(c.claims) != 0}
+	c.claims = append(c.claims, claim)
+	return claim, true, nil
+}
+
+type lxcStartGateFunc func(context.Context, string) (func(), error)
+
+func (f lxcStartGateFunc) AcquireStart(ctx context.Context, node string) (func(), error) {
+	return f(ctx, node)
+}
+
+func TestLXC_InjectJITReAdmitsAfterClaimExpiresWhilePacing(t *testing.T) {
+	t.Parallel()
+	f, srv := newLXCFake(t)
+	f.cts[10061] = &lxcCT{Name: "c", Config: map[string]any{}}
+	p := newLXCProvisioner(t, srv)
+	profile := p.profiles["ct"]
+	profile.MemoryMB = 10240
+	p.profiles["ct"] = profile
+	capacity := &lxcStartCapacity{t: t, generation: time.Now()}
+	p.startCapacity = capacity
+	active, released := false, 0
+	p.startGate = lxcStartGateFunc(func(_ context.Context, node string) (func(), error) {
+		require.Equal(t, "pve1", node)
+		require.False(t, active, "previous boot slot must be released before retry")
+		active = true
+		return func() { active = false; released++ }, nil
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	vm := &VM{VMID: 10061, Node: "pve1", Profile: "ct", CreatedAt: capacity.generation}
+	require.NoError(t, p.InjectJITConfig(ctx, vm, validJIT(t)))
+	require.Len(t, capacity.claims, 2)
+	require.Equal(t, 2, released)
+	require.True(t, capacity.claims[1].started)
+	require.False(t, capacity.claims[1].released)
+	require.Len(t, f.find(http.MethodPost, "/nodes/pve1/lxc/10061/status/start"), 1)
+	require.Empty(t, f.find(http.MethodPost, "/nodes/pve1/lxc/10061/status/reboot"))
 }
 
 func TestLXC_InjectJITConfigRejectsBadValues(t *testing.T) {
