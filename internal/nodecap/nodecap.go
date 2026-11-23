@@ -339,8 +339,9 @@ type Accountant struct {
 	// now is the clock used for reservation expiry and snapshot
 	// staleness. Indirect so a test can age a snapshot without sleeping;
 	// New pins it to time.Now.
-	now           func() time.Time
-	recoveryUntil time.Time
+	now              func() time.Time
+	recoveryUntil    time.Time
+	lastAdmissionLog map[admissionKey]time.Time // guarded by mu
 }
 
 // snapshot is one immutable read of /cluster/resources.
@@ -746,6 +747,7 @@ func (a *Accountant) fitsLocked(snap *snapshot, node string, shape Shape, extraF
 // a.mu and must have checked node is in snap.
 func (a *Accountant) fitsWithCreditLocked(snap *snapshot, node string, shape Shape, memCredit uint64, vcpuCredit int) bool {
 	if a.isHostMode() && time.Now().Before(a.recoveryUntil) {
+		a.logAdmissionDenial(snap, node, "restart_recovery", shape, memCredit, vcpuCredit, NodeState{})
 		return false
 	}
 	totals := snap.nodes[node]
@@ -759,10 +761,23 @@ func (a *Accountant) fitsWithCreditLocked(snap *snapshot, node string, shape Sha
 		need = uint64(float64(shape.MemoryBytes) * a.memOvercommit())
 	}
 	if need > avail {
+		reason := "memory"
+		if st.MemoryPressured {
+			reason = "missing_memory_sample"
+			if a.stale(snap) {
+				reason = "stale_snapshot"
+			}
+		}
+		a.logAdmissionDenial(snap, node, reason, shape, memCredit, vcpuCredit, st)
 		return false
 	}
 	if a.cpuGated() {
 		if st.CommittedVCPU-vcpuCredit+st.LaunchVCPUs(shape) > a.vcpuLimit(totals.vcpus) {
+			reason := "cpu"
+			if a.cpuUsageMode() && (totals.cpuMissing || a.stale(snap)) {
+				reason = "missing_or_stale_cpu_sample"
+			}
+			a.logAdmissionDenial(snap, node, reason, shape, memCredit, vcpuCredit, st)
 			return false
 		}
 	}
