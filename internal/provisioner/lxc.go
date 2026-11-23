@@ -773,47 +773,62 @@ func (p *pmox) injectLXCJIT(ctx context.Context, vm *VM, jit string) error {
 	if err != nil {
 		return fmt.Errorf("inject jit: get ct %d status: %w", vm.VMID, classifyProxmoxError(err))
 	}
-	var claim nodecap.Reservation
-	if st.Status != "running" && p.startCapacity != nil {
+	needsClaim := st.Status != "running" && p.startCapacity != nil
+	var shape nodecap.Shape
+	if needsClaim {
 		profile, ok := p.profiles[vm.Profile]
 		if !ok || profile.MemoryMB <= 0 {
 			return fmt.Errorf("inject jit: cannot size stopped ct %d", vm.VMID)
 		}
-		shape := nodecap.Shape{MemoryBytes: uint64(profile.MemoryMB) * 1024 * 1024, VCPUs: profile.CPUCores}
-		for {
-			var admitted bool
-			claim, admitted, err = p.startCapacity.ReserveExisting(ctx, vm.Node, shape, vm.VMID)
-			if err == nil && admitted {
-				break
-			}
-			timer := time.NewTimer(time.Second)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return ctx.Err()
-			case <-timer.C:
-			}
-		}
+		shape = nodecap.Shape{MemoryBytes: uint64(profile.MemoryMB) * 1024 * 1024, VCPUs: profile.CPUCores}
 	}
-	issued := false
-	defer func() {
-		if claim != nil && !issued {
-			claim.Release()
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-	}()
-	if p.startGate != nil {
-		release, gateErr := p.startGate.AcquireStart(ctx, vm.Node)
-		if gateErr != nil {
-			return fmt.Errorf("inject jit: wait for host boot budget: %w", gateErr)
+		var claim nodecap.Reservation
+		if needsClaim {
+			var admitted bool
+			if c, ok := p.startCapacity.(interface {
+				ReserveExistingForJIT(context.Context, string, nodecap.Shape, int, time.Time) (nodecap.Reservation, bool, error)
+			}); ok {
+				claim, admitted, err = c.ReserveExistingForJIT(ctx, vm.Node, shape, vm.VMID, vm.CreatedAt)
+			} else {
+				claim, admitted, err = p.startCapacity.ReserveExisting(ctx, vm.Node, shape, vm.VMID)
+			}
+			if err != nil || !admitted {
+				timer := time.NewTimer(time.Second)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return ctx.Err()
+				case <-timer.C:
+				}
+				continue
+			}
+		}
+		release := func() {}
+		if p.startGate != nil {
+			var gateErr error
+			release, gateErr = p.startGate.AcquireStart(ctx, vm.Node)
+			if gateErr != nil {
+				if claim != nil {
+					claim.Release()
+				}
+				return fmt.Errorf("inject jit: wait for host boot budget: %w", gateErr)
+			}
+		}
+		if starter, ok := claim.(interface{ BeginStart() bool }); ok && !starter.BeginStart() {
+			// A borrowed hold can expire while boot pacing is pending.
+			// Drop the slot before attempting fresh admission; no POST
+			// was issued, so this does not start the guest twice.
+			release()
+			claim.Release()
+			continue
 		}
 		defer release()
+		break
 	}
-	if claim != nil {
-		if starter, ok := claim.(interface{ BeginStart() bool }); ok && !starter.BeginStart() {
-			return fmt.Errorf("inject jit: capacity reservation expired for ct %d", vm.VMID)
-		}
-	}
-	issued = true
 	if st.Status == "running" {
 		err = p.postLXCTask(ctx, vm, "/status/reboot", map[string]any{"timeout": lxcRebootTimeoutSeconds}, 300)
 	} else {

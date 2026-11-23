@@ -1487,3 +1487,62 @@ func TestConfirmedDestroyReleasesOnlyCapturedGuestClaims(t *testing.T) {
 	require.True(t, jit.released)
 	require.Equal(t, map[uint64]*reservation{3: other, 4: unbound, 5: replacement}, a.res)
 }
+
+func TestStoppedLXCJITReusesExactStartedClaim(t *testing.T) {
+	t.Parallel()
+	rs := newResourceServer(t, []map[string]any{
+		nodeRow("pve1", 32*gib, 16),
+		stoppedGuestRow(10001, "pve1", 10*gib, 4),
+	})
+	rs.setNodeStatus("pve1", 18*gib, 32*gib)
+	a := newAccountant(t, rs, func(o *Options) {
+		o.MemoryMode = MemoryModeHostAvailable
+		o.ReserveBytes = 0
+		o.Refresh = time.Minute
+	})
+	ctx := context.Background()
+	shape := Shape{MemoryBytes: 10 * gib, VCPUs: 4}
+	generation := time.Now()
+	claim, ok, err := a.Reserve(ctx, "pve1", shape)
+	require.NoError(t, err)
+	require.True(t, ok)
+	original := claim.(*reservation)
+	original.Bind(10001)
+	original.SetGeneration(generation)
+	require.True(t, original.BeginStart())
+	expiry := original.expires
+
+	for _, mismatched := range []struct {
+		id         int
+		generation time.Time
+		shape      Shape
+	}{
+		{10001, generation.Add(-time.Second), shape},
+		{10002, generation, shape},
+		{10001, time.Time{}, shape},
+		{10001, generation, Shape{MemoryBytes: 9 * gib, VCPUs: 4}},
+	} {
+		_, granted, e := a.ReserveExistingForJIT(ctx, "pve1", mismatched.shape, mismatched.id, mismatched.generation)
+		require.NoError(t, e)
+		require.False(t, granted, "a mismatched start must not borrow the only paid claim")
+	}
+
+	borrowed, ok, err := a.ReserveExistingForJIT(ctx, "pve1", shape, 10001, generation)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, expiry, original.expires, "acquisition alone must not renew the claim")
+	borrowed.Release()
+	require.Equal(t, expiry, original.expires, "cancelled pacing must leave expiry unchanged")
+	require.Len(t, a.res, 1, "a second full reservation would block or double-charge the same LXC")
+	states, err := a.Snapshot(ctx)
+	require.NoError(t, err)
+	require.Equal(t, uint64(8*gib), states["pve1"].AvailableBytes)
+	require.True(t, borrowed.(interface{ BeginStart() bool }).BeginStart())
+
+	a.BeginRecovery(time.Minute)
+	_, ok, err = a.ReserveExistingForJIT(ctx, "pve1", shape, 10001, generation)
+	require.NoError(t, err)
+	require.False(t, ok, "borrowing cannot bypass leader recovery")
+	a.ReservationsBeforeDestroy("pve1", 10001)()
+	require.False(t, borrowed.(interface{ BeginStart() bool }).BeginStart(), "a destroyed claim cannot be rearmed")
+}

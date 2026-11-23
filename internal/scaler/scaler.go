@@ -565,7 +565,7 @@ func (s *Scaler) provisionOne(ctx context.Context, vmObj *pool.VM) bool {
 	s.metrics.TrackStartup(s.cfg.ScaleSetName, vmObj.Profile, vmObj.Name, requested)
 	injectStarted := time.Now()
 	if err := s.injectWithRetry(ctx, &provisioner.VM{
-		VMID: vmObj.VMID, Node: vmObj.Node, Name: vmObj.Name, Profile: vmObj.Profile,
+		VMID: vmObj.VMID, Node: vmObj.Node, Name: vmObj.Name, Profile: vmObj.Profile, CreatedAt: vmObj.CreatedAt,
 	}, jitCfg.EncodedJITConfig); err != nil {
 		s.metrics.ForgetStartup(s.cfg.ScaleSetName, vmObj.Name)
 		s.log.Error("jit injection failed (after retries); releasing vm", "vmid", vmObj.VMID, "err", err)

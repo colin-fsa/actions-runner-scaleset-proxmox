@@ -89,6 +89,7 @@ type VM struct {
 	Name      string
 	Profile   string
 	GuestType string
+	CreatedAt time.Time // Exact store generation, when available for JIT.
 }
 
 // CloneOptions are passed to [Provisioner.Clone]. NewVMID is allocated by

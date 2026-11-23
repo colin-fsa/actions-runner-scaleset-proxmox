@@ -386,6 +386,8 @@ type reservation struct {
 	shape Shape
 	// vmid is 0 until Bind is called.
 	vmid int
+	// generation distinguishes a stored runner from a reuse of its VMID.
+	generation time.Time
 	// freeing lists VMIDs the caller has committed to destroying in
 	// order to make this reservation fit. Their allocation is credited
 	// back while they are still visible in the snapshot; each entry
@@ -408,6 +410,23 @@ func (r *reservation) Bind(vmid int) {
 	defer r.acct.mu.Unlock()
 	r.vmid = vmid
 }
+
+// SetGeneration associates a claim with the exact store row it funds.
+func (r *reservation) SetGeneration(createdAt time.Time) {
+	r.acct.mu.Lock()
+	defer r.acct.mu.Unlock()
+	if !r.released && r.generation.IsZero() {
+		r.generation = createdAt
+	}
+}
+
+// borrowedStart uses an existing claim without transferring its ownership.
+type borrowedStart struct{ original *reservation }
+
+func (b borrowedStart) Bind(int)          {}
+func (b borrowedStart) ExpectPoweredOff() {}
+func (b borrowedStart) Release()          {}
+func (b borrowedStart) BeginStart() bool  { return b.original.BeginStart() }
 
 // BeginStart extends a live claim before issuing a start. A claim that has
 // expired cannot be used to start a guest without re-admission.
@@ -596,6 +615,16 @@ func (a *Accountant) ReserveFreeing(ctx context.Context, node string, shape Shap
 // stopped), and admitting on it would start the VM unchecked. For a VM
 // that really is running this is merely conservative.
 func (a *Accountant) ReserveExisting(ctx context.Context, node string, shape Shape, vmid int) (Reservation, bool, error) {
+	return a.reserveExisting(ctx, node, shape, vmid, time.Time{})
+}
+
+// ReserveExistingForJIT lets a stopped container use a claim from its own
+// cold start or warm promotion. It cannot borrow from another generation.
+func (a *Accountant) ReserveExistingForJIT(ctx context.Context, node string, shape Shape, vmid int, generation time.Time) (Reservation, bool, error) {
+	return a.reserveExisting(ctx, node, shape, vmid, generation)
+}
+
+func (a *Accountant) reserveExisting(ctx context.Context, node string, shape Shape, vmid int, generation time.Time) (Reservation, bool, error) {
 	snap, err := a.resources(ctx)
 	if err != nil {
 		return nil, false, err
@@ -603,18 +632,41 @@ func (a *Accountant) ReserveExisting(ctx context.Context, node string, shape Sha
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.sweepLocked(snap)
+	if a.isHostMode() && vmid > 0 && !generation.IsZero() {
+		for _, r := range a.res {
+			if r.node != node || r.vmid != vmid || !r.generation.Equal(generation) ||
+				r.shape != shape || !r.started || r.poweredOff || len(r.freeing) != 0 {
+				continue
+			}
+			// The existing hold already covers this start. Do not count a
+			// prospective destruction or start while below the guarded floor.
+			totals, known := snap.nodes[node]
+			reserve := a.reserveFor(totals.memBytes)
+			holds, _ := a.holdsAndCreditsLocked(snap, node)
+			if !known || totals.memMissing || a.stale(snap) || time.Now().Before(a.recoveryUntil) ||
+				totals.memAvailable < reserve || holds > totals.memAvailable-reserve {
+				return nil, false, nil
+			}
+			state := a.stateLocked(snap, node)
+			if state.CPUGated && state.CommittedVCPU > state.LimitVCPU {
+				return nil, false, nil
+			}
+			return borrowedStart{original: r}, true, nil
+		}
+	}
 	if !a.fitsSelfLocked(snap, node, shape, vmid) {
 		return nil, false, nil
 	}
 	a.nextRes++
 	r := &reservation{
-		id:      a.nextRes,
-		node:    node,
-		shape:   shape,
-		vmid:    vmid,
-		created: time.Now(),
-		expires: time.Now().Add(a.opts.ReservationTTL),
-		acct:    a,
+		id:         a.nextRes,
+		node:       node,
+		shape:      shape,
+		vmid:       vmid,
+		generation: generation,
+		created:    time.Now(),
+		expires:    time.Now().Add(a.opts.ReservationTTL),
+		acct:       a,
 	}
 	a.res[r.id] = r
 	return r, true, nil

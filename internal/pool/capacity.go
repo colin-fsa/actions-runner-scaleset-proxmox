@@ -55,6 +55,12 @@ func (c capacityClaim) bind(vmid int) {
 	}
 }
 
+func (c capacityClaim) setGeneration(createdAt time.Time) {
+	if r, ok := c.res.(interface{ SetGeneration(time.Time) }); ok {
+		r.SetGeneration(createdAt)
+	}
+}
+
 func (c capacityClaim) beginStart() bool {
 	if r, ok := c.res.(interface{ BeginStart() bool }); ok {
 		return r.BeginStart()
@@ -335,7 +341,9 @@ func (m *manager) admitPromotion(ctx context.Context, w *store.VM) (capacityClai
 			"profile", ps.settings.Name, "vmid", w.VMID, "node", w.Node, "memory_mb", ps.settings.MemoryMB)
 		return capacityClaim{}, false
 	}
-	return claimFor(res), true
+	claim := claimFor(res)
+	claim.setGeneration(w.CreatedAt)
+	return claim, true
 }
 
 // reserveCapacity claims capacity for one clone of ps on node.
