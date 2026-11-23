@@ -3065,6 +3065,15 @@ func (m *manager) drainDestroyQueueLocked() {
 	}
 }
 
+func (m *manager) reservationsBeforeDestroy(node string, vmid int) func() {
+	if acct, ok := m.cfg.Capacity.(interface {
+		ReservationsBeforeDestroy(string, int) func()
+	}); ok {
+		return acct.ReservationsBeforeDestroy(node, vmid)
+	}
+	return func() {}
+}
+
 // destroyOrSyncFallback is the clone-failure destroy path. The async
 // route used by every other site bails out fast if m.workerCtx is
 // already cancelled (the destroyAsync goroutine's destroySem.Acquire
@@ -3084,10 +3093,12 @@ func (m *manager) destroyOrSyncFallback(vmid int, node, profile string) {
 		"vmid", vmid, "node", node)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
+	releaseReservations := m.reservationsBeforeDestroy(node, vmid)
 	if err := m.prov.Destroy(ctx, &provisioner.VM{VMID: vmid, Node: node}); err != nil {
 		m.log.Warn("clone-fail destroy: synchronous fallback failed; vm may leak", "vmid", vmid, "err", err)
 		return
 	}
+	releaseReservations()
 	if err := m.store.Delete(vmid); err != nil {
 		m.log.Warn("clone-fail destroy: row delete failed after sync destroy", "vmid", vmid, "err", err)
 	}
@@ -3112,6 +3123,7 @@ func (m *manager) destroy(ctx context.Context, vmid int, node string) {
 	))
 	defer span.End()
 
+	releaseReservations := m.reservationsBeforeDestroy(node, vmid)
 	if err := m.prov.Destroy(dctx, &provisioner.VM{VMID: vmid, Node: node}); err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "destroy failed")
@@ -3125,6 +3137,7 @@ func (m *manager) destroy(ctx context.Context, vmid int, node string) {
 		m.log.Warn("destroy: provisioner failed", "vmid", vmid, "err", err)
 		return
 	}
+	releaseReservations()
 	// Delete the row and capture its runner_id in the same write txn.
 	// A separate Get-then-Delete would race with concurrent
 	// SetRunnerID writes that land during prov.Destroy: a stale read

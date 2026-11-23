@@ -476,6 +476,26 @@ func New(cli *proxmox.Client, opts Options) (*Accountant, error) {
 	}, nil
 }
 
+// ReservationsBeforeDestroy captures the claims bound to this guest before
+// issuing its destroy. Invoke the returned function only after confirmed
+// destroy success, before releasing the pool's VMID. Claims acquired later
+// are not affected, even if the VMID has been reused.
+func (a *Accountant) ReservationsBeforeDestroy(node string, vmid int) func() {
+	a.mu.Lock()
+	var claims []*reservation
+	for _, r := range a.res {
+		if r.vmid == vmid && r.node == node {
+			claims = append(claims, r)
+		}
+	}
+	a.mu.Unlock()
+	return func() {
+		for _, r := range claims {
+			r.Release()
+		}
+	}
+}
+
 // Snapshot returns the current per-node capacity state, net of the host
 // reserve and every outstanding reservation. Callers use it to publish
 // gauges and to size an eviction plan.

@@ -2,6 +2,7 @@ package gh
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/pool"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/provisioner"
 	"github.com/stretchr/testify/require"
 )
 
@@ -103,4 +105,75 @@ func TestOfflineBusyVetoesCleanupIncludingFinalCheck(t *testing.T) {
 	now = now.Add(r.cfg.RunningIdleGrace + time.Second)
 	require.NoError(t, r.Tick(context.Background()))
 	require.Len(t, mgr.destroyCalls, 1)
+}
+
+type stoppedTestProv struct {
+	*stubProv
+	state string
+	err   error
+}
+
+func (s *stoppedTestProv) PowerState(context.Context, *provisioner.VM) (string, error) {
+	return s.state, s.err
+}
+
+type missingTestPool struct {
+	*fakeManager
+	checked []pool.RowSnapshot
+}
+
+func (m *missingTestPool) ForceDestroyUnchanged(_ context.Context, row pool.RowSnapshot, _ string) error {
+	m.checked = append(m.checked, row)
+	return nil
+}
+
+func TestAssignedMissingRequiresCompleteGitHubAndStoppedGuest(t *testing.T) {
+	for _, tc := range []struct {
+		name, power, listing          string
+		powerErr                      error
+		protected, jitPending, reaped bool
+	}{
+		{name: "stopped and absent", power: "stopped", listing: "absent", reaped: true},
+		{name: "powered on", power: "running", listing: "absent"},
+		{name: "unconfirmed power", power: "stopped", listing: "absent", powerErr: errors.New("failed power read")},
+		{name: "appears before destruction", power: "stopped", listing: "busy"},
+		{name: "failed final registry check", power: "stopped", listing: "error"},
+		{name: "pending JIT", power: "stopped", listing: "absent", jitPending: true},
+		{name: "protected adoption", power: "stopped", listing: "absent", protected: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				n := calls.Add(1)
+				if n > 2 {
+					switch tc.listing {
+					case "busy":
+						_, _ = w.Write([]byte(`{"total_count":1,"runners":[{"id":41,"name":"gh-runner-test-42","status":"online","busy":true}]}`))
+						return
+					case "error":
+						w.WriteHeader(http.StatusForbidden)
+						return
+					}
+				}
+				_, _ = w.Write([]byte(`{"total_count":0,"runners":[]}`))
+			}))
+			defer srv.Close()
+			now := time.Now()
+			row := pool.RowSnapshot{VMID: 42, Node: "pve1", Name: "gh-runner-test-42", State: "assigned", StateSince: now.Add(-time.Hour), CreatedAt: now.Add(-2 * time.Hour), JITPending: tc.jitPending, AdoptionProtected: tc.protected}
+			m := &missingTestPool{fakeManager: &fakeManager{rows: []pool.RowSnapshot{row}}}
+			p := &stoppedTestProv{stubProv: &stubProv{}, state: tc.power, err: tc.powerErr}
+			r, err := New(baseCfg(), newTestClient(t, srv), m, p, silentLogger(), nil)
+			require.NoError(t, err)
+			r.now = func() time.Time { return now }
+			require.NoError(t, r.Tick(context.Background()))
+			require.Empty(t, m.checked, "start grace on first observed absence, not row age")
+			now = now.Add(r.cfg.AssignedGrace + time.Second)
+			require.NoError(t, r.Tick(context.Background()))
+			if tc.reaped {
+				require.Equal(t, []pool.RowSnapshot{row}, m.checked)
+			} else {
+				require.Empty(t, m.checked)
+			}
+		})
+	}
 }
