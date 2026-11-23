@@ -96,3 +96,61 @@ func TestWindowsJITWriteDiagnosticsAreRedacted(t *testing.T) {
 		require.NotContains(t, err.Error(), "secret-jit-payload")
 	}
 }
+
+func TestWindowsJITHandoffState(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		exit int
+		want string
+	}{
+		{"pristine", 0, "pristine"},
+		{"occupied", 41, "occupied"},
+		{"unknown", 42, "unknown"},
+		{"no exit code", -1, "unknown"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case strings.HasSuffix(r.URL.Path, "/agent/exec"):
+					var body struct{ Command []string }
+					require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+					require.Len(t, body.Command, 5)
+					buf, err := base64.StdEncoding.DecodeString(body.Command[4])
+					require.NoError(t, err)
+					units := make([]uint16, len(buf)/2)
+					for i := range units {
+						units[i] = uint16(buf[2*i]) | uint16(buf[2*i+1])<<8
+					}
+					script := string(utf16.Decode(units))
+					for _, s := range []string{"Get-ScheduledTask", "Get-ChildItem", "started", "jitconfig.tmp", "ReparsePoint", "Test-JitConfig.ps1", ".Execute -ine $expectedExe"} {
+						require.Contains(t, script, s)
+					}
+					require.NotContains(t, script, "ReadAllText")
+					require.NotContains(t, script, "Get-Content")
+					_, _ = io.WriteString(w, `{"data":{"pid":7}}`)
+				case strings.HasSuffix(r.URL.Path, "/agent/exec-status"):
+					if tc.exit == -1 {
+						_, _ = io.WriteString(w, `{"data":{"exited":true,"err-data":"must-not-leak"}}`)
+					} else {
+						_, _ = fmt.Fprintf(w, `{"data":{"exited":true,"exitcode":%d,"err-data":"must-not-leak"}}`, tc.exit)
+					}
+				default:
+					t.Errorf("unexpected read path: %s", r.URL.Path)
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+			p := newTestProvisioner(t, srv, "pve1")
+			p.profiles = map[string]config.ProfileConfig{"win": {Name: "win", GuestOS: "windows"}}
+			got, err := p.WindowsJITHandoffState(t.Context(), &VM{VMID: 7, Node: "pve1", Profile: "win"})
+			require.Equal(t, tc.want, got)
+			if tc.want == "unknown" {
+				require.Error(t, err)
+				require.NotContains(t, err.Error(), "must-not-leak")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}

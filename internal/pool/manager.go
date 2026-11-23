@@ -1307,10 +1307,19 @@ func (m *manager) adoptOne(ctx context.Context, pv *provisioner.VM, runners map[
 			state = store.StateDestroying
 		} else if state == store.StateHot {
 			readCtx, cancel := context.WithTimeout(ctx, adoptPowerStateTimeoutPerVM)
-			jit, err := m.prov.ReadJITConfig(readCtx, &provisioner.VM{VMID: pv.VMID, Node: pv.Node, Name: pv.Name, Profile: profile})
+			handoff := "unknown"
+			if probe, ok := m.prov.(interface {
+				WindowsJITHandoffState(context.Context, *provisioner.VM) (string, error)
+			}); ok {
+				result, err := probe.WindowsJITHandoffState(readCtx, &provisioner.VM{VMID: pv.VMID, Node: pv.Node, Name: pv.Name, Profile: profile})
+				if err == nil && (result == "pristine" || result == "occupied") {
+					handoff = result
+				}
+			}
 			cancel()
-			if err != nil || len(jit) != 0 {
+			if handoff != "pristine" {
 				state = store.StateAssigned
+				m.log.Warn("adopt: Windows handoff cannot be reused", "vmid", pv.VMID, "handoff", handoff)
 			}
 		}
 	}
