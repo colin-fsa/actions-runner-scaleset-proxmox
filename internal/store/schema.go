@@ -110,6 +110,8 @@ type VM struct {
 	HasRecycleSnapshot bool
 	JITPending         bool
 	JITAssignedAt      time.Time
+	WindowsJITAt       time.Time
+	WindowsJITRunnerID int64
 	// AdoptionProtected prevents cleanup or reuse while restart observations
 	// cannot establish that an inherited guest's job is no longer busy.
 	AdoptionProtected bool

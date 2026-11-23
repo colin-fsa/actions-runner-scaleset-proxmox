@@ -765,6 +765,9 @@ type CapacityConfig struct {
 	// available RAM covers its full request plus the host reserve; a value below
 	// 1.0 lets the box be oversubscribed. Ignored in the allocated mode.
 	MemoryOvercommit float64 `yaml:"memory_overcommit" validate:"gte=0,lte=1"`
+
+	// WindowsOnlineSettleAfter is opt-in. See config.example.yaml.
+	WindowsOnlineSettleAfter Duration `yaml:"windows_online_settle_after"`
 }
 
 // ProfileConfig defines a runner profile — a named bundle of hardware
@@ -1762,6 +1765,14 @@ func (c *Config) resolvePool() error {
 	default:
 		return fmt.Errorf("pool.capacity.memory_mode: unknown value %q (expected %q or %q)",
 			c.Pool.Capacity.MemoryMode, MemoryModeAllocated, MemoryModeHostAvailable)
+	}
+	if d := c.Pool.Capacity.WindowsOnlineSettleAfter.D(); d != 0 {
+		if d < 30*time.Second || d >= max(15*time.Minute, c.Pool.CloneInflightGrace.D()) {
+			return errors.New("pool.capacity.windows_online_settle_after must be zero or at least 30s and shorter than the reservation TTL")
+		}
+		if !c.Pool.Capacity.Enabled || c.Pool.Capacity.MemoryMode != MemoryModeHostAvailable {
+			return errors.New("pool.capacity.windows_online_settle_after requires host_available capacity admission")
+		}
 	}
 	// GitHub reconciler grace knobs must be strictly positive. Like the
 	// pool durations above, ApplyDefaults substituted defaults for unset

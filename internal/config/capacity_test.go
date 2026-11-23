@@ -272,3 +272,22 @@ func TestCapacity_CPUModes(t *testing.T) {
 	_, err = config.Parse(capacityCfg("10", capacityOn+"\n    cpu_mode: host_usage\n    cpu_launch_vcpus: -1", "0", "4096"))
 	require.Error(t, err)
 }
+
+func TestCapacity_WindowsOnlineSettleIsOptIn(t *testing.T) {
+	t.Parallel()
+	cfg, err := config.Parse(capacityCfg("10", capacityOn, "2", "4096"))
+	require.NoError(t, err)
+	require.Zero(t, cfg.Pool.Capacity.WindowsOnlineSettleAfter.D())
+	hostMode := capacityOn + "\n    memory_mode: host_available"
+	cfg, err = config.Parse(capacityCfg("10", hostMode+"\n    windows_online_settle_after: 2m", "2", "4096"))
+	require.NoError(t, err)
+	require.Equal(t, 2*time.Minute, cfg.Pool.Capacity.WindowsOnlineSettleAfter.D())
+	for _, bad := range []string{
+		capacityOn + "\n    windows_online_settle_after: 2m",
+		hostMode + "\n    windows_online_settle_after: 29s",
+		hostMode + "\n    windows_online_settle_after: 15m",
+	} {
+		_, err = config.Parse(capacityCfg("10", bad, "2", "4096"))
+		require.ErrorContains(t, err, "pool.capacity.windows_online_settle_after")
+	}
+}

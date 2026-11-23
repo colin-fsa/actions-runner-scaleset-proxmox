@@ -580,6 +580,11 @@ func (s *Scaler) provisionOne(ctx context.Context, vmObj *pool.VM) bool {
 		}
 		return false
 	}
+	if runnerID > 0 {
+		if p, ok := s.pool.(interface{ RecordWindowsJITDelivery(*pool.VM, int64) }); ok {
+			p.RecordWindowsJITDelivery(vmObj, runnerID)
+		}
+	}
 	s.metrics.ObserveStartupStage(s.cfg.ScaleSetName, vmObj.Profile, "jit_injection", time.Since(injectStarted))
 	s.metrics.StartupDelivered(s.cfg.ScaleSetName, vmObj.Name)
 	return true
