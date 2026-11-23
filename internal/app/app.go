@@ -806,6 +806,30 @@ func runOneScaleset(leaderCtx context.Context, deps runOneScalesetDeps, entry co
 		}
 	}()
 
+	owner := scope.Org
+	if owner == "" {
+		idx := strings.IndexByte(scope.Repo, '/')
+		if idx <= 0 {
+			return fmt.Errorf("scalesets[%q].scope.repo %q is not in owner/repo form (validation should have caught this)",
+				entry.Name, scope.Repo)
+		}
+		owner = scope.Repo[:idx]
+	}
+	sessionClient, err := ghClient.MessageSessionClient(leaderCtx, rss.ID, owner)
+	if err != nil {
+		return fmt.Errorf("open message session: %w", err)
+	}
+
+	// An exclusive message session must be available before adoption can
+	// queue cleanup. A 409 retry must not race its own previous destroys.
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.WithoutCancel(leaderCtx), 10*time.Second)
+		defer cancel()
+		if err := sessionClient.Close(closeCtx); err != nil {
+			log.Warn("close runner message session", "scaleset", entry.Name, "err", err)
+		}
+	}()
+
 	if err := mgr.Adopt(leaderCtx); err != nil {
 		// An empty store after failed discovery makes live guests look like
 		// orphans. Let the supervisor retry adoption before any sweeper runs.
@@ -839,20 +863,6 @@ func runOneScaleset(leaderCtx context.Context, deps runOneScalesetDeps, entry co
 		log.Warn("priority: matcher build failed; priority observation disabled", "scaleset", entry.Name, "err", err)
 	} else {
 		sc.SetPriority(pm)
-	}
-
-	owner := scope.Org
-	if owner == "" {
-		idx := strings.IndexByte(scope.Repo, '/')
-		if idx <= 0 {
-			return fmt.Errorf("scalesets[%q].scope.repo %q is not in owner/repo form (validation should have caught this)",
-				entry.Name, scope.Repo)
-		}
-		owner = scope.Repo[:idx]
-	}
-	sessionClient, err := ghClient.MessageSessionClient(leaderCtx, rss.ID, owner)
-	if err != nil {
-		return fmt.Errorf("open message session: %w", err)
 	}
 
 	lst, err := listener.New(sessionClient, listener.Config{

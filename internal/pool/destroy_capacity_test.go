@@ -51,3 +51,29 @@ func TestDestroyReleasesReservationsOnlyAfterProvisionerSuccess(t *testing.T) {
 		})
 	}
 }
+
+func TestForgetAbsentAssignedCannotDeleteNewGeneration(t *testing.T) {
+	st := newTestStore(t)
+	p := &fakeProv{}
+	m := newTestManager(t, st, p, Config{})
+	v := &store.VM{VMID: 10001, Node: "pve1", Name: "gh-runner-test-10001", Profile: defaultProfileName, State: store.StateAssigned, PoolKind: store.PoolKindHot, AdoptionProtected: true}
+	require.NoError(t, st.Insert(v))
+	rs, err := m.ListRows(context.Background())
+	require.NoError(t, err)
+	require.Len(t, rs, 1)
+	stale := rs[0]
+	_, err = st.Update(v.VMID, func(v *store.VM) { v.RunnerID = 100 })
+	require.NoError(t, err)
+	removed, err := m.ForgetAbsentAssigned(context.Background(), stale)
+	require.NoError(t, err)
+	require.False(t, removed)
+	_, err = st.Update(v.VMID, func(v *store.VM) { v.RunnerID = 0 })
+	require.NoError(t, err)
+	rs, err = m.ListRows(context.Background())
+	require.NoError(t, err)
+	removed, err = m.ForgetAbsentAssigned(context.Background(), rs[0])
+	require.NoError(t, err)
+	require.True(t, removed)
+	_, err = st.Get(v.VMID)
+	require.ErrorIs(t, err, store.ErrNotFound)
+}

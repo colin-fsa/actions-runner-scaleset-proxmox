@@ -177,3 +177,64 @@ func TestAssignedMissingRequiresCompleteGitHubAndStoppedGuest(t *testing.T) {
 		})
 	}
 }
+
+type absentAdoptionProv struct {
+	*stubProv
+	absent bool
+}
+
+func (p *absentAdoptionProv) ConfirmGuestAbsent(context.Context, *provisioner.VM) (bool, error) {
+	return p.absent, nil
+}
+
+type forgetAdoptionPool struct {
+	*fakeManager
+	forgotten []pool.RowSnapshot
+}
+
+func (p *forgetAdoptionPool) ForgetAbsentAssigned(_ context.Context, row pool.RowSnapshot) (bool, error) {
+	p.forgotten = append(p.forgotten, row)
+	return true, nil
+}
+func TestForgetAbsentAdoptionRequiresStableCompleteProof(t *testing.T) {
+	now := time.Now()
+	row := pool.RowSnapshot{VMID: 42, Name: "gh-runner-test-42", Node: "pve1", State: "assigned", CreatedAt: now, StateSince: now, AdoptionProtected: true}
+	mgr := &forgetAdoptionPool{fakeManager: &fakeManager{rows: []pool.RowSnapshot{row}}}
+	prov := &absentAdoptionProv{stubProv: &stubProv{}, absent: true}
+	var present atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if present.Load() {
+			_, _ = w.Write([]byte(`{"total_count":1,"runners":[{"id":42,"name":"gh-runner-test-42","status":"online","busy":true}]}`))
+		} else {
+			_, _ = w.Write([]byte(`{"total_count":0,"runners":[]}`))
+		}
+	}))
+	defer srv.Close()
+	r, err := New(baseCfg(), newTestClient(t, srv), mgr, prov, silentLogger(), nil)
+	require.NoError(t, err)
+	r.now = func() time.Time { return now }
+	ctx := context.Background()
+	tick := func(truncated bool) { r.applyMatrix(ctx, mgr.rows, map[string]pool.RunnerInfo{}, truncated) }
+	tick(false)
+	now = now.Add(r.cfg.AssignedGrace + time.Second)
+	tick(true) // incomplete page invalidates the previous observation
+	tick(false)
+	require.Empty(t, mgr.forgotten)
+	now = now.Add(r.cfg.AssignedGrace + time.Second)
+	present.Store(true) // fresh confirmation vetoes stale prior listing
+	tick(false)
+	require.Empty(t, mgr.forgotten)
+	present.Store(false)
+	tick(false)
+	now = now.Add(r.cfg.AssignedGrace + time.Second)
+	prov.absent = false // reused VMID or unknown PVE presence
+	tick(false)
+	require.Empty(t, mgr.forgotten)
+	prov.absent = true
+	tick(false)
+	require.Empty(t, mgr.forgotten)
+	now = now.Add(r.cfg.AssignedGrace + time.Second)
+	tick(false)
+	require.Equal(t, []pool.RowSnapshot{row}, mgr.forgotten)
+	require.Empty(t, mgr.destroyCalls)
+}
