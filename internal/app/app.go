@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -225,27 +226,33 @@ func Run(ctx context.Context, opts Options) error {
 				acct.RequireRecovery(true)
 			}
 			g.Go(func() error {
-				return completeLeaderRestart(ctxg, log, cfg, sharedProv, restart, func(holds []nodecap.RestartHold, discardRemoved func()) error {
-					if !hasRecovery {
-						return errors.New("host admission recovery accounting unavailable")
-					}
-					starter, ok := deps.capacity.(interface {
-						InstallRestartHolds([]nodecap.RestartHold) error
+				quiet := max(cfg.Pool.BootStartInterval.D(), 15*time.Second)
+				return completeLeaderRestart(ctxg, log, cfg, sharedProv.Client(),
+					func(ctx context.Context, vm *provisioner.VM) error {
+						ping, cancel := context.WithTimeout(ctx, 8*time.Second)
+						defer cancel()
+						return sharedProv.WaitReady(ping, vm, 8*time.Second)
+					}, quiet, restart, func(holds []nodecap.RestartHold, discardRemoved func()) error {
+						if !hasRecovery {
+							return errors.New("host admission recovery accounting unavailable")
+						}
+						starter, ok := deps.capacity.(interface {
+							InstallRestartHolds([]nodecap.RestartHold) error
+						})
+						if !ok {
+							return errors.New("inherited guest accounting unavailable")
+						}
+						if err := starter.InstallRestartHolds(holds); err != nil {
+							return err
+						}
+						discardRemoved()
+						acct.RequireRecovery(false)
+						deps.windowsBootBudget.RequireRecovery(false)
+						for _, entry := range cfg.Scalesets {
+							health.MarkScalesetRecoveryDone(entry.Name)
+						}
+						return nil
 					})
-					if !ok {
-						return errors.New("inherited guest accounting unavailable")
-					}
-					if err := starter.InstallRestartHolds(holds); err != nil {
-						return err
-					}
-					discardRemoved()
-					acct.RequireRecovery(false)
-					deps.windowsBootBudget.RequireRecovery(false)
-					for _, entry := range cfg.Scalesets {
-						health.MarkScalesetRecoveryDone(entry.Name)
-					}
-					return nil
-				})
 			})
 		}
 		for i := range cfg.Scalesets {
@@ -779,13 +786,14 @@ func runOneScaleset(leaderCtx context.Context, deps runOneScalesetDeps, entry co
 		return fmt.Errorf("build github rest client: %w", err)
 	}
 
-	rss, err := ensureScaleSetForEntry(leaderCtx, ghClient, entry, metrics, log)
-	if err != nil {
-		return fmt.Errorf("ensure runner scale set: %w", err)
+	guarded := deps.restart != nil
+	var rss *scaleset.RunnerScaleSet
+	if !guarded {
+		rss, err = ensureScaleSetForEntry(leaderCtx, ghClient, entry, metrics, log)
+		if err != nil {
+			return fmt.Errorf("ensure runner scale set: %w", err)
+		}
 	}
-	ssSysInfo.ScaleSetID = rss.ID
-	ghClient.SetSystemInfo(ssSysInfo)
-	log.Info("runner scale set ready", "scaleset", entry.Name, "name", rss.Name, "id", rss.ID)
 
 	// Build the per-profile canary controller. Errors are
 	// non-fatal — log + degrade to no-canary (every clone
@@ -795,9 +803,6 @@ func runOneScaleset(leaderCtx context.Context, deps runOneScalesetDeps, entry co
 		log.Warn("canary: controller build failed; canary rollout disabled", "scaleset", entry.Name, "err", cerr)
 		canaryCtrl = nil
 	}
-	state.canaryPtr.Store(canaryCtrl)
-	defer state.canaryPtr.Store(nil)
-
 	st, err := store.New()
 	if err != nil {
 		return fmt.Errorf("init store: %w", err)
@@ -854,22 +859,8 @@ func runOneScaleset(leaderCtx context.Context, deps runOneScalesetDeps, entry co
 		}
 		owner = scope.Repo[:idx]
 	}
-	sessionClient, err := ghClient.MessageSessionClient(leaderCtx, rss.ID, owner)
-	if err != nil {
-		return fmt.Errorf("open message session: %w", err)
-	}
-
-	// An exclusive message session must be available before adoption can
-	// queue cleanup. A 409 retry must not race its own previous destroys.
-	defer func() {
-		closeCtx, cancel := context.WithTimeout(context.WithoutCancel(leaderCtx), 10*time.Second)
-		defer cancel()
-		if err := sessionClient.Close(closeCtx); err != nil {
-			log.Warn("close runner message session", "scaleset", entry.Name, "err", err)
-		}
-	}()
-
-	if deps.restart != nil && !deps.restart.released() {
+	observed := guarded && !deps.restart.released()
+	if observed {
 		strict, ok := mgr.(interface{ AdoptForRestart(context.Context) error })
 		if !ok {
 			return errors.New("adopt inherited guests: scoped restart observation unavailable")
@@ -877,16 +868,75 @@ func runOneScaleset(leaderCtx context.Context, deps runOneScalesetDeps, entry co
 		if err := strict.AdoptForRestart(leaderCtx); err != nil {
 			return fmt.Errorf("adopt inherited guests for restart: %w", err)
 		}
-		defer deps.restart.track(entry.Name, mgr)()
-	} else if err := mgr.Adopt(leaderCtx); err != nil {
-		// An empty store after failed discovery makes live guests look like
-		// orphans. Let the supervisor retry adoption before any sweeper runs.
-		return fmt.Errorf("adopt inherited guests: %w", err)
+		// This manager is observation-only while the session POST is
+		// retried. Keep its row generations stable for shared accounting.
+		untrack := deps.restart.track(entry.Name, mgr)
+		defer untrack()
 	}
-	if deps.restart == nil || deps.restart.released() {
+	if guarded {
+		rss, err = lookupGuardedScaleSet(leaderCtx, deps.restart.ready,
+			func(ctx context.Context) (int, *scaleset.RunnerScaleSet, error) {
+				return lookupScaleSetForEntry(ctx, ghClient, entry)
+			},
+			func(ctx context.Context, groupID int) (*scaleset.RunnerScaleSet, error) {
+				return createScaleSetForEntry(ctx, ghClient, entry, groupID, metrics, log)
+			})
+		if err != nil {
+			return fmt.Errorf("prepare guarded runner scale set %q: %w", entry.Name, err)
+		}
+	}
+
+	ssSysInfo.ScaleSetID = rss.ID
+	ghClient.SetSystemInfo(ssSysInfo)
+
+	sessionClient, err := openObservedMessageSession(leaderCtx, log, entry.Name, observed,
+		scalesetRetryInitialBackoff, scalesetRetryMaxBackoff, func(ctx context.Context) (*scaleset.MessageSessionClient, error) {
+			return ghClient.MessageSessionClient(ctx, rss.ID, owner)
+		})
+	if err != nil {
+		return fmt.Errorf("open message session: %w", err)
+	}
+
+	// Only this exact acquired session permits the mutation-capable
+	// workers, including startup cleanup and label reconciliation.
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.WithoutCancel(leaderCtx), 10*time.Second)
+		defer cancel()
+		if err := sessionClient.Close(closeCtx); err != nil {
+			log.Warn("close runner message session", "scaleset", entry.Name, "err", err)
+		}
+	}()
+	if guarded {
+		groupID, current, err := lookupScaleSetForEntry(leaderCtx, ghClient, entry)
+		if err != nil {
+			return err
+		}
+		if current == nil || current.ID != rss.ID {
+			return errors.New("runner scale set changed during message-session acquisition")
+		}
+		reconciled, err := reconcileScaleSetLabels(leaderCtx, ghClient, entry, current, groupID, metrics, log)
+		if err != nil {
+			return fmt.Errorf("reconcile runner scale set labels: %w", err)
+		}
+		if reconciled.ID != rss.ID {
+			// The normal idle-only label repair recreated this set.
+			// Retry with an exclusive session for its new numeric ID.
+			return errors.New("runner scale set recreated; reopen its message session")
+		}
+	}
+	if !observed {
+		if err := mgr.Adopt(leaderCtx); err != nil {
+			return fmt.Errorf("adopt inherited guests: %w", err)
+		}
+	}
+	if !guarded || deps.restart.released() {
 		health.MarkScalesetRecoveryDone(entry.Name)
 	}
 	health.MarkProxmoxOK()
+	log.Info("runner scale set ready", "scaleset", entry.Name, "name", rss.Name, "id", rss.ID)
+
+	state.canaryPtr.Store(canaryCtrl)
+	defer state.canaryPtr.Store(nil)
 
 	state.poolPtr.Store(&mgr)
 	defer state.poolPtr.Store(nil)
@@ -949,6 +999,12 @@ func runOneScaleset(leaderCtx context.Context, deps runOneScalesetDeps, entry co
 	}
 
 	g, ctxg := errgroup.WithContext(leaderCtx)
+	if observed {
+		g.Go(func() error {
+			deps.restart.runSessionOwnedCleanup(ctxg, entry.Name, mgr, log)
+			return nil
+		})
+	}
 	g.Go(func() error { return mgr.Run(ctxg) })
 	if schedRunner != nil {
 		g.Go(func() error { return runSwallowCancel(func() error { return schedRunner.Run(ctxg) }) })
@@ -959,6 +1015,57 @@ func runOneScaleset(leaderCtx context.Context, deps runOneScalesetDeps, entry co
 		return runSwallowCancel(func() error { return lst.Run(ctxg, sc) })
 	})
 	return g.Wait()
+}
+
+func openObservedMessageSession(ctx context.Context, log *slog.Logger, name string, observed bool, initial, maxBackoff time.Duration,
+	open func(context.Context) (*scaleset.MessageSessionClient, error)) (*scaleset.MessageSessionClient, error) {
+	if !observed {
+		return open(ctx)
+	}
+	backoff := initial
+	for {
+		attempt, cancel := context.WithTimeout(ctx, 15*time.Second)
+		session, err := open(attempt)
+		cancel()
+		if err == nil {
+			return session, nil
+		}
+		// The pinned SDK wraps HTTP status as request metadata, with
+		// no exported status-error type. Restrict the retry to that
+		// exact prefix; never inspect a remote request body's prose.
+		if !messageSessionConflict(err) {
+			return nil, err
+		}
+		log.Warn("runner message session conflict; pool remains observation-only", "scaleset", name, "retry_after", backoff)
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+		backoff = min(backoff*2, maxBackoff)
+	}
+}
+
+func messageSessionConflict(err error) bool {
+	const wrapped = "failed to create message session: failed to do the session request: request POST "
+	msg, ok := strings.CutPrefix(err.Error(), wrapped)
+	if !ok {
+		return false
+	}
+	rawURL, status, ok := strings.Cut(msg, " failed(status=")
+	if !ok || !(strings.HasPrefix(status, `"409 Conflict")`) || strings.HasPrefix(status, `"409 Conflict",`)) {
+		return false
+	}
+	u, err := url.ParseRequestURI(rawURL)
+	if err != nil || !u.IsAbs() || u.Host == "" {
+		return false
+	}
+	_, path, ok := strings.Cut(u.Path, "/runnerscalesets/")
+	id, sessionRoute := strings.CutSuffix(path, "/sessions")
+	number, err := strconv.Atoi(id)
+	return ok && sessionRoute && err == nil && number > 0
 }
 
 // runSwallowCancel runs fn and treats context.Canceled as a clean exit
@@ -1091,6 +1198,48 @@ func runScalesetAttempt(ctx context.Context, entry config.ScaleSetEntry, state *
 	return run(ctx, entry, state)
 }
 
+// lookupGuardedScaleSet permits only read-only lookup while the shared
+// inventory is unproved. An absent set can be created once after proof;
+// re-read before creation so an appeared set cannot trigger label
+// reconciliation before this controller owns a session.
+func lookupGuardedScaleSet(ctx context.Context, ready <-chan struct{},
+	lookup func(context.Context) (int, *scaleset.RunnerScaleSet, error),
+	create func(context.Context, int) (*scaleset.RunnerScaleSet, error)) (*scaleset.RunnerScaleSet, error) {
+	_, existing, err := lookup(ctx)
+	if err != nil || existing != nil {
+		return existing, err
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-ready:
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	group, existing, err := lookup(ctx)
+	if err != nil || existing != nil {
+		return existing, err
+	}
+	return create(ctx, group)
+}
+
+func lookupScaleSetForEntry(ctx context.Context, gh *scaleset.Client, entry config.ScaleSetEntry) (int, *scaleset.RunnerScaleSet, error) {
+	groupID := 1
+	if entry.RunnerGroup != "" {
+		rg, err := gh.GetRunnerGroupByName(ctx, entry.RunnerGroup)
+		if err != nil {
+			return 0, nil, fmt.Errorf("get runner group %q: %w", entry.RunnerGroup, err)
+		}
+		groupID = rg.ID
+	}
+	existing, err := gh.GetRunnerScaleSet(ctx, groupID, entry.Name)
+	if err != nil {
+		return 0, nil, fmt.Errorf("lookup runner scale set %q: %w", entry.Name, err)
+	}
+	return groupID, existing, nil
+}
+
 // ensureScaleSetForEntry locates the entry's scale set by name or
 // creates it, then reconciles its labels with the entry's configured
 // Labels. Identity (Name / Labels / RunnerGroup) is read from the
@@ -1112,17 +1261,9 @@ func runScalesetAttempt(ctx context.Context, entry config.ScaleSetEntry, state *
 // health signal stayed green. reconcileScaleSetLabels closes that gap.
 func ensureScaleSetForEntry(ctx context.Context, gh *scaleset.Client, entry config.ScaleSetEntry,
 	metrics *observability.Metrics, log *slog.Logger) (*scaleset.RunnerScaleSet, error) {
-	groupID := 1
-	if entry.RunnerGroup != "" {
-		rg, err := gh.GetRunnerGroupByName(ctx, entry.RunnerGroup)
-		if err != nil {
-			return nil, fmt.Errorf("get runner group %q: %w", entry.RunnerGroup, err)
-		}
-		groupID = rg.ID
-	}
-	existing, err := gh.GetRunnerScaleSet(ctx, groupID, entry.Name)
+	groupID, existing, err := lookupScaleSetForEntry(ctx, gh, entry)
 	if err != nil {
-		return nil, fmt.Errorf("lookup runner scale set %q: %w", entry.Name, err)
+		return nil, err
 	}
 	if existing != nil {
 		rss, rerr := reconcileScaleSetLabels(ctx, gh, entry, existing, groupID, metrics, log)
@@ -1131,6 +1272,10 @@ func ensureScaleSetForEntry(ctx context.Context, gh *scaleset.Client, entry conf
 		}
 		return rss, nil
 	}
+	return createScaleSetForEntry(ctx, gh, entry, groupID, metrics, log)
+}
+
+func createScaleSetForEntry(ctx context.Context, gh *scaleset.Client, entry config.ScaleSetEntry, groupID int, metrics *observability.Metrics, log *slog.Logger) (*scaleset.RunnerScaleSet, error) {
 	log.Info("creating runner scale set", "name", entry.Name)
 	labels := make([]scaleset.Label, 0, len(entry.Labels))
 	for _, l := range entry.Labels {

@@ -25,6 +25,7 @@ type recoveryFixture struct {
 	tail             []restartTask
 	archive          []restartTask
 	guests           []restartGuest
+	lxcGuests        []restartGuest
 	memory           map[string]any
 	taskError        bool
 	cloneLogs        map[string]string
@@ -89,7 +90,15 @@ func (f *recoveryFixture) Get(_ context.Context, path string, dst any) error {
 			HA map[string]int `json:"ha"`
 		}{g, map[string]int{"managed": 0}})
 	case "/nodes/pve/lxc":
-		return encode([]restartGuest{})
+		return encode(append([]restartGuest{}, f.lxcGuests...))
+	case "/nodes/pve/lxc/11001/status/current":
+		if len(f.lxcGuests) != 1 {
+			return errors.New("direct LXC unavailable")
+		}
+		return encode(struct {
+			restartGuest
+			HA map[string]int `json:"ha"`
+		}{f.lxcGuests[0], map[string]int{"managed": 0}})
 	case "/nodes/pve/status":
 		mem := f.memory
 		if mem == nil {

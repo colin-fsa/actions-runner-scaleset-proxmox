@@ -129,6 +129,10 @@ The same node status privilege used by live capacity allows the clock read;
 own task visibility does not require datacenter-wide auditing. Missing or
 ambiguous task evidence logs a reason and blocks new clones and power
 starts, while existing listeners and tracked-job reconciliation continue.
+A scale set waiting for an exclusive GitHub message session can contribute
+read-only recovery observations. It cannot run workers or cleanup until it
+owns that session. A missing scale set can be created after shared proof;
+on a first guarded install, the same prior Proxmox proof requirements apply.
 Pristine, already-powered Windows runners can accept jobs without a new
 power operation. If the same inherited running process remains observable
 but its readiness cannot be confirmed, it stays unavailable for new work
