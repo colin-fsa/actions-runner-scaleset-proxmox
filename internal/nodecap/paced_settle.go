@@ -81,17 +81,15 @@ func ReportPacedWorkerDone(ctx context.Context) {
 }
 
 type pacedBootProof struct {
-	upid                   string
-	completed              bool
-	ready                  time.Time
-	name                   string
-	firstSample            time.Time
-	firstBootAt            time.Time
-	firstUptime            uint64
-	submitName, submitKind string
-	returned, probeAt      time.Time
-	workerDone             bool
-	rechecked              inactiveStartView
+	upid                    string
+	completed               bool
+	completedAt             time.Time
+	ready                   time.Time
+	name                    string
+	submitName, submitKind  string
+	returned, probeAt       time.Time
+	workerDone, slotSettled bool
+	rechecked               inactiveStartView
 }
 
 func (r *reservation) pacedTask(stamp time.Time, node string, vmid int, upid string, completed bool) {
@@ -104,8 +102,9 @@ func (r *reservation) pacedTask(stamp time.Time, node string, vmid int, upid str
 	if !completed && r.pacedProof.upid == "" {
 		r.pacedProof.upid = upid
 	}
-	if completed && r.pacedProof.upid == upid {
+	if completed && r.pacedProof.upid == upid && !r.pacedProof.completed {
 		r.pacedProof.completed = true
+		r.pacedProof.completedAt = a.now()
 	}
 }
 
@@ -119,46 +118,4 @@ func (r *reservation) pacedReady(stamp time.Time, name string) {
 	if r.pacedProof.ready.IsZero() {
 		r.pacedProof.ready, r.pacedProof.name = a.now(), name
 	}
-}
-
-// pacedBootVisibleLocked retires a boot hold, not a promise to reserve all
-// future job RSS. The measured policy retains the normal hard reserve,
-// waits for identical boot identity and two independent fresh host reads
-// after task success and guest readiness, and never assumes a boot failed
-// merely because it is absent from a read.
-func (a *Accountant) pacedBootVisibleLocked(snap *snapshot, r *reservation) bool {
-	p := &r.pacedProof
-	if !r.paced || p.ready.IsZero() {
-		return false
-	}
-	sample := snap.nodes[r.node]
-	guest, known := snap.runningGuests[r.vmid]
-	if !known || guest.node != r.node || guest.name != p.name || guest.uptime == 0 ||
-		!snap.takenAt.After(p.ready) || !sample.memReadAt.After(p.ready) ||
-		a.recoveringLocked() || a.stale(snap) ||
-		sample.memMissing || a.now().Sub(sample.memReadAt) > a.opts.Refresh ||
-		sample.memAvailable < a.reserveFor(sample.memBytes) ||
-		(a.cpuUsageMode() && (sample.cpuMissing || sample.vcpus <= 0 ||
-			sample.cpuUsage >= float64(a.vcpuLimit(sample.vcpus))/float64(sample.vcpus))) {
-		return false
-	}
-	bootAt := snap.takenAt.Add(-time.Duration(guest.uptime) * time.Second)
-	// Bound pvestatd timing lag without accepting a reboot after readiness.
-	slop := max(a.opts.Refresh, 15*time.Second)
-	if bootAt.Before(r.startedAt.Add(-slop)) || bootAt.After(p.ready) {
-		return false
-	}
-	if p.firstSample.IsZero() {
-		p.firstSample, p.firstBootAt, p.firstUptime = sample.memReadAt, bootAt, guest.uptime
-		return false
-	}
-	if sample.memReadAt.Sub(p.firstSample) < max(a.opts.PacedStartInterval, 15*time.Second) {
-		return false
-	}
-	if guest.uptime <= p.firstUptime || bootAt.Before(p.firstBootAt.Add(-slop)) || bootAt.After(p.firstBootAt.Add(slop)) {
-		return false
-	}
-	a.log.Debug("nodecap: observed paced boot; retired start hold", "node", r.node, "vmid", r.vmid,
-		"generation", r.generation, "claim", r.id, "upid", p.upid, "memory_bytes", r.shape.MemoryBytes)
-	return true
 }

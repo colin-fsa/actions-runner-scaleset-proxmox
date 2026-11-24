@@ -135,9 +135,10 @@ type restartGuest struct {
 }
 
 type restartView struct {
-	uptime int64
-	tasks  map[string]restartTask
-	guests map[int]restartGuest
+	uptime         int64
+	hostObservedAt time.Time
+	tasks          map[string]restartTask
+	guests         map[int]restartGuest
 }
 
 func scopedRestartConfig(cfg *config.Config) bool {
@@ -367,7 +368,7 @@ func readRestartView(ctx context.Context, cli recoveryReader, cfg *config.Config
 	if hostErr != nil || host.Uptime <= 0 || !hasAvailable {
 		return restartView{}, errors.New("authoritative host available memory unavailable")
 	}
-	view.uptime = host.Uptime
+	view.uptime, view.hostObservedAt = host.Uptime, time.Now()
 	view.tasks, err = readRestartTasks(ctx, cli, node, cfg.Proxmox.Auth.TokenID, cutoff)
 	if err != nil {
 		return restartView{}, err
@@ -480,7 +481,11 @@ func proveScopedRestart(ctx context.Context, cli recoveryReader, cfg *config.Con
 		}
 	}
 	unready.Range(func(_, value any) bool {
-		result.holds = append(result.holds, value.(nodecap.RestartHold))
+		hold := value.(nodecap.RestartHold)
+		// Both direct guest/process observations matched, and each was
+		// followed by actual host capacity. Keep row quarantine separate.
+		hold.HostObservedAt = second.hostObservedAt
+		result.holds = append(result.holds, hold)
 		return true
 	})
 	return nil

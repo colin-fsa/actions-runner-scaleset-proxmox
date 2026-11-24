@@ -137,7 +137,7 @@ func TestPacedStartRejectsCachedCapacityWhenFreshSourceFails(t *testing.T) {
 	require.Empty(t, a.res)
 }
 
-func TestPacedBootLimitAndSeparateSuccessSamples(t *testing.T) {
+func TestPacedBootLimitRejectsClusterVisibilityWithoutDirectProof(t *testing.T) {
 	rs := newResourceServer(t, []map[string]any{nodeRow("pve1", 157*gib, 88)})
 	rs.setNodeStatus("pve1", 68*gib, 157*gib)
 	a := newAccountant(t, rs, func(o *Options) {
@@ -182,8 +182,8 @@ func TestPacedBootLimitAndSeparateSuccessSamples(t *testing.T) {
 	row["uptime"] = 22
 	rs.setRows([]map[string]any{nodeRow("pve1", 157*gib, 88), row})
 	_, ok = doReserve(10003)
-	require.True(t, ok, "task, ready guest and two fresh matching observations allow the next paced start")
-	require.True(t, one.(*reservation).released)
+	require.False(t, ok, "cluster uptime and a receipt do not replace exact direct boot visibility")
+	require.False(t, one.(*reservation).released)
 	require.False(t, two.(*reservation).released, "neighbor's unresolved task/guest is uncredited")
 }
 
@@ -314,4 +314,40 @@ func TestRestartHoldIsExactAndDoesNotCountAsPendingPower(t *testing.T) {
 	state, err = a.Snapshot(t.Context())
 	require.NoError(t, err)
 	require.Equal(t, uint64(7*gib), state["pve1"].AvailableBytes)
+}
+
+func TestRestartObservedHostSkipsExtraDebitOnlyInPacedHostMode(t *testing.T) {
+	rs := newResourceServer(t, []map[string]any{nodeRow("pve1", 32*gib, 16)})
+	now := time.Now()
+	for _, tc := range []struct {
+		name     string
+		paced    bool
+		observed time.Time
+		want     int
+	}{
+		{"paired direct proof", true, now, 0},
+		{"stale host proof", true, now.Add(-time.Hour), -1},
+		{"missing host proof", true, time.Time{}, 1},
+		{"other host config", false, now, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newAccountant(t, rs, func(o *Options) {
+				o.MemoryMode, o.ReserveBytes, o.Refresh = MemoryModeHostAvailable, 4*gib, time.Minute
+				if tc.paced {
+					o.PacedStartLimit, o.PacedStartInterval = 2, 15*time.Second
+				}
+			})
+			a.now = func() time.Time { return now }
+			a.RequireRecovery(true)
+			err := a.InstallRestartHolds([]RestartHold{{Node: "pve1", VMID: 10001, Generation: now,
+				Shape: Shape{MemoryBytes: 4 * gib, VCPUs: 4}, HostObservedAt: tc.observed}})
+			if tc.want < 0 {
+				require.ErrorContains(t, err, "repeat restart proof")
+				require.Empty(t, a.res, "do not install a permanent debit for a retryable observation")
+				return
+			}
+			require.NoError(t, err)
+			require.Len(t, a.res, tc.want)
+		})
+	}
 }

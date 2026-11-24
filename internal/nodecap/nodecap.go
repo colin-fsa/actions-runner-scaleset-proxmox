@@ -344,10 +344,11 @@ type Accountant struct {
 	// now is the clock used for reservation expiry and snapshot
 	// staleness. Indirect so a test can age a snapshot without sleeping;
 	// New pins it to time.Now.
-	now                 func() time.Time
-	recoveryUntil       time.Time
-	verificationPending bool
-	lastAdmissionLog    map[admissionKey]time.Time // guarded by mu
+	now                      func() time.Time
+	recoveryUntil            time.Time
+	verificationPending      bool
+	lastAdmissionLog         map[admissionKey]time.Time // guarded by mu
+	lastPacedHostObservation map[string]time.Time
 }
 
 // snapshot is one immutable read of /cluster/resources.
@@ -366,10 +367,9 @@ type snapshot struct {
 	// a node's live available RAM reflects only powered-on guests, so a
 	// reservation's RAM counts as "already in free" only once its guest is
 	// powered on, not the moment its configured memory is raised.
-	guestPowered  map[int]bool
-	runningGuests map[int]qemuIdentity
-	qemuRunning   map[int]qemuIdentity
-	takenAt       time.Time
+	guestPowered map[int]bool
+	qemuRunning  map[int]qemuIdentity
+	takenAt      time.Time
 }
 
 type nodeTotals struct {
@@ -736,7 +736,7 @@ func (a *Accountant) ReservePacedRestart(ctx context.Context, node string, vmid 
 	a.sweepLocked(snap)
 	totals, known := snap.nodes[node]
 	if !known || totals.memMissing || a.stale(snap) || a.recoveringLocked() ||
-		totals.memAvailable < a.reserveFor(totals.memBytes) {
+		totals.memReadAt.Before(a.lastPacedHostObservation[node]) || totals.memAvailable < a.reserveFor(totals.memBytes) {
 		return nil, false, nil
 	}
 	// This is not a new CPU allocation. Check actual host CPU where
@@ -758,9 +758,12 @@ func (a *Accountant) reserveExistingFrom(snap *snapshot, node string, shape Shap
 	defer a.mu.Unlock()
 	a.sweepLocked(snap)
 	if paced {
+		if snap.nodes[node].memReadAt.Before(a.lastPacedHostObservation[node]) {
+			return nil, false, nil
+		}
 		outstanding := 0
 		for _, r := range a.res {
-			if r.paced && r.node == node && !(r.vmid == vmid && !generation.IsZero() && r.generation.Equal(generation)) {
+			if r.paced && !r.pacedProof.slotSettled && r.node == node && !(r.vmid == vmid && !generation.IsZero() && r.generation.Equal(generation)) {
 				outstanding++
 			}
 		}
@@ -965,7 +968,7 @@ func (a *Accountant) stateLocked(snap *snapshot, node string) NodeState {
 		// snapshot too old to trust, has no usable number to admit against.
 		// Memory is not overcommittable, so guessing the other way would
 		// silently oversubscribe the box.
-		if totals.memMissing || a.stale(snap) {
+		if totals.memMissing || a.stale(snap) || totals.memReadAt.Before(a.lastPacedHostObservation[node]) {
 			return NodeState{
 				TotalBytes:      totals.memBytes,
 				ReserveBytes:    reserve,
@@ -1211,11 +1214,6 @@ func (a *Accountant) sweepLocked(snap *snapshot) {
 			delete(a.res, id)
 			continue
 		}
-		if a.pacedBootVisibleLocked(snap, r) {
-			r.released = true
-			delete(a.res, id)
-			continue
-		}
 		retired := r.vmid != 0 && snap.guestMem[r.vmid] >= r.shape.MemoryBytes
 		if a.isHostMode() && !r.poweredOff {
 			// Power-on is not evidence that host RAM has settled. A
@@ -1268,6 +1266,16 @@ func (a *Accountant) resources(ctx context.Context) (*snapshot, error) {
 		fresh, err := a.fetch(fetchCtx)
 		if err != nil {
 			return nil, err
+		}
+		// Reconcile observed starts even when held capacity prevents the pool
+		// from reaching the powered-start admission path. Never use a cached
+		// inventory/host read as evidence for retiring a claim.
+		if a.SupportsPacedStart() {
+			for node := range fresh.nodes {
+				probe, stop := context.WithTimeout(fetchCtx, min(a.opts.Refresh, 5*time.Second))
+				a.recheckInactiveStarts(probe, node, fresh)
+				stop()
+			}
 		}
 		a.cache.Set(snapshotCacheKey, fresh, ttlcache.DefaultTTL)
 		a.mu.Lock()
@@ -1323,10 +1331,6 @@ func (a *Accountant) fetch(ctx context.Context) (*snapshot, error) {
 		guestPowered: map[int]bool{},
 		takenAt:      a.now(),
 	}
-	if a.SupportsPacedStart() {
-		snap.runningGuests = make(map[int]qemuIdentity)
-	}
-
 	if a.opts.WindowsOnlineSettleAfter > 0 {
 		snap.qemuRunning = make(map[int]qemuIdentity)
 	}
@@ -1363,10 +1367,6 @@ func (a *Accountant) fetch(ctx context.Context) (*snapshot, error) {
 			// faithful record of who is actually consuming live host RAM — the
 			// thing host_available mode keys its holds and retirement on.
 			snap.guestPowered[vmid] = r.Status != guestStopped
-			if snap.runningGuests != nil && r.Status == "running" {
-				snap.runningGuests[vmid] = qemuIdentity{node: r.Node, name: r.Name, uptime: r.Uptime}
-			}
-
 			if snap.qemuRunning != nil && r.Type == "qemu" && r.Status == "running" {
 				snap.qemuRunning[vmid] = qemuIdentity{node: r.Node, name: r.Name, uptime: r.Uptime}
 			}

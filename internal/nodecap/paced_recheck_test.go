@@ -132,3 +132,135 @@ func exerciseInactiveReceiptRecovery(t *testing.T, ready bool) {
 	require.NoError(t, err)
 	require.Equal(t, uint64(16*gib), st["pve1"].AvailableBytes, "both incomplete submissions still hold full RAM")
 }
+
+func TestPacedTerminalBootUsesFreshDirectHostAndNoReadiness(t *testing.T) {
+	for _, op := range []string{"qmstart", "vzstart", "vzreboot"} {
+		t.Run(op, func(t *testing.T) {
+			const owner = "runner@pve!production"
+			const id = 10001
+			const node = "pve1"
+			const name = "runner-10001"
+			kind := "qemu"
+			if strings.HasPrefix(op, "vz") {
+				kind = "lxc"
+			}
+			var mu sync.Mutex
+			now := time.Now().Truncate(time.Second)
+			begun := now
+			boot := begun.Add(time.Second)
+			pid, guestName, status, exit := 9172, name, "running", "OK"
+			available := uint64(60 * gib)
+			badHost := false
+			degraded := false
+			upid := fmt.Sprintf("UPID:pve1:00000001:00000002:%08X:%s:%d:%s:", begun.Unix(), op, id, owner)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				mu.Lock()
+				defer mu.Unlock()
+				write := func(data any) { _ = json.NewEncoder(w).Encode(map[string]any{"data": data}) }
+				switch {
+				case req.URL.Path == "/cluster/resources":
+					// Lagging uptime would place the original 3s boot *after*
+					// the successful task's completion. It must not gate proof.
+					write([]map[string]any{nodeRow(node, 64*gib, 32),
+						{"type": kind, "node": node, "vmid": id, "name": name, "status": "running",
+							"uptime": max(int64(now.Sub(boot)/time.Second)-8, 0), "maxmem": 10 * gib}})
+				case req.URL.Path == "/nodes/pve1/status":
+					if badHost {
+						http.Error(w, "node status unavailable", http.StatusBadRequest)
+						return
+					}
+					var mem any = available
+					if degraded {
+						mem = int64(-1)
+					}
+					write(map[string]any{"memory": map[string]any{"total": 64 * gib, "available": mem}})
+				case strings.HasSuffix(req.URL.Path, "/"+upid+"/status"):
+					write(map[string]any{"upid": upid, "node": node, "type": op, "id": "10001",
+						"starttime": begun.Unix(), "status": "stopped", "exitstatus": exit})
+				case req.URL.Path == fmt.Sprintf("/nodes/%s/%s/%d/status/current", node, kind, id):
+					reportPID, uptime := pid, int64(now.Sub(boot)/time.Second)
+					if status == "stopped" {
+						reportPID, uptime = 0, 0
+					}
+					write(map[string]any{"vmid": "10001", "name": guestName, "status": status, "pid": reportPID,
+						"uptime": uptime, "ha": map[string]int{"managed": 0}})
+				default:
+					http.Error(w, "unexpected route", http.StatusBadRequest)
+				}
+			}))
+			t.Cleanup(srv.Close)
+			a, err := New(proxmox.NewClient(srv.URL), Options{MemoryMode: MemoryModeHostAvailable, ReserveBytes: 4 * gib,
+				Refresh: time.Minute, PacedStartLimit: 1, PacedStartInterval: 15 * time.Second, PacedTaskOwner: owner, Log: quietLogger()})
+			require.NoError(t, err)
+			a.now = func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+			advance := func(d time.Duration) { mu.Lock(); defer mu.Unlock(); now = now.Add(d) }
+			gen := begun.Add(-time.Second)
+			shape := Shape{MemoryBytes: 10 * gib}
+			r, ok, err := a.ReserveExistingForPacedStart(t.Context(), node, shape, id, gen, false)
+			require.NoError(t, err)
+			require.True(t, ok)
+			require.True(t, r.(*reservation).BeginStart())
+			ctx := WithPacedTaskReceipt(t.Context(), r)
+			ReportPacedSubmissionReturned(ctx, name, kind)
+			ReportPacedTask(ctx, node, id, upid, false)
+			advance(3 * time.Second)
+			ReportPacedTask(ctx, node, id, "wrong-receipt", true)
+			check := func() NodeState {
+				a.cache.Delete(snapshotCacheKey)
+				res, err := a.Snapshot(t.Context())
+				require.NoError(t, err)
+				return res[node]
+			}
+			advance(3 * time.Second)
+			require.Equal(t, uint64(46*gib), check().AvailableBytes, "unconfirmed task holds")
+			ReportPacedTask(ctx, node, id, upid, true)
+			advance(5 * time.Second)
+			require.Equal(t, uint64(46*gib), check().AvailableBytes, "one exact sample still holds")
+			advance(16 * time.Second)
+			mu.Lock()
+			guestName = "reused-10001"
+			mu.Unlock()
+			require.Equal(t, uint64(46*gib), check().AvailableBytes, "same ID but wrong name is not proof")
+			advance(6 * time.Second)
+			mu.Lock()
+			guestName, exit = name, "failed"
+			mu.Unlock()
+			require.Equal(t, uint64(46*gib), check().AvailableBytes, "terminal failure is not success")
+			advance(6 * time.Second)
+			mu.Lock()
+			exit, status = "OK", "stopped"
+			mu.Unlock()
+			require.Equal(t, uint64(46*gib), check().AvailableBytes, "stopped guest is not accounted boot")
+			advance(6 * time.Second)
+			mu.Lock()
+			status, degraded = "running", true
+			mu.Unlock()
+			require.Zero(t, check().AvailableBytes, "invalid live host reading fails closed")
+			advance(6 * time.Second)
+			mu.Lock()
+			degraded = false
+			mu.Unlock()
+			require.Equal(t, uint64(46*gib), check().AvailableBytes, "first reliable post-failure sample")
+			advance(16 * time.Second)
+			mu.Lock()
+			pid++
+			mu.Unlock()
+			require.Equal(t, uint64(46*gib), check().AvailableBytes, "PID change restarts the quiet observation")
+			advance(16 * time.Second)
+			old, err := a.fetch(t.Context())
+			require.NoError(t, err)
+			advance(time.Second)
+			require.Equal(t, uint64(56*gib), check().AvailableBytes, "no guest agent, runner readiness, or worker done needed")
+			require.True(t, r.(*reservation).released)
+			_, ok, err = a.reserveExistingFrom(old, node, shape, id+1, gen, false, true)
+			require.NoError(t, err)
+			require.False(t, ok, "an older in-flight snapshot cannot spend newly released credit")
+			mu.Lock()
+			badHost = true
+			mu.Unlock()
+			_, ok, err = a.ReserveExistingForPacedStart(t.Context(), node, shape, id+1, gen, false)
+			require.NoError(t, err)
+			require.False(t, ok, "resolved holds do not bypass fresh host admission")
+		})
+	}
+}
