@@ -210,14 +210,44 @@ func Run(ctx context.Context, opts Options) error {
 	// other scale sets keep running. Sibling shutdown still
 	// happens via ctx cancel on process-wide SIGTERM / drain.
 	runLeaderPlane := func(leaderCtx context.Context) error {
-		// An old leader can have Proxmox tasks in flight after it exits.
-		// Wait through their bounded start and memory-settling window.
-		recovery := max(15*time.Minute, cfg.Pool.CloneInflightGrace.D())
-		deps.windowsBootBudget.BeginRecovery(recovery)
-		if acct, ok := deps.capacity.(interface{ BeginRecovery(time.Duration) }); ok {
-			acct.BeginRecovery(recovery)
-		}
+		leaderDeps := deps
 		g, ctxg := errgroup.WithContext(leaderCtx)
+		hostMode := cfg.Pool.Capacity.Enabled && cfg.Pool.Capacity.MemoryMode == config.MemoryModeHostAvailable
+		if hostMode {
+			restart := &restartBarrier{
+				managers: make(map[string]pool.Manager, len(cfg.Scalesets)),
+				ready:    make(chan struct{}),
+			}
+			leaderDeps.restart = restart
+			deps.windowsBootBudget.RequireRecovery(true)
+			acct, hasRecovery := deps.capacity.(interface{ RequireRecovery(bool) })
+			if hasRecovery {
+				acct.RequireRecovery(true)
+			}
+			g.Go(func() error {
+				return completeLeaderRestart(ctxg, log, cfg, sharedProv, restart, func(holds []nodecap.RestartHold, discardRemoved func()) error {
+					if !hasRecovery {
+						return errors.New("host admission recovery accounting unavailable")
+					}
+					starter, ok := deps.capacity.(interface {
+						InstallRestartHolds([]nodecap.RestartHold) error
+					})
+					if !ok {
+						return errors.New("inherited guest accounting unavailable")
+					}
+					if err := starter.InstallRestartHolds(holds); err != nil {
+						return err
+					}
+					discardRemoved()
+					acct.RequireRecovery(false)
+					deps.windowsBootBudget.RequireRecovery(false)
+					for _, entry := range cfg.Scalesets {
+						health.MarkScalesetRecoveryDone(entry.Name)
+					}
+					return nil
+				})
+			})
+		}
 		for i := range cfg.Scalesets {
 			entry := cfg.Scalesets[i]
 			state := scStates[entry.Name]
@@ -225,7 +255,7 @@ func Run(ctx context.Context, opts Options) error {
 				return superviseScaleset(ctxg, entry, state, log,
 					scalesetRetryInitialBackoff, scalesetRetryMaxBackoff,
 					func(ctx context.Context, entry config.ScaleSetEntry, state *scalesetState) error {
-						return runOneScaleset(ctx, deps, entry, state)
+						return runOneScaleset(ctx, leaderDeps, entry, state)
 					})
 			})
 		}
@@ -581,22 +611,27 @@ func buildCapacityAccountant(cfg *config.Config, prov provisioner.Provisioner, l
 	if !cc.Enabled {
 		return nil, nil //nolint:nilnil // nil accountant IS the disabled state; an error would be wrong
 	}
+	bootLimit := max(cfg.Pool.BootsPerNode, cfg.Pool.WindowsBootsPerNode)
+	if cc.EvictIdleForDemand {
+		bootLimit = 0 // preserve the independent parked-eviction reservation path
+	}
 	acct, err := nodecap.New(prov.Client(), nodecap.Options{
-		Nodes:            affinityNodeUniverse(cfg),
-		Refresh:          cc.RefreshInterval.D(),
-		ReserveBytes:     uint64(max(cc.ReserveMemoryMB, 0)) * 1024 * 1024,
-		ReserveFraction:  cc.ReserveMemoryFraction,
-		CPUOvercommit:    cc.CPUOvercommitRatio,
-		CPUMode:          cc.CPUMode,
-		CPUUsageLimit:    cc.CPUUsageLimit,
-		CPULaunchVCPUs:   derefInt(cc.CPULaunchVCPUs),
-		MemoryMode:       cc.MemoryMode,
-		MemoryOvercommit: cc.MemoryOvercommit,
-		// The in-flight clone grace already means "how long before we
-		// assume a clone that never came back is gone"; a reservation
-		// outliving its clone is the same question, so it reuses the
-		// same knob rather than adding a near-duplicate one.
-		ReservationTTL:           max(15*time.Minute, cfg.Pool.CloneInflightGrace.D()),
+		PacedStartLimit:    bootLimit,
+		PacedStartInterval: cfg.Pool.BootStartInterval.D(),
+		PacedTaskOwner:     cfg.Proxmox.Auth.TokenID,
+		Nodes:              affinityNodeUniverse(cfg),
+		Refresh:            cc.RefreshInterval.D(),
+		ReserveBytes:       uint64(max(cc.ReserveMemoryMB, 0)) * 1024 * 1024,
+		ReserveFraction:    cc.ReserveMemoryFraction,
+		CPUOvercommit:      cc.CPUOvercommitRatio,
+		CPUMode:            cc.CPUMode,
+		CPUUsageLimit:      cc.CPUUsageLimit,
+		CPULaunchVCPUs:     derefInt(cc.CPULaunchVCPUs),
+		MemoryMode:         cc.MemoryMode,
+		MemoryOvercommit:   cc.MemoryOvercommit,
+		// Abandoned pending work is bounded by the clone grace. Paced
+		// submissions are retired only through proof or confirmed cleanup.
+		ReservationTTL:           cfg.Pool.CloneInflightGrace.D(),
 		WindowsOnlineSettleAfter: cc.WindowsOnlineSettleAfter.D(),
 		WindowsOnlineFreshness:   2 * cfg.GitHub.PollInterval.D(),
 		// How the accountant recognises our own guests, which count even
@@ -717,6 +752,7 @@ type runOneScalesetDeps struct {
 	health            *observability.Health
 	log               *slog.Logger
 	sysInfo           scaleset.SystemInfo
+	restart           *restartBarrier
 }
 
 // runOneScaleset drives one scale set's GH listener, REST
@@ -833,12 +869,23 @@ func runOneScaleset(leaderCtx context.Context, deps runOneScalesetDeps, entry co
 		}
 	}()
 
-	if err := mgr.Adopt(leaderCtx); err != nil {
+	if deps.restart != nil && !deps.restart.released() {
+		strict, ok := mgr.(interface{ AdoptForRestart(context.Context) error })
+		if !ok {
+			return errors.New("adopt inherited guests: scoped restart observation unavailable")
+		}
+		if err := strict.AdoptForRestart(leaderCtx); err != nil {
+			return fmt.Errorf("adopt inherited guests for restart: %w", err)
+		}
+		defer deps.restart.track(entry.Name, mgr)()
+	} else if err := mgr.Adopt(leaderCtx); err != nil {
 		// An empty store after failed discovery makes live guests look like
 		// orphans. Let the supervisor retry adoption before any sweeper runs.
 		return fmt.Errorf("adopt inherited guests: %w", err)
 	}
-	health.MarkScalesetRecoveryDone(entry.Name)
+	if deps.restart == nil || deps.restart.released() {
+		health.MarkScalesetRecoveryDone(entry.Name)
+	}
 	health.MarkProxmoxOK()
 
 	state.poolPtr.Store(&mgr)
@@ -890,6 +937,7 @@ func runOneScaleset(leaderCtx context.Context, deps runOneScalesetDeps, entry co
 		AssignedOfflineGrace: cfg.GitHub.AssignedOfflineGrace.D(),
 		OrphanGrace:          cfg.Pool.OrphanGrace.D(),
 		RunnerNamePrefix:     state.vmPrefix,
+		RecoveryPending:      deps.windowsBootBudget.RecoveryPending,
 	}, restCli, mgr, state.prov, log, metrics)
 	if err != nil {
 		return fmt.Errorf("build gh reconciler: %w", err)

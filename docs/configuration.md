@@ -107,21 +107,45 @@ Slots are held through guest readiness or failure; saturation defers pool
 refill. The budget is local to one elected controller, not a lock between
 independently deployed controllers.
 
-With capacity enabled and `memory_mode: host_available`, start reservations
-withhold the configured RAM (scaled by `memory_overcommit`) for at least 15
-minutes after the start request, or `clone_inflight_grace` if longer. This is a
-bounded settling assumption, not a measurement of individual guest RAM. It can
-temporarily double count memory that has already appeared in host usage.
-After each leader election, start pacing and host-memory admission pause for
-the same window to let requests from the previous leader settle. This initial
-quiet period is intentional even on a fresh controller: with pacing enabled,
-new starts wait at least 15 minutes after election; host-available admission
-also waits when capacity accounting is enabled. Queued work can remain queued
-throughout this period and LXC JIT delivery can wait for the budget, increasing
-listener response time. Plan the isolated canary around that delay rather than
-interpreting it as a failed start. This policy assumes Proxmox start tasks and
-memory ramp complete within that window; raise `clone_inflight_grace` if that
-is not conservative enough. Keep host reserve for other workloads.
+With `host_available` capacity and a configured start pace/limit, the
+controller samples node capacity immediately before a shared power POST.
+A submitted launch holds capacity until Proxmox confirms successful task
+completion, the guest is ready, and independent fresh host samples see the
+same boot, or until its destruction is confirmed. The hard host reserve
+still applies; this is not a reservation of future job memory. An ambiguous
+launch stays charged rather than expiring automatically. Once its local
+worker has returned and two direct reads show stable identity, trustworthy
+host capacity and no unfinished matching task, it can stop occupying a
+concurrent start slot without lifting its memory charge. A missing task
+requires positive visibility of the existing controller token's own task
+archive; empty results by themselves are not enough.
+
+On replacement, a paced standalone single-node deployment with a dedicated,
+unchanged Proxmox API token and destroy-mode recycling validates the
+controller's own active/archive task stream, exact adopted guests and fresh
+host capacity before reopening admission. The previous instance must be
+stopped, and other operators must not manage the controller's VMID ranges.
+The same node status privilege used by live capacity allows the clock read;
+own task visibility does not require datacenter-wide auditing. Missing or
+ambiguous task evidence logs a reason and blocks new clones and power
+starts, while existing listeners and tracked-job reconciliation continue.
+Pristine, already-powered Windows runners can accept jobs without a new
+power operation. If the same inherited running process remains observable
+but its readiness cannot be confirmed, it stays unavailable for new work
+and separately retains its full configured footprint until confirmed
+cleanup; it does not consume a concurrent boot slot. No timer clears
+blocked restart proof or that footprint. If a matching old clone first
+appears after initial adoption, it is recorded without any power or delete
+request and the complete proof runs again. An expected-name, in-range,
+untagged guest can occupy an excluded ID after old tasks drain and two
+direct fresh observations confirm it is stopped, unlocked and not HA
+managed. An exact same-token clone log provides attribution when still
+available; an older or missing log never confers ownership. The excluded
+ID consumes no runner slot or host RAM reservation and requires operator
+review. The controller never tags, starts, or deletes it. A new install or token
+with no prior matching archive has no restart proof: establish a clean
+handoff under operator control before enabling this guarded mode. Other
+topologies with these gates do not automatically resume on this path.
 
 ### Staged canary and rollback
 

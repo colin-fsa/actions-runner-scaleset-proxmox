@@ -432,7 +432,7 @@ func (p *pmox) cloneLXCFromTemplate(ctx context.Context, opts CloneOptions, temp
 	params := buildLXCCloneParams(p.scaleSetName, opts, templateNodeName)
 	delay := lxcCloneRetryBase
 	for attempt := 1; ; attempt++ {
-		err := p.postLXCTask(ctx, &VM{VMID: templateVMID, Node: templateNodeName}, "/clone", params, 600)
+		err := p.postLXCTask(ctx, &VM{VMID: templateVMID, Node: templateNodeName}, "/clone", params, int(cloneTaskTimeout/time.Second))
 		if err == nil {
 			return nil
 		}
@@ -544,31 +544,68 @@ func (p *pmox) lxcStatus(ctx context.Context, node string, vmid int) (*lxcStatus
 // postLXCTask POSTs to a container endpoint that returns a task UPID and
 // awaits it.
 func (p *pmox) postLXCTask(ctx context.Context, vm *VM, suffix string, body any, seconds int) error {
-	var upid proxmox.UPID
-	if err := p.cli.Post(ctx, lxcPath(vm.Node, vm.VMID, suffix), body, &upid); err != nil {
+	task, err := p.submitLXCTask(ctx, vm, suffix, body)
+	if err != nil {
 		return err
 	}
-	return awaitTask(ctx, proxmox.NewTask(upid, p.cli), seconds)
+	return p.awaitLXCTask(ctx, vm, suffix, task, seconds)
 }
 
-// startLXC is Start for a container: re-verify the firewall sandbox (see
-// Start for why), then power on.
-func (p *pmox) startLXC(ctx context.Context, vm *VM) error {
+func (p *pmox) submitLXCTask(ctx context.Context, vm *VM, suffix string, body any) (*proxmox.Task, error) {
+	var upid proxmox.UPID
+	if err := p.cli.Post(ctx, lxcPath(vm.Node, vm.VMID, suffix), body, &upid); err != nil {
+		return nil, err
+	}
+	if upid == "" {
+		return nil, errors.New("Proxmox returned no task ID; outcome unknown")
+	}
+	if suffix == "/status/start" || suffix == "/status/reboot" {
+		nodecap.ReportPacedTask(ctx, vm.Node, vm.VMID, string(upid), false)
+		p.log.Debug("start: Proxmox task accepted", "vmid", vm.VMID, "node", vm.Node, "upid", upid, "operation", suffix)
+	}
+	return proxmox.NewTask(upid, p.cli), nil
+}
+
+func (p *pmox) awaitLXCTask(ctx context.Context, vm *VM, suffix string, task *proxmox.Task, seconds int) error {
+	accepted := task.UPID
+	err := awaitTask(ctx, task, seconds)
+	if err == nil && (suffix == "/status/start" || suffix == "/status/reboot") {
+		p.reportStartTaskOutcome(ctx, vm.Node, vm.VMID, accepted, task, suffix)
+	}
+	return err
+}
+
+// startLXC re-verifies the firewall sandbox before a paced HTTP POST.
+func (p *pmox) startLXC(ctx context.Context, vm *VM, gate StartSubmission) error {
 	if p.cfg.Firewall.Enabled {
 		if err := p.ensureFirewallLXC(ctx, vm); err != nil {
 			return fmt.Errorf("ensure firewall before start: %w", err)
 		}
 	}
-	return p.startLXCTask(ctx, vm)
+	return p.startLXCTask(ctx, vm, gate)
 }
 
-func (p *pmox) startLXCTask(ctx context.Context, vm *VM) error {
+func (p *pmox) startLXCTask(ctx context.Context, vm *VM, gates ...StartSubmission) error {
 	ctx, span := tracer.Start(ctx, "provisioner.PowerOn")
 	defer span.End()
-	if err := p.postLXCTask(ctx, vm, "/status/start", nil, 300); err != nil {
-		if isAlreadyRunning(err) {
-			return nil
-		}
+	var task *proxmox.Task
+	const operation = "/status/start"
+	submit := func(requestCtx context.Context) error {
+		ctx = requestCtx
+		var err error
+		task, err = p.submitLXCTask(requestCtx, vm, operation, nil)
+		return err
+	}
+	var err error
+	if len(gates) > 0 && gates[0] != nil {
+		err = gates[0](ctx, submit)
+	} else {
+		err = submit(ctx)
+	}
+	if err == nil {
+		err = p.awaitLXCTask(ctx, vm, operation, task, 300)
+	}
+	if err != nil && !isAlreadyRunning(err) {
 		return fmt.Errorf("start ct: %w", err)
 	}
 	return nil
@@ -760,31 +797,162 @@ func (p *pmox) injectLXCJIT(ctx context.Context, vm *VM, jit string) error {
 	// PVE's env option replaces the whole NUL-separated list, so merge:
 	// keep the container's (template-inherited) variables in order, drop
 	// any previous JIT entry and append the new one.
-	var ctCfg map[string]any
-	if err := p.cli.Get(ctx, lxcPath(vm.Node, vm.VMID, "/config"), &ctCfg); err != nil {
-		return fmt.Errorf("inject jit: read config of ct %d: %w", vm.VMID, classifyProxmoxError(err))
+	stage := func() error {
+		var ctCfg map[string]any
+		if err := p.cli.Get(ctx, lxcPath(vm.Node, vm.VMID, "/config"), &ctCfg); err != nil {
+			return fmt.Errorf("inject jit: read config of ct %d: %w", vm.VMID, classifyProxmoxError(err))
+		}
+		existing, _ := ctCfg["env"].(string)
+		body := map[string]any{"env": mergeLXCJITEnv(existing, jit)}
+		if err := p.cli.Put(ctx, lxcPath(vm.Node, vm.VMID, "/config"), body, nil); err != nil {
+			return fmt.Errorf("inject jit: set env on ct %d: %w", vm.VMID, redactJIT(classifyProxmoxError(err), jit))
+		}
+
+		return nil
 	}
-	existing, _ := ctCfg["env"].(string)
-	body := map[string]any{"env": mergeLXCJITEnv(existing, jit)}
-	if err := p.cli.Put(ctx, lxcPath(vm.Node, vm.VMID, "/config"), body, nil); err != nil {
-		return fmt.Errorf("inject jit: set env on ct %d: %w", vm.VMID, redactJIT(classifyProxmoxError(err), jit))
+	var task *proxmox.Task
+	var operation string
+	submit := func(ctx context.Context, status string) error {
+		operation = "/status/start"
+		var body any
+		if status == "running" {
+			operation = "/status/reboot"
+			body = map[string]any{"timeout": lxcRebootTimeoutSeconds}
+		}
+		var err error
+		task, err = p.submitLXCTask(ctx, vm, operation, body)
+		if operation == "/status/start" && isAlreadyRunning(err) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("inject jit: restart ct %d: %w", vm.VMID, redactJIT(classifyProxmoxError(err), jit))
+		}
+		return nil
 	}
+	releaseStart, powerCtx, err := p.awaitLXCJITStart(ctx, vm, stage, submit)
+	defer nodecap.ReportPacedWorkerDone(powerCtx)
+	if err != nil {
+		return err
+	}
+	defer releaseStart()
+	if task != nil {
+		if err := p.awaitLXCTask(powerCtx, vm, operation, task, 300); err != nil {
+			return fmt.Errorf("inject jit: await restart ct %d: %w", vm.VMID, redactJIT(classifyProxmoxError(err), jit))
+		}
+	}
+	if err := p.waitReadyLXC(ctx, vm, lxcPostRestartReadyTimeout); err != nil {
+		return fmt.Errorf("inject jit: ct %d did not come back: %w", vm.VMID, err)
+	}
+	nodecap.ReportPacedReady(powerCtx, vm.Name)
+	p.log.Debug("jit delivered via container env", "vmid", vm.VMID, "node", vm.Node, "bytes", len(jit))
+	return nil
+}
+
+// awaitLXCJITStart preserves the old path for installations without both
+// limits, but a paced host sizes the current power state inside the gate.
+func (p *pmox) awaitLXCJITStart(ctx context.Context, vm *VM, stage func() error, submit func(context.Context, string) error) (func(), context.Context, error) {
+	gate, gateOK := p.startGate.(interface {
+		UsesPacedAdmission() bool
+		AcquireStartWithSubmission(context.Context, string, func(func()) error) (func(), error)
+	})
+	acct, acctOK := p.startCapacity.(interface {
+		SupportsPacedStart() bool
+		ReservePacedRestart(context.Context, string, int, time.Time) (nodecap.Reservation, bool, error)
+		ReserveExistingForPacedStart(context.Context, string, nodecap.Shape, int, time.Time, bool) (nodecap.Reservation, bool, error)
+	})
+	if gateOK && acctOK && gate.UsesPacedAdmission() && acct.SupportsPacedStart() {
+		notAdmitted := errors.New("fresh node capacity deferred")
+		var status string
+		powerCtx := ctx
+		for {
+			release, err := gate.AcquireStartWithSubmission(ctx, vm.Node, func(mark func()) error {
+				st, err := p.lxcStatus(ctx, vm.Node, vm.VMID)
+				if err != nil {
+					if errors.Is(classifyProxmoxError(err), ErrVMNotFound) {
+						return fmt.Errorf("inject jit: refresh ct %d power: %w", vm.VMID, ErrVMNotFound)
+					}
+					return notAdmitted
+				}
+				if st.Name == "" || st.Name != vm.Name {
+					return notAdmitted
+				}
+				status = st.Status
+				var claim nodecap.Reservation
+				var admitted bool
+				switch status {
+				case "running":
+					claim, admitted, err = acct.ReservePacedRestart(ctx, vm.Node, vm.VMID, vm.CreatedAt)
+					if err != nil || !admitted {
+						return ErrRunningJITCapacityDeferred
+					}
+				case "stopped":
+					profile, ok := p.profiles[vm.Profile]
+					if !ok || profile.MemoryMB <= 0 {
+						return fmt.Errorf("inject jit: cannot size stopped ct %d", vm.VMID)
+					}
+					shape := nodecap.Shape{MemoryBytes: uint64(profile.MemoryMB) * 1024 * 1024, VCPUs: profile.CPUCores}
+					claim, admitted, err = acct.ReserveExistingForPacedStart(ctx, vm.Node, shape, vm.VMID, vm.CreatedAt, false)
+					if err != nil || !admitted {
+						return notAdmitted
+					}
+				default:
+					return notAdmitted
+				}
+				if err := stage(); err != nil {
+					if claim != nil {
+						claim.Release()
+					}
+					return err
+				}
+				if claim != nil {
+					if starter, ok := claim.(interface{ BeginStart() bool }); ok && !starter.BeginStart() {
+						claim.Release()
+						// JIT has already been written. Never use the
+						// safe-to-requeue result after that boundary.
+						return errors.New("inject jit: staged before the capacity claim expired")
+					}
+					powerCtx = nodecap.WithPacedTaskReceipt(ctx, claim)
+				}
+				mark()
+				defer nodecap.ReportPacedSubmissionReturned(powerCtx, vm.Name, "lxc")
+				return submit(powerCtx, status)
+			})
+			if err == nil {
+				return release, powerCtx, nil
+			}
+			if !errors.Is(err, notAdmitted) {
+				return nil, powerCtx, err
+			}
+			timer := time.NewTimer(time.Second)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx, ctx.Err()
+			case <-timer.C:
+			}
+		}
+	}
+
+	if err := stage(); err != nil {
+		return nil, ctx, err
+	}
+
 	st, err := p.lxcStatus(ctx, vm.Node, vm.VMID)
 	if err != nil {
-		return fmt.Errorf("inject jit: get ct %d status: %w", vm.VMID, classifyProxmoxError(err))
+		return nil, ctx, fmt.Errorf("inject jit: get ct %d status: %w", vm.VMID, classifyProxmoxError(err))
 	}
 	needsClaim := st.Status != "running" && p.startCapacity != nil
 	var shape nodecap.Shape
 	if needsClaim {
 		profile, ok := p.profiles[vm.Profile]
 		if !ok || profile.MemoryMB <= 0 {
-			return fmt.Errorf("inject jit: cannot size stopped ct %d", vm.VMID)
+			return nil, ctx, fmt.Errorf("inject jit: cannot size stopped ct %d", vm.VMID)
 		}
 		shape = nodecap.Shape{MemoryBytes: uint64(profile.MemoryMB) * 1024 * 1024, VCPUs: profile.CPUCores}
 	}
 	for {
 		if err := ctx.Err(); err != nil {
-			return err
+			return nil, ctx, err
 		}
 		var claim nodecap.Reservation
 		if needsClaim {
@@ -801,7 +969,7 @@ func (p *pmox) injectLXCJIT(ctx context.Context, vm *VM, jit string) error {
 				select {
 				case <-ctx.Done():
 					timer.Stop()
-					return ctx.Err()
+					return nil, ctx, ctx.Err()
 				case <-timer.C:
 				}
 				continue
@@ -815,7 +983,7 @@ func (p *pmox) injectLXCJIT(ctx context.Context, vm *VM, jit string) error {
 				if claim != nil {
 					claim.Release()
 				}
-				return fmt.Errorf("inject jit: wait for host boot budget: %w", gateErr)
+				return nil, ctx, fmt.Errorf("inject jit: wait for host boot budget: %w", gateErr)
 			}
 		}
 		if starter, ok := claim.(interface{ BeginStart() bool }); ok && !starter.BeginStart() {
@@ -826,25 +994,12 @@ func (p *pmox) injectLXCJIT(ctx context.Context, vm *VM, jit string) error {
 			claim.Release()
 			continue
 		}
-		defer release()
-		break
-	}
-	if st.Status == "running" {
-		err = p.postLXCTask(ctx, vm, "/status/reboot", map[string]any{"timeout": lxcRebootTimeoutSeconds}, 300)
-	} else {
-		err = p.postLXCTask(ctx, vm, "/status/start", nil, 300)
-		if isAlreadyRunning(err) {
-			err = nil
+		if err := submit(ctx, st.Status); err != nil {
+			release()
+			return nil, ctx, err
 		}
+		return release, ctx, nil
 	}
-	if err != nil {
-		return fmt.Errorf("inject jit: restart ct %d: %w", vm.VMID, redactJIT(classifyProxmoxError(err), jit))
-	}
-	if err := p.waitReadyLXC(ctx, vm, lxcPostRestartReadyTimeout); err != nil {
-		return fmt.Errorf("inject jit: ct %d did not come back: %w", vm.VMID, err)
-	}
-	p.log.Debug("jit delivered via container env", "vmid", vm.VMID, "node", vm.Node, "bytes", len(jit))
-	return nil
 }
 
 // readLXCJIT returns the JIT config stored in the container's env option

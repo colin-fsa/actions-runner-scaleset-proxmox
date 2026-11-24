@@ -285,7 +285,7 @@ func TestCapacity_WindowsOnlineSettleIsOptIn(t *testing.T) {
 	for _, bad := range []string{
 		capacityOn + "\n    windows_online_settle_after: 2m",
 		hostMode + "\n    windows_online_settle_after: 29s",
-		hostMode + "\n    windows_online_settle_after: 15m",
+		hostMode + "\n    windows_online_settle_after: 5m",
 	} {
 		_, err = config.Parse(capacityCfg("10", bad, "2", "4096"))
 		require.ErrorContains(t, err, "pool.capacity.windows_online_settle_after")

@@ -132,3 +132,15 @@ func TestHostBudgetSpacingAndRecovery(t *testing.T) {
 	require.NoError(t, b.pace(context.Background(), "pve1"))
 	require.GreaterOrEqual(t, time.Since(start), 25*time.Millisecond)
 }
+
+func TestBootBudgetRequiresEvidenceToEndRestartRecovery(t *testing.T) {
+	b := NewHostBootBudget(2, time.Nanosecond, 0)
+	b.RequireRecovery(true)
+	b.BeginRecovery(0)
+	_, ok := b.tryAcquire("pve1")
+	require.False(t, ok, "expiring an old compatibility timer cannot clear proof gate")
+	b.RequireRecovery(false)
+	release, ok := b.tryAcquire("pve1")
+	require.True(t, ok)
+	release()
+}
