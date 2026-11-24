@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -11,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	proxmox "github.com/luthermonson/go-proxmox"
 
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/config"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/nodecap"
@@ -34,17 +37,96 @@ type restartTask struct {
 	Status string `json:"status"`
 }
 
+// PVE has returned LXC VMIDs as integer strings on some versions. Unlike
+// StringOrUint64 in the SDK, a restart proof cannot truncate a fractional ID.
+type restartVMID int
+
+var errRestartVMIDWire = errors.New("invalid vmid encoding (expected a canonical positive integer)")
+
+func (v *restartVMID) UnmarshalJSON(raw []byte) error {
+	s := restartNumericToken(raw)
+	n, err := strconv.ParseUint(s, 10, 31)
+	if err != nil || n == 0 || strconv.FormatUint(n, 10) != s {
+		return errRestartVMIDWire
+	}
+	*v = restartVMID(n)
+	return nil
+}
+
+// PVE configured with cpulimit but no cores can emit a JSON string here
+// (pve-container #8162). Preserve fractional quotas and the exact identity
+// check between reads. The hold still requires a positive, bounded shape.
+type restartCPUs float64
+
+var errRestartCPUWire = errors.New("invalid cpus encoding (expected a nonnegative number)")
+
+func (v *restartCPUs) UnmarshalJSON(raw []byte) error {
+	s := restartNumericToken(raw)
+	if s == "" || s[0] < '0' || s[0] > '9' || strings.TrimSpace(s) != s {
+		return errRestartCPUWire
+	}
+	var n float64
+	if err := json.Unmarshal([]byte(s), &n); err != nil || math.IsInf(n, 0) || math.IsNaN(n) {
+		return errRestartCPUWire
+	}
+	*v = restartCPUs(n)
+	return nil
+}
+
+func restartNumericToken(raw []byte) string {
+	if len(raw) >= 2 && raw[0] == '"' && raw[len(raw)-1] == '"' {
+		raw = raw[1 : len(raw)-1]
+	}
+	return string(raw)
+}
+
+// SDK HTTP errors can include response bodies or URLs. Keep the cause
+// inspectable without including untrusted payloads in normal controller logs.
+type restartReadError struct {
+	operation string
+	cause     error
+}
+
+func (e restartReadError) Error() string {
+	var typeErr *json.UnmarshalTypeError
+	var syntaxErr *json.SyntaxError
+	switch {
+	case errors.Is(e.cause, errRestartVMIDWire):
+		return e.operation + ": " + errRestartVMIDWire.Error()
+	case errors.Is(e.cause, errRestartCPUWire):
+		return e.operation + ": " + errRestartCPUWire.Error()
+	case errors.As(e.cause, &typeErr):
+		switch typeErr.Field {
+		case "vmid", "name", "tags", "status", "lock", "template", "uptime", "pid", "maxmem", "cpus", "ha.managed":
+			return e.operation + ": unexpected JSON type for " + typeErr.Field
+		}
+		return e.operation + ": unexpected JSON shape"
+	case errors.As(e.cause, &syntaxErr):
+		return e.operation + ": malformed JSON response"
+	case errors.Is(e.cause, proxmox.ErrNotAuthorized):
+		return e.operation + ": API denied access"
+	case errors.Is(e.cause, context.DeadlineExceeded):
+		return e.operation + ": request timed out"
+	case errors.Is(e.cause, context.Canceled):
+		return e.operation + ": request canceled"
+	default:
+		return e.operation + ": API read failed"
+	}
+}
+
+func (e restartReadError) Unwrap() error { return e.cause }
+
 type restartGuest struct {
-	ID        int     `json:"vmid"`
-	Name      string  `json:"name"`
-	Tags      string  `json:"tags"`
-	Status    string  `json:"status"`
-	Lock      string  `json:"lock"`
-	Template  int     `json:"template"`
-	Uptime    int64   `json:"uptime"`
-	PID       int64   `json:"pid"`
-	MaxMemory uint64  `json:"maxmem"`
-	CPUs      float64 `json:"cpus"`
+	ID        restartVMID `json:"vmid"`
+	Name      string      `json:"name"`
+	Tags      string      `json:"tags"`
+	Status    string      `json:"status"`
+	Lock      string      `json:"lock"`
+	Template  int         `json:"template"`
+	Uptime    int64       `json:"uptime"`
+	PID       int64       `json:"pid"`
+	MaxMemory uint64      `json:"maxmem"`
+	CPUs      restartCPUs `json:"cpus"`
 	kind      string
 	set       string
 	profile   string
@@ -186,11 +268,15 @@ func readRestartView(ctx context.Context, cli recoveryReader, cfg *config.Config
 	view := restartView{guests: make(map[int]restartGuest)}
 	for _, kind := range []string{"qemu", "lxc"} {
 		var guests []restartGuest
-		if err := cli.Get(ctx, base+"/"+kind, &guests); err != nil || guests == nil {
-			return restartView{}, fmt.Errorf("unavailable %s inventory", kind)
+		if err := cli.Get(ctx, base+"/"+kind, &guests); err != nil {
+			return restartView{}, restartReadError{"unavailable " + kind + " inventory", err}
+		}
+		if guests == nil {
+			return restartView{}, fmt.Errorf("unavailable %s inventory: missing JSON list", kind)
 		}
 		for _, g := range guests {
-			if g.ID <= 0 {
+			id := int(g.ID)
+			if id <= 0 {
 				return restartView{}, errors.New("invalid Proxmox guest identity")
 			}
 			if g.Template != 0 {
@@ -198,7 +284,7 @@ func readRestartView(ctx context.Context, cli recoveryReader, cfg *config.Config
 			}
 			for _, set := range cfg.Scalesets {
 				rng := entryVMIDRange(set, cfg.Proxmox.VMIDRange)
-				inRange := g.ID >= rng.Min && g.ID <= rng.Max
+				inRange := id >= rng.Min && id <= rng.Max
 				owned := tags.IsOwnedBy(g.Tags, set.Name)
 				if !inRange && !owned {
 					continue
@@ -214,7 +300,7 @@ func readRestartView(ctx context.Context, cli recoveryReader, cfg *config.Config
 					}
 					// Optional attribution must not outlive PVE task
 					// retention or prevent excluding an inert occupied ID.
-					_, g.pretag, _ = pretagProfile(ctx, cli, cfg, set, kind, g.ID, firstTasks)
+					_, g.pretag, _ = pretagProfile(ctx, cli, cfg, set, kind, id, firstTasks)
 					g.set, g.profile, g.kind, g.untagged = set.Name, tags.DefaultProfile, kind, true
 				} else {
 					for _, p := range set.Profiles {
@@ -223,10 +309,10 @@ func readRestartView(ctx context.Context, cli recoveryReader, cfg *config.Config
 						}
 					}
 				}
-				if g.set == "" || view.guests[g.ID].ID != 0 {
+				if g.set == "" || view.guests[id].ID != 0 {
 					return restartView{}, fmt.Errorf("guest %d has ambiguous profile or duplicate identity", g.ID)
 				}
-				view.guests[g.ID] = g
+				view.guests[id] = g
 			}
 		}
 	}
@@ -250,10 +336,10 @@ func readRestartView(ctx context.Context, cli recoveryReader, cfg *config.Config
 			var snapshot statusObservation
 			path := fmt.Sprintf("%s/%s/%d/status/current", base, listed.kind, id)
 			if err := cli.Get(statusCtx, path, &snapshot); err != nil {
-				return fmt.Errorf("guest %d direct status unavailable", id)
+				return restartReadError{fmt.Sprintf("guest %d direct status unavailable", id), err}
 			}
 			live := snapshot.restartGuest
-			if snapshot.HA.Managed == nil || *snapshot.HA.Managed != 0 || live.ID != id ||
+			if snapshot.HA.Managed == nil || *snapshot.HA.Managed != 0 || int(live.ID) != id ||
 				live.Name != listed.Name || live.Tags != listed.Tags || live.Status != listed.Status ||
 				live.Lock != "" || live.Template != 0 ||
 				(live.Status == "running" && (live.PID <= 0 || live.Uptime <= 0)) ||
@@ -376,7 +462,7 @@ func proveScopedRestart(ctx context.Context, cli recoveryReader, cfg *config.Con
 					return fmt.Errorf("guest %d readiness and configured footprint are unproven", id)
 				}
 				unready.Store(id, nodecap.RestartHold{VMID: id, Node: cfg.Nodes.SingleNode, Generation: row.CreatedAt,
-					Shape: nodecap.Shape{MemoryBytes: g.MaxMemory, VCPUs: int(math.Ceil(g.CPUs))}})
+					Shape: nodecap.Shape{MemoryBytes: g.MaxMemory, VCPUs: int(math.Ceil(float64(g.CPUs)))}})
 			}
 			return nil
 		})
