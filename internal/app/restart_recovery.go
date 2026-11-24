@@ -437,10 +437,11 @@ func absSeconds(n int64) int64 {
 }
 
 type restartBarrier struct {
-	mu       sync.Mutex
-	managers map[string]pool.Manager
-	revision uint64
-	ready    chan struct{}
+	mu             sync.Mutex
+	managers       map[string]pool.Manager
+	revision       uint64
+	ready          chan struct{}
+	stoppedCleanup map[string][]pool.RowSnapshot
 }
 
 func (b *restartBarrier) released() bool {
@@ -490,6 +491,59 @@ func (b *restartBarrier) releaseCurrent(revision uint64, release func() error) e
 	return nil
 }
 
+func (b *restartBarrier) runSessionOwnedCleanup(ctx context.Context, set string, mgr pool.Manager, log *slog.Logger) {
+	select {
+	case <-b.ready:
+	case <-ctx.Done():
+		return
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	b.mu.Lock()
+	if b.managers[set] != mgr {
+		b.mu.Unlock()
+		return
+	}
+	rows := b.stoppedCleanup[set]
+	delete(b.stoppedCleanup, set)
+	b.mu.Unlock()
+	cleaner, ok := mgr.(interface {
+		QueueObservedRestartCleanup(context.Context, pool.RowSnapshot) error
+	})
+	if !ok {
+		return
+	}
+	backoff := scalesetRetryInitialBackoff
+	for len(rows) > 0 && ctx.Err() == nil {
+		remaining := rows[:0]
+		for _, row := range rows {
+			if ctx.Err() != nil {
+				return
+			}
+			observe, stop := context.WithTimeout(ctx, 8*time.Second)
+			err := cleaner.QueueObservedRestartCleanup(observe, row)
+			stop()
+			if err != nil {
+				log.Warn("controller restart: stopped cleanup deferred", "vmid", row.VMID, "reason", err, "retry_after", backoff)
+				remaining = append(remaining, row)
+			}
+		}
+		rows = remaining
+		if len(rows) == 0 {
+			return
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		backoff = min(backoff*2, scalesetRetryMaxBackoff)
+	}
+}
+
 func (b *restartBarrier) observeLate(ctx context.Context, revision uint64, mgrs map[string]pool.Manager, guests []restartLateGuest) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -522,14 +576,13 @@ func (b *restartBarrier) observeLate(ctx context.Context, revision uint64, mgrs 
 	return nil
 }
 
-func completeLeaderRestart(ctx context.Context, log *slog.Logger, cfg *config.Config, prov provisioner.Provisioner, b *restartBarrier, release func([]nodecap.RestartHold, func()) error) error {
+func completeLeaderRestart(ctx context.Context, log *slog.Logger, cfg *config.Config, cli recoveryReader, ready func(context.Context, *provisioner.VM) error, quiet time.Duration, b *restartBarrier, release func([]nodecap.RestartHold, func()) error) error {
 	if !scopedRestartConfig(cfg) {
 		log.Error("controller recovery blocked: exact-owner restart requires paced standalone single-node host_available, destroy mode, and token auth")
 		<-ctx.Done()
 		return nil
 	}
 	cutoff := time.Now().Add(-max(cfg.Pool.CloneInflightGrace.D(), cfg.Pool.BootStartInterval.D()) - 5*time.Second).Unix()
-	quiet := max(cfg.Pool.BootStartInterval.D(), 15*time.Second)
 	var lastReason string
 	for ctx.Err() == nil {
 		mgrs, revision := b.snapshot()
@@ -549,11 +602,7 @@ func completeLeaderRestart(ctx context.Context, log *slog.Logger, cfg *config.Co
 		}
 		var result restartResult
 		if err == nil {
-			err = proveScopedRestart(attempt, prov.Client(), cfg, rows, func(ctx context.Context, vm *provisioner.VM) error {
-				ping, cancel := context.WithTimeout(ctx, 8*time.Second)
-				defer cancel()
-				return prov.WaitReady(ping, vm, 8*time.Second)
-			}, cutoff, quiet, &result)
+			err = proveScopedRestart(attempt, cli, cfg, rows, ready, cutoff, quiet, &result)
 		}
 		if len(result.late) > 0 && attempt.Err() == nil {
 			if observeErr := b.observeLate(attempt, revision, mgrs, result.late); observeErr != nil {
@@ -584,16 +633,12 @@ func completeLeaderRestart(ctx context.Context, log *slog.Logger, cfg *config.Co
 						valid = append(valid, hold)
 					}
 				}
+				// Store proof for each session winner. The shared
+				// observer must never enqueue a disconnected pool's
+				// physical cleanup itself.
+				b.stoppedCleanup = make(map[string][]pool.RowSnapshot)
 				for _, stopped := range result.stopped {
-					if cleaner, ok := mgrs[stopped.manager].(interface {
-						QueueObservedRestartCleanup(context.Context, pool.RowSnapshot) error
-					}); ok {
-						observe, stop := context.WithTimeout(ctx, 8*time.Second)
-						if err := cleaner.QueueObservedRestartCleanup(observe, stopped.row); err != nil {
-							log.Warn("controller restart: stopped cleanup deferred", "vmid", stopped.row.VMID, "reason", err)
-						}
-						stop()
-					}
+					b.stoppedCleanup[stopped.manager] = append(b.stoppedCleanup[stopped.manager], stopped.row)
 				}
 				return release(valid, func() {
 					for _, h := range valid {
