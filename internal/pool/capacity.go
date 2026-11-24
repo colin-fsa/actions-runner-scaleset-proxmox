@@ -329,7 +329,17 @@ func (m *manager) admitPromotion(ctx context.Context, w *store.VM) (capacityClai
 		m.log.Warn("promote: no profile to size the VM; deferring", "vmid", w.VMID, "profile", w.Profile)
 		return capacityClaim{}, false
 	}
-	res, ok, err := m.cfg.Capacity.ReserveExisting(ctx, w.Node, shapeOf(ps.settings), w.VMID)
+	shape := shapeOf(ps.settings)
+	var res nodecap.Reservation
+	var ok bool
+	var err error
+	if acct, supported := m.cfg.Capacity.(interface {
+		ReserveExistingForPromotion(context.Context, string, nodecap.Shape, int, time.Time) (nodecap.Reservation, bool, error)
+	}); supported {
+		res, ok, err = acct.ReserveExistingForPromotion(ctx, w.Node, shape, w.VMID, w.CreatedAt)
+	} else {
+		res, ok, err = m.cfg.Capacity.ReserveExisting(ctx, w.Node, shape, w.VMID)
+	}
 	if err != nil {
 		m.recordPromotionDeferral(ps, w.Node)
 		m.log.Warn("promote: capacity unknown; deferring", "profile", ps.settings.Name, "vmid", w.VMID, "node", w.Node, "err", err)

@@ -150,6 +150,11 @@ type Reservation interface {
 
 // Options configures an Accountant.
 type Options struct {
+	PacedStartLimit    int
+	PacedStartInterval time.Duration
+	// PacedTaskOwner is the existing dedicated PVE API token ID; no secret.
+	PacedTaskOwner string
+
 	// Nodes restricts accounting to the operator-declared node list.
 	// Empty means "every node the cluster reports".
 	Nodes []string
@@ -339,9 +344,10 @@ type Accountant struct {
 	// now is the clock used for reservation expiry and snapshot
 	// staleness. Indirect so a test can age a snapshot without sleeping;
 	// New pins it to time.Now.
-	now              func() time.Time
-	recoveryUntil    time.Time
-	lastAdmissionLog map[admissionKey]time.Time // guarded by mu
+	now                 func() time.Time
+	recoveryUntil       time.Time
+	verificationPending bool
+	lastAdmissionLog    map[admissionKey]time.Time // guarded by mu
 }
 
 // snapshot is one immutable read of /cluster/resources.
@@ -360,9 +366,10 @@ type snapshot struct {
 	// a node's live available RAM reflects only powered-on guests, so a
 	// reservation's RAM counts as "already in free" only once its guest is
 	// powered on, not the moment its configured memory is raised.
-	guestPowered map[int]bool
-	qemuRunning  map[int]qemuIdentity
-	takenAt      time.Time
+	guestPowered  map[int]bool
+	runningGuests map[int]qemuIdentity
+	qemuRunning   map[int]qemuIdentity
+	takenAt       time.Time
 }
 
 type nodeTotals struct {
@@ -411,6 +418,9 @@ type reservation struct {
 	started    bool
 	startedAt  time.Time
 	online     windowsOnlineProof
+	paced      bool
+	inherited  bool
+	pacedProof pacedBootProof
 }
 
 func (r *reservation) Bind(vmid int) {
@@ -444,14 +454,18 @@ func (r *reservation) BeginStart() bool {
 	if !r.acct.isHostMode() {
 		return true
 	}
-	if r.released || time.Now().After(r.expires) {
+	now := time.Now()
+	if r.released || r.inherited || (!(r.paced && r.started) && now.After(r.expires)) {
 		return false
 	}
-	now := time.Now()
-	r.expires = now.Add(r.acct.opts.ReservationTTL)
+	if !r.paced {
+		r.expires = now.Add(r.acct.opts.ReservationTTL)
+	}
 	r.started = true
+	r.poweredOff = false // a previously stopped warm clone may fund its own promotion
 	r.startedAt = now
 	r.online = windowsOnlineProof{}
+	r.pacedProof = pacedBootProof{}
 	if r.acct.opts.WindowsOnlineSettleAfter > 0 && !r.generation.IsZero() {
 		for _, previous := range r.acct.res {
 			if previous != r && previous.node == r.node && previous.vmid == r.vmid &&
@@ -463,11 +477,27 @@ func (r *reservation) BeginStart() bool {
 	return true
 }
 
+// RequireRecovery blocks host-mode accounting until fresh restart
+// reconciliation, with no deadline that can automatically clear it.
+func (a *Accountant) RequireRecovery(pending bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.verificationPending = pending
+}
+
+func (a *Accountant) recoveringLocked() bool {
+	return a.verificationPending || a.now().Before(a.recoveryUntil)
+}
+
 // BeginRecovery pauses host-available admission at leader transitions.
 func (a *Accountant) BeginRecovery(delay time.Duration) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.recoveryUntil = time.Now().Add(delay)
+	if delay <= 0 {
+		a.recoveryUntil = time.Time{}
+		return
+	}
+	a.recoveryUntil = a.now().Add(delay)
 }
 
 func (r *reservation) Release() {
@@ -484,6 +514,13 @@ func (r *reservation) ExpectPoweredOff() {
 	r.acct.mu.Lock()
 	defer r.acct.mu.Unlock()
 	r.poweredOff = true
+}
+
+func recoveryDeadline(delay time.Duration) time.Time {
+	if delay <= 0 {
+		return time.Time{}
+	}
+	return time.Now().Add(delay)
 }
 
 // New constructs an Accountant over the given Proxmox client.
@@ -505,7 +542,7 @@ func New(cli *proxmox.Client, opts Options) (*Accountant, error) {
 		opts:          opts,
 		log:           opts.Log,
 		now:           time.Now,
-		recoveryUntil: time.Now().Add(opts.RecoveryDelay),
+		recoveryUntil: recoveryDeadline(opts.RecoveryDelay),
 		cache: ttlcache.New[string, *snapshot](
 			ttlcache.WithTTL[string, *snapshot](opts.Refresh),
 			ttlcache.WithDisableTouchOnHit[string, *snapshot](),
@@ -634,41 +671,138 @@ func (a *Accountant) ReserveFreeing(ctx context.Context, node string, shape Shap
 // stopped), and admitting on it would start the VM unchecked. For a VM
 // that really is running this is merely conservative.
 func (a *Accountant) ReserveExisting(ctx context.Context, node string, shape Shape, vmid int) (Reservation, bool, error) {
-	return a.reserveExisting(ctx, node, shape, vmid, time.Time{})
+	return a.reserveExisting(ctx, node, shape, vmid, time.Time{}, false)
 }
 
 // ReserveExistingForJIT lets a stopped container use a claim from its own
 // cold start or warm promotion. It cannot borrow from another generation.
 func (a *Accountant) ReserveExistingForJIT(ctx context.Context, node string, shape Shape, vmid int, generation time.Time) (Reservation, bool, error) {
-	return a.reserveExisting(ctx, node, shape, vmid, generation)
+	return a.reserveExisting(ctx, node, shape, vmid, generation, false)
 }
 
-func (a *Accountant) reserveExisting(ctx context.Context, node string, shape Shape, vmid int, generation time.Time) (Reservation, bool, error) {
+// ReserveExistingForPromotion can reuse the exact warm clone's hold before
+// its stopped row reaches the cluster snapshot. Promotion still has to pass
+// the ordinary host safety floors and win the pool row's Warm->Booting CAS.
+func (a *Accountant) ReserveExistingForPromotion(ctx context.Context, node string, shape Shape, vmid int, generation time.Time) (Reservation, bool, error) {
+	return a.reserveExisting(ctx, node, shape, vmid, generation, true)
+}
+
+func (a *Accountant) reserveExisting(ctx context.Context, node string, shape Shape, vmid int, generation time.Time, promotion bool) (Reservation, bool, error) {
 	snap, err := a.resources(ctx)
 	if err != nil {
+		return nil, false, err
+	}
+	return a.reserveExistingFrom(snap, node, shape, vmid, generation, promotion, false)
+}
+
+// ReserveExistingForPacedStart uses a direct sample taken after the shared
+// start pacer. An API failure never falls back to cached pre-start capacity.
+func (a *Accountant) ReserveExistingForPacedStart(ctx context.Context, node string, shape Shape, vmid int, generation time.Time, promotion bool) (Reservation, bool, error) {
+	readCtx, cancel := context.WithTimeout(ctx, min(a.opts.Refresh, fetchTimeout))
+	defer cancel()
+	snap, err := a.fetch(readCtx)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := readCtx.Err(); err != nil {
+		return nil, false, err
+	}
+	a.recheckInactiveStarts(readCtx, node, snap)
+	if err := readCtx.Err(); err != nil {
+		return nil, false, err
+	}
+	return a.reserveExistingFrom(snap, node, shape, vmid, generation, promotion, true)
+}
+
+func (a *Accountant) SupportsPacedStart() bool {
+	return a.isHostMode() && a.opts.PacedStartLimit > 0 && a.opts.PacedStartInterval > 0
+}
+
+// ReservePacedRestart checks a running guest's node, without creating a
+// second hold. A recent still-unsettled start is rearmed for the same
+// generation so a JIT reboot cannot strand its now-obsolete proof.
+func (a *Accountant) ReservePacedRestart(ctx context.Context, node string, vmid int, generation time.Time) (Reservation, bool, error) {
+	readCtx, cancel := context.WithTimeout(ctx, min(a.opts.Refresh, fetchTimeout))
+	defer cancel()
+	snap, err := a.fetch(readCtx)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := readCtx.Err(); err != nil {
 		return nil, false, err
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.sweepLocked(snap)
+	totals, known := snap.nodes[node]
+	if !known || totals.memMissing || a.stale(snap) || a.recoveringLocked() ||
+		totals.memAvailable < a.reserveFor(totals.memBytes) {
+		return nil, false, nil
+	}
+	// This is not a new CPU allocation. Check actual host CPU where
+	// configured, not other workers' reserved launch footprints.
+	if a.cpuUsageMode() && (totals.cpuMissing || totals.vcpus <= 0 ||
+		int(math.Ceil(totals.cpuUsage*float64(totals.vcpus))) > a.vcpuLimit(totals.vcpus)) {
+		return nil, false, nil
+	}
+	for _, r := range a.res {
+		if r.node == node && r.vmid == vmid && !generation.IsZero() && r.generation.Equal(generation) && r.paced && r.started {
+			return borrowedStart{original: r}, true, nil
+		}
+	}
+	return nil, true, nil
+}
+
+func (a *Accountant) reserveExistingFrom(snap *snapshot, node string, shape Shape, vmid int, generation time.Time, promotion, paced bool) (Reservation, bool, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.sweepLocked(snap)
+	if paced {
+		outstanding := 0
+		for _, r := range a.res {
+			if r.paced && r.node == node && !(r.vmid == vmid && !generation.IsZero() && r.generation.Equal(generation)) {
+				outstanding++
+			}
+		}
+		if outstanding >= a.opts.PacedStartLimit {
+			a.logAdmissionDenial(snap, node, "unsettled_start_limit", shape, 0, 0, a.stateLocked(snap, node))
+			return nil, false, nil
+		}
+	}
+
 	if a.isHostMode() && vmid > 0 && !generation.IsZero() {
 		for _, r := range a.res {
-			if r.node != node || r.vmid != vmid || !r.generation.Equal(generation) ||
-				r.shape != shape || !r.started || r.poweredOff || len(r.freeing) != 0 {
+			if r.node != node || r.vmid != vmid || !r.generation.Equal(generation) {
 				continue
+			}
+			// Never charge the same generation again while its earlier
+			// reservation is still being prepared. Do not silently reuse
+			// a different footprint or a claim backed by pending eviction.
+			if r.inherited || r.shape != shape || len(r.freeing) != 0 || (!r.started && !(promotion && r.poweredOff)) {
+				return nil, false, nil
 			}
 			// The existing hold already covers this start. Do not count a
 			// prospective destruction or start while below the guarded floor.
 			totals, known := snap.nodes[node]
 			reserve := a.reserveFor(totals.memBytes)
 			holds, _ := a.holdsAndCreditsLocked(snap, node)
-			if !known || totals.memMissing || a.stale(snap) || time.Now().Before(a.recoveryUntil) ||
+			if !known || totals.memMissing || a.stale(snap) || a.recoveringLocked() ||
 				totals.memAvailable < reserve || holds > totals.memAvailable-reserve {
 				return nil, false, nil
 			}
 			state := a.stateLocked(snap, node)
 			if state.CPUGated && state.CommittedVCPU > state.LimitVCPU {
 				return nil, false, nil
+			}
+			r.paced = r.paced || paced
+
+			if !r.started {
+				// Transfer the stopped-clone claim to this promotion before
+				// releasing the lock. A new inventory read must not sweep
+				// it while the worker waits to issue the start. A failed
+				// Warm->Booting CAS can safely release it: no boot occurred.
+				r.poweredOff = false
+				return r, true, nil
 			}
 			return borrowedStart{original: r}, true, nil
 		}
@@ -683,6 +817,7 @@ func (a *Accountant) reserveExisting(ctx context.Context, node string, shape Sha
 		shape:      shape,
 		vmid:       vmid,
 		generation: generation,
+		paced:      paced,
 		created:    time.Now(),
 		expires:    time.Now().Add(a.opts.ReservationTTL),
 		acct:       a,
@@ -746,7 +881,7 @@ func (a *Accountant) fitsLocked(snap *snapshot, node string, shape Shape, extraF
 // knows are already charged to the ledger on its behalf. Caller must hold
 // a.mu and must have checked node is in snap.
 func (a *Accountant) fitsWithCreditLocked(snap *snapshot, node string, shape Shape, memCredit uint64, vcpuCredit int) bool {
-	if a.isHostMode() && time.Now().Before(a.recoveryUntil) {
+	if a.isHostMode() && a.recoveringLocked() {
 		a.logAdmissionDenial(snap, node, "restart_recovery", shape, memCredit, vcpuCredit, NodeState{})
 		return false
 	}
@@ -1058,14 +1193,14 @@ func (a *Accountant) reserveFor(total uint64) uint64 {
 // expired ones. Caller must hold a.mu.
 //
 // A reservation retires once its VM is observed at (or above) its full
-// configured size in allocated mode. In host_available mode a powered
-// guest remains reserved for a bounded settling period because the power
-// flag does not show whether host memory usage has caught up. Expiry is
-// also the leak guard for clones that never got that far.
+// configured size in allocated mode. A paced post-POST reservation
+// requires settling evidence or exact confirmed cleanup: neither a
+// power flag nor expiry proves the host has observed that boot. Expiry
+// guards claims that never reached the paced submission boundary.
 func (a *Accountant) sweepLocked(snap *snapshot) {
 	now := time.Now()
 	for id, r := range a.res {
-		if now.After(r.expires) {
+		if !r.inherited && !(r.paced && r.started) && now.After(r.expires) {
 			if a.isHostMode() && r.started {
 				a.log.Debug("nodecap: start reservation settled", "node", r.node, "vmid", r.vmid)
 			} else {
@@ -1076,10 +1211,15 @@ func (a *Accountant) sweepLocked(snap *snapshot) {
 			delete(a.res, id)
 			continue
 		}
+		if a.pacedBootVisibleLocked(snap, r) {
+			r.released = true
+			delete(a.res, id)
+			continue
+		}
 		retired := r.vmid != 0 && snap.guestMem[r.vmid] >= r.shape.MemoryBytes
 		if a.isHostMode() && !r.poweredOff {
-			// Power-on is not evidence that host RAM has settled. Expiry
-			// above is the bounded settling policy for these reservations.
+			// Power-on is not evidence that host RAM has settled. A
+			// paced start may retire through exact proof/cleanup only.
 			retired = false
 		}
 		if (a.isHostMode() || a.cpuUsageMode()) && !r.poweredOff {
@@ -1149,13 +1289,29 @@ func (a *Accountant) resources(ctx context.Context) (*snapshot, error) {
 	return v.(*snapshot), nil
 }
 
+// admissionResource intentionally omits out-of-scope signed usage
+// telemetry (e.g. LXC's memory.current-file may momentarily be negative).
+// The node /status sample remains the sole source for live host memory.
+type admissionResource struct {
+	Type     string `json:"type"`
+	Node     string `json:"node"`
+	Status   string `json:"status"`
+	MaxMem   uint64 `json:"maxmem"`
+	MaxCPU   uint64 `json:"maxcpu"`
+	Template uint64 `json:"template"`
+	VMID     uint64 `json:"vmid"`
+	Tags     string `json:"tags"`
+	Name     string `json:"name"`
+	Uptime   uint64 `json:"uptime"`
+}
+
 // fetch reads GET /cluster/resources and projects it into a snapshot.
 //
 // The raw client Get is used rather than Client.Cluster().Resources()
 // because the latter issues an extra /cluster/status round-trip per call
 // that carries nothing this package needs.
 func (a *Accountant) fetch(ctx context.Context) (*snapshot, error) {
-	var rs proxmox.ClusterResources
+	var rs []admissionResource
 	if err := a.cli.Get(ctx, "/cluster/resources", &rs); err != nil {
 		return nil, fmt.Errorf("list cluster resources: %w", err)
 	}
@@ -1167,6 +1323,10 @@ func (a *Accountant) fetch(ctx context.Context) (*snapshot, error) {
 		guestPowered: map[int]bool{},
 		takenAt:      a.now(),
 	}
+	if a.SupportsPacedStart() {
+		snap.runningGuests = make(map[int]qemuIdentity)
+	}
+
 	if a.opts.WindowsOnlineSettleAfter > 0 {
 		snap.qemuRunning = make(map[int]qemuIdentity)
 	}
@@ -1203,6 +1363,10 @@ func (a *Accountant) fetch(ctx context.Context) (*snapshot, error) {
 			// faithful record of who is actually consuming live host RAM — the
 			// thing host_available mode keys its holds and retirement on.
 			snap.guestPowered[vmid] = r.Status != guestStopped
+			if snap.runningGuests != nil && r.Status == "running" {
+				snap.runningGuests[vmid] = qemuIdentity{node: r.Node, name: r.Name, uptime: r.Uptime}
+			}
+
 			if snap.qemuRunning != nil && r.Type == "qemu" && r.Status == "running" {
 				snap.qemuRunning[vmid] = qemuIdentity{node: r.Node, name: r.Name, uptime: r.Uptime}
 			}
@@ -1227,7 +1391,7 @@ func (a *Accountant) fetch(ctx context.Context) (*snapshot, error) {
 			// as missing so stateLocked fails closed rather than admit blind.
 			totals.memReadAt = a.now()
 			st, err := a.nodeLiveStatus(ctx, node)
-			free, ok := st.availableMemory()
+			free, ok := st.Memory.AvailableBytes()
 			totals.memAvailable = free
 			totals.memMissing = err != nil || !ok
 			totals.cpuMissing = err != nil || st.CPU == nil
@@ -1243,12 +1407,15 @@ func (a *Accountant) fetch(ctx context.Context) (*snapshot, error) {
 
 // nodeLiveStatus supplies both admission modes in one API round trip.
 type liveStatus struct {
-	CPU    *float64 `json:"cpu"`
-	Memory struct {
-		Available *uint64 `json:"available"`
-		Used      *uint64 `json:"used"`
-		Total     uint64  `json:"total"`
-	} `json:"memory"`
+	CPU    *float64   `json:"cpu"`
+	Memory HostMemory `json:"memory"`
+}
+
+// HostMemory is the authoritative /nodes/{node}/status capacity reading.
+type HostMemory struct {
+	Available *uint64 `json:"available"`
+	Used      *uint64 `json:"used"`
+	Total     uint64  `json:"total"`
 }
 
 func (a *Accountant) nodeLiveStatus(ctx context.Context, node string) (liveStatus, error) {
@@ -1260,18 +1427,20 @@ func (a *Accountant) nodeLiveStatus(ctx context.Context, node string) (liveStatu
 	return st, err
 }
 
-// Older APIs omit available but report used excluding reclaimable cache.
-func (st liveStatus) availableMemory() (uint64, bool) {
-	if st.Memory.Total == 0 {
+// AvailableBytes rejects invalid explicit available memory. Older
+// APIs omit it but report used excluding reclaimable cache; use
+// total-used, never the differently defined free-memory field.
+func (mem HostMemory) AvailableBytes() (uint64, bool) {
+	if mem.Total == 0 {
 		return 0, false
 	}
-	if st.Memory.Available != nil {
-		return *st.Memory.Available, *st.Memory.Available <= st.Memory.Total
+	if mem.Available != nil {
+		return *mem.Available, *mem.Available <= mem.Total
 	}
-	if st.Memory.Used == nil || *st.Memory.Used > st.Memory.Total {
+	if mem.Used == nil || *mem.Used > mem.Total {
 		return 0, false
 	}
-	return st.Memory.Total - *st.Memory.Used, true
+	return mem.Total - *mem.Used, true
 }
 
 // addClamped adds a signed delta to an unsigned base, flooring at 0.

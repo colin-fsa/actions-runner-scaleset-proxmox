@@ -564,6 +564,13 @@ func countBusy(txn *memdb.Txn, profile string) (int, error) {
 // Oldest-Hot-first selection is preserved (closest to vm_max_age recycle
 // goes first).
 func (s *Store) AcquireHotInProfile(profile string, jobID int64, maxConcurrent, maxBusy int) (*VM, error) {
+	return s.AcquireEligibleHot(profile, jobID, maxConcurrent, maxBusy, nil)
+}
+
+// AcquireEligibleHot preserves the profile and global cap transaction,
+// while allowing the caller to exclude rows that would require a new
+// power operation during scoped recovery. The predicate must be read-only.
+func (s *Store) AcquireEligibleHot(profile string, jobID int64, maxConcurrent, maxBusy int, eligible func(*VM) bool) (*VM, error) {
 	txn := s.db.Txn(true)
 	defer txn.Abort()
 
@@ -606,6 +613,9 @@ func (s *Store) AcquireHotInProfile(profile string, jobID int64, maxConcurrent, 
 	var oldest *VM
 	for raw := it.Next(); raw != nil; raw = it.Next() {
 		cand := raw.(*VM)
+		if eligible != nil && !eligible(cand) {
+			continue
+		}
 		if oldest == nil || cand.CreatedAt.Before(oldest.CreatedAt) {
 			oldest = cand
 		}

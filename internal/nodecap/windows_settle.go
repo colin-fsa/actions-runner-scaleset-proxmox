@@ -91,7 +91,7 @@ func (a *Accountant) windowsSettledCreditLocked(snap *snapshot, node string) uin
 	totals, known := snap.nodes[node]
 	now := a.now()
 	if !known || totals.memMissing || a.stale(snap) || totals.memReadAt.IsZero() ||
-		now.Before(a.recoveryUntil) || now.Sub(totals.memReadAt) > a.opts.Refresh ||
+		a.recoveringLocked() || now.Sub(totals.memReadAt) > a.opts.Refresh ||
 		totals.memAvailable < a.reserveFor(totals.memBytes) {
 		return 0
 	}

@@ -568,6 +568,21 @@ func (s *Scaler) provisionOne(ctx context.Context, vmObj *pool.VM) bool {
 		VMID: vmObj.VMID, Node: vmObj.Node, Name: vmObj.Name, Profile: vmObj.Profile, CreatedAt: vmObj.CreatedAt,
 	}, jitCfg.EncodedJITConfig); err != nil {
 		s.metrics.ForgetStartup(s.cfg.ScaleSetName, vmObj.Name)
+		if errors.Is(err, provisioner.ErrRunningJITCapacityDeferred) {
+			// No env or power request reached this running VM. Retire only
+			// the exact minted registration before making it reusable.
+			returned := false
+			if requeue, ok := s.pool.(interface{ ReturnUndeliveredJIT(*pool.VM, int64) bool }); ok && runnerID > 0 {
+				if cleanupErr := s.gh.RemoveRunner(ctx, runnerID); cleanupErr == nil {
+					returned = requeue.ReturnUndeliveredJIT(vmObj, runnerID)
+				} else {
+					s.log.Warn("deferred JIT: remove exact runner registration failed", "vmid", vmObj.VMID, "runner_id", runnerID, "err", cleanupErr)
+				}
+			}
+			s.log.Debug("jit capacity deferred before delivery", "vmid", vmObj.VMID, "returned_hot", returned)
+			return false
+		}
+
 		s.log.Error("jit injection failed (after retries); releasing vm", "vmid", vmObj.VMID, "err", err)
 		// Helper enforces the closed enum on `op` so a future caller
 		// can't blow up Prometheus cardinality silently.

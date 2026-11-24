@@ -11,11 +11,12 @@ import (
 // WindowsBootBudget is shared by every profile and scale set. The historical
 // name is retained for compatibility; the budget applies to all guests.
 type WindowsBootBudget struct {
-	limit    int64
-	interval time.Duration
-	readyAt  time.Time
-	mu       sync.Mutex
-	nodes    map[string]*bootNode
+	limit               int64
+	interval            time.Duration
+	readyAt             time.Time
+	verificationPending bool
+	mu                  sync.Mutex
+	nodes               map[string]*bootNode
 }
 
 type bootNode struct {
@@ -50,11 +51,11 @@ func (b *WindowsBootBudget) acquire(ctx context.Context, node string) (func(), e
 	return sync.OnceFunc(func() { s.Release(1) }), nil
 }
 func (b *WindowsBootBudget) tryAcquire(node string) (func(), bool) {
-	if b == nil || (b.limit <= 0 && b.interval <= 0) {
+	if b == nil || (b.limit <= 0 && b.interval <= 0 && !b.RecoveryPending()) {
 		return func() {}, true
 	}
 	b.mu.Lock()
-	blocked := time.Now().Before(b.readyAt)
+	blocked := b.verificationPending || time.Now().Before(b.readyAt)
 	b.mu.Unlock()
 	if blocked {
 		return nil, false
@@ -67,6 +68,23 @@ func (b *WindowsBootBudget) tryAcquire(node string) (func(), bool) {
 		return nil, false
 	}
 	return sync.OnceFunc(func() { s.Release(1) }), true
+}
+
+// RequireRecovery holds the boot gate until the leader proves its own
+// outstanding Proxmox work has been reconciled.
+func (b *WindowsBootBudget) RequireRecovery(pending bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.verificationPending = pending
+}
+
+func (b *WindowsBootBudget) RecoveryPending() bool {
+	if b == nil {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.verificationPending
 }
 
 // BeginRecovery suppresses new starts following each leader transition.
@@ -82,10 +100,14 @@ func (b *WindowsBootBudget) BeginRecovery(delay time.Duration) {
 // AcquireStart is used by paths outside pool promotion, including LXC JIT
 // restarts. Waiting is cancellable and shares the same host slots.
 func (b *WindowsBootBudget) AcquireStart(ctx context.Context, node string) (func(), error) {
+	return b.acquireStart(ctx, node, nil)
+}
+
+func (b *WindowsBootBudget) acquireStart(ctx context.Context, node string, action func(markSubmitted func()) error) (func(), error) {
 	for {
 		release, ok := b.tryAcquire(node)
 		if ok {
-			if err := b.pace(ctx, node); err != nil {
+			if err := b.paceAction(ctx, node, action); err != nil {
 				release()
 				return nil, err
 			}
@@ -104,8 +126,39 @@ func (b *WindowsBootBudget) AcquireStart(ctx context.Context, node string) (func
 // pace serializes the actual start calls, including delayed clones. Timing
 // admission instead would allow slow clones to finish together and burst.
 func (b *WindowsBootBudget) pace(ctx context.Context, node string) error {
+	return b.paceAdmission(ctx, node, nil)
+}
+
+// UsesPacedAdmission means start work is bounded and interleaved.
+func (b *WindowsBootBudget) UsesPacedAdmission() bool {
+	return b != nil && b.limit > 0 && b.interval > 0
+}
+
+// AcquireStartWithSubmission holds the common pacer through the HTTP POST,
+// but not the task wait. A call that may have reached PVE marks submission
+// even when its HTTP response is an error.
+func (b *WindowsBootBudget) AcquireStartWithSubmission(ctx context.Context, node string, action func(markSubmitted func()) error) (func(), error) {
+	return b.acquireStart(ctx, node, action)
+}
+
+func (b *WindowsBootBudget) paceAdmission(ctx context.Context, node string, admit func() error) error {
+	return b.paceAction(ctx, node, func(markSubmitted func()) error {
+		if admit != nil {
+			if err := admit(); err != nil {
+				return err
+			}
+		}
+		markSubmitted()
+		return nil
+	})
+}
+
+func (b *WindowsBootBudget) paceAction(ctx context.Context, node string, action func(markSubmitted func()) error) error {
 	if b == nil || b.interval <= 0 {
-		return ctx.Err()
+		if err := ctx.Err(); err != nil || action == nil {
+			return err
+		}
+		return action(func() {})
 	}
 	n := b.node(node)
 	n.pace.Lock()
@@ -122,6 +175,14 @@ func (b *WindowsBootBudget) pace(ctx context.Context, node string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	n.last = time.Now()
-	return nil
+	if action == nil {
+		n.last = time.Now()
+		return nil
+	}
+	submitted := false
+	err := action(func() { submitted = true })
+	if submitted {
+		n.last = time.Now()
+	}
+	return err
 }

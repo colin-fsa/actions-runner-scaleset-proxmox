@@ -52,6 +52,10 @@ var ErrFirewallGroupNotFound = errors.New("provisioner: configured firewall secu
 // inside this package — callers never have to string-match Proxmox
 // response text.
 var (
+	// ErrRunningJITCapacityDeferred proves the container was running and
+	// neither the new JIT env nor any boot request was sent.
+	ErrRunningJITCapacityDeferred = errors.New("provisioner: running LXC JIT deferred before delivery")
+
 	// ErrVMNotFound means the Proxmox API responded with "vm not
 	// found" (typically HTTP 500 wrapping "Configuration file
 	// 'nodes/.../qemu-server/<vmid>.conf' does not exist" or HTTP 404).
@@ -84,12 +88,13 @@ var (
 // from the row's profile (see resolveGuestType), so the store does not
 // need to persist the guest type.
 type VM struct {
-	VMID      int
-	Node      string
-	Name      string
-	Profile   string
-	GuestType string
-	CreatedAt time.Time // Exact store generation, when available for JIT.
+	VMID          int
+	Node          string
+	Name          string
+	Profile       string
+	GuestType     string
+	CreatedAt     time.Time // Exact store generation, when available for JIT.
+	NameRangeOnly bool      // discovery by prefix/range, not proof of controller ownership
 }
 
 // CloneOptions are passed to [Provisioner.Clone]. NewVMID is allocated by
@@ -415,6 +420,13 @@ func newTracker(ttl time.Duration) *ttlcache.Cache[int, time.Time] {
 	)
 }
 
+// CloneOperationTimeout bounds the clone/configure worker and unbounded
+// HTTP callers. It is a deadline, never a restart or admission delay.
+const (
+	cloneTaskTimeout      = 10 * time.Minute
+	CloneOperationTimeout = cloneTaskTimeout + 2*time.Minute
+)
+
 // newProxmoxClient builds the underlying HTTP+API-token client.
 //
 // The HTTP transport is wrapped by hashicorp/go-retryablehttp so transient
@@ -441,14 +453,9 @@ func newProxmoxClient(cfg config.ProxmoxConfig) *proxmox.Client {
 	retry := retryablehttp.NewClient()
 	retry.HTTPClient = &http.Client{
 		Transport: tr,
-		// Per-request hard cap. Must be >= the largest task.WaitFor
-		// budget (600s in Clone) — otherwise a single poll that stalls
-		// past Timeout aborts a still-progressing task and the caller
-		// sees a spurious failure. 15m matches the per-clone ctx
-		// deadline in pool.runClone so this is just a backstop for
-		// callers that forget to pass a bounded ctx; well-behaved
-		// callers' ctx deadlines win long before this fires.
-		Timeout: 15 * time.Minute,
+		// Upstream task waits are bounded separately. This is a
+		// transport backstop for requests without a shorter context.
+		Timeout: CloneOperationTimeout,
 	}
 	retry.RetryMax = 4
 	retry.RetryWaitMin = 500 * time.Millisecond
@@ -646,7 +653,7 @@ func (p *pmox) Clone(ctx context.Context, opts CloneOptions) (*VM, error) {
 	if err != nil {
 		return nil, fmt.Errorf("issue clone: %w", err)
 	}
-	if err := awaitTask(ctx, task, 600); err != nil {
+	if err := awaitTask(ctx, task, int(cloneTaskTimeout/time.Second)); err != nil {
 		return nil, fmt.Errorf("await clone task: %w", err)
 	}
 
@@ -942,12 +949,20 @@ func (p *pmox) locateTemplate(ctx context.Context, templateVMID int) (string, er
 // no NIC, re-applying only the firewall options — an idempotent PUT —
 // so a duplicate group rule never accumulates across starts.
 func (p *pmox) Start(ctx context.Context, vm *VM) error {
+	return p.StartWithSubmission(ctx, vm, nil)
+}
+
+// StartSubmission gates only the POST. Proxmox lookup/firewall work happens
+// before it, and waiting for the accepted task happens after it.
+type StartSubmission func(context.Context, func(context.Context) error) error
+
+func (p *pmox) StartWithSubmission(ctx context.Context, vm *VM, gate StartSubmission) error {
 	guestType, gtErr := p.resolveGuestType(ctx, vm)
 	if gtErr != nil {
 		return gtErr
 	}
 	if guestType == config.GuestTypeLXC {
-		return p.startLXC(ctx, vm)
+		return p.startLXC(ctx, vm, gate)
 	}
 	pVM, err := p.getVM(ctx, vm)
 	if err != nil {
@@ -958,7 +973,7 @@ func (p *pmox) Start(ctx context.Context, vm *VM) error {
 			return fmt.Errorf("ensure firewall before start: %w", err)
 		}
 	}
-	return p.startInternal(ctx, pVM)
+	return p.startInternal(ctx, pVM, gate)
 }
 
 // ensureFirewall verifies that a VM carries the configured sandbox —
@@ -1029,10 +1044,22 @@ func (p *pmox) ensureFirewall(ctx context.Context, pVM *proxmox.VirtualMachine) 
 	return nil
 }
 
-func (p *pmox) startInternal(ctx context.Context, pVM *proxmox.VirtualMachine) error {
+func (p *pmox) startInternal(ctx context.Context, pVM *proxmox.VirtualMachine, gates ...StartSubmission) error {
 	ctx, span := tracer.Start(ctx, "provisioner.PowerOn")
 	defer span.End()
-	task, err := pVM.Start(ctx)
+	var task *proxmox.Task
+	submit := func(requestCtx context.Context) error {
+		ctx = requestCtx
+		var err error
+		task, err = pVM.Start(requestCtx)
+		return err
+	}
+	var err error
+	if len(gates) > 0 && gates[0] != nil {
+		err = gates[0](ctx, submit)
+	} else {
+		err = submit(ctx)
+	}
 	if err != nil {
 		// If the VM is already running, Proxmox returns an error. Treat as
 		// success since the desired post-condition is met.
@@ -1041,10 +1068,32 @@ func (p *pmox) startInternal(ctx context.Context, pVM *proxmox.VirtualMachine) e
 		}
 		return fmt.Errorf("start vm: %w", err)
 	}
+	if task == nil || task.UPID == "" {
+		return errors.New("start vm: Proxmox returned no task ID; outcome unknown")
+	}
+	nodecap.ReportPacedTask(ctx, pVM.Node, int(pVM.VMID), string(task.UPID), false)
+	accepted := task.UPID
+	p.log.Debug("start: Proxmox task accepted", "vmid", pVM.VMID, "node", pVM.Node, "upid", task.UPID, "operation", "qemu_start")
 	if err := awaitTask(ctx, task, 300); err != nil {
 		return fmt.Errorf("await start: %w", err)
 	}
+	p.reportStartTaskOutcome(ctx, pVM.Node, int(pVM.VMID), accepted, task, "qemu_start")
 	return nil
+}
+
+// Generic task waiting treats any non-running string as terminal. That
+// is not affirmative receipt evidence for retiring a powered-on hold.
+func (p *pmox) reportStartTaskOutcome(ctx context.Context, node string, vmid int, accepted proxmox.UPID, task *proxmox.Task, operation string) {
+	if !startTaskSucceeded(task, accepted) {
+		p.log.Debug("start: Proxmox task success unproven", "vmid", vmid, "node", node, "upid", accepted, "operation", operation)
+		return
+	}
+	nodecap.ReportPacedTask(ctx, node, vmid, string(accepted), true)
+	p.log.Debug("start: Proxmox task completed", "vmid", vmid, "node", node, "upid", accepted, "operation", operation)
+}
+
+func startTaskSucceeded(task *proxmox.Task, accepted proxmox.UPID) bool {
+	return task != nil && accepted != "" && task.UPID == accepted && task.Status == "stopped" && task.ExitStatus == "OK"
 }
 
 // Stop attempts a graceful Shutdown first; if that doesn't settle within
@@ -1195,7 +1244,7 @@ func (p *pmox) SnapshotRollback(ctx context.Context, vm *VM, name string) error 
 	if err != nil {
 		return fmt.Errorf("rollback to snapshot %q on vm %d (node %s): %w", name, vm.VMID, vm.Node, classifyProxmoxError(err))
 	}
-	if err := awaitTask(ctx, task, 600); err != nil {
+	if err := awaitTask(ctx, task, int(cloneTaskTimeout/time.Second)); err != nil {
 		return fmt.Errorf("await rollback to snapshot %q on vm %d (node %s): %w", name, vm.VMID, vm.Node, classifyProxmoxError(err))
 	}
 	return nil
@@ -1410,7 +1459,7 @@ func (p *pmox) classifyGuest(vmid int, name, guestTags, node, guestType string) 
 	if owned {
 		profile = tags.ProfileOf(guestTags)
 	}
-	return &VM{VMID: vmid, Node: node, Name: name, Profile: profile, GuestType: guestType}, true
+	return &VM{VMID: vmid, Node: node, Name: name, Profile: profile, GuestType: guestType, NameRangeOnly: !owned}, true
 }
 
 // getVM resolves *VM into the library's *proxmox.VirtualMachine.

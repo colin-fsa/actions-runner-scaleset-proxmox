@@ -1767,8 +1767,8 @@ func (c *Config) resolvePool() error {
 			c.Pool.Capacity.MemoryMode, MemoryModeAllocated, MemoryModeHostAvailable)
 	}
 	if d := c.Pool.Capacity.WindowsOnlineSettleAfter.D(); d != 0 {
-		if d < 30*time.Second || d >= max(15*time.Minute, c.Pool.CloneInflightGrace.D()) {
-			return errors.New("pool.capacity.windows_online_settle_after must be zero or at least 30s and shorter than the reservation TTL")
+		if d < 30*time.Second || d >= c.Pool.CloneInflightGrace.D() {
+			return errors.New("pool.capacity.windows_online_settle_after must be zero or at least 30s and shorter than clone_inflight_grace")
 		}
 		if !c.Pool.Capacity.Enabled || c.Pool.Capacity.MemoryMode != MemoryModeHostAvailable {
 			return errors.New("pool.capacity.windows_online_settle_after requires host_available capacity admission")

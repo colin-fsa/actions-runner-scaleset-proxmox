@@ -29,6 +29,8 @@ const (
 	StateDraining   State = "draining"
 	StateDestroying State = "destroying"
 	StatePoison     State = "poison"
+	// StateExcluded occupies its ID without being an autoscaler runner.
+	StateExcluded State = "excluded"
 )
 
 // PoolKind is the pool budget a VM counts toward.
@@ -53,6 +55,7 @@ var AllStates = []State{
 	StateDraining,
 	StateDestroying,
 	StatePoison,
+	StateExcluded,
 }
 
 // VM is a single Proxmox virtual machine the scaleset is managing.
@@ -114,7 +117,9 @@ type VM struct {
 	WindowsJITRunnerID int64
 	// AdoptionProtected prevents cleanup or reuse while restart observations
 	// cannot establish that an inherited guest's job is no longer busy.
-	AdoptionProtected bool
+	AdoptionProtected       bool
+	RestartCleanupPending   bool
+	RestartPretagQuarantine bool
 	// StartWorkerDeadline is set atomically with Provisioning/Booting while
 	// the local clone or boot worker owns the row. The in-memory store is
 	// rebuilt on restart; a zero value denotes no tracked worker.

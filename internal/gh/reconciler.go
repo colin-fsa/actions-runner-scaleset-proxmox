@@ -70,6 +70,9 @@ type Config struct {
 	// otherwise the reconciler will destroy VMs the pool worker is
 	// still booting. Wired from config's pool.orphan_grace.
 	OrphanGrace time.Duration
+	// During restart, continue exact tracked-row reconciliation, but do
+	// not destroy a guest or runner from an incomplete store snapshot.
+	RecoveryPending func() bool
 
 	// RunnerNamePrefix is the prefix our scaleset stamps on every
 	// runner name (e.g. "gh-runner-proxmox-ubuntu-x64-"). Runners NOT
@@ -292,6 +295,9 @@ func (r *Reconciler) Tick(ctx context.Context) error {
 		}
 	}
 	r.applyMatrix(ctx, rows, runners, truncated)
+	if r.cfg.RecoveryPending != nil && r.cfg.RecoveryPending() {
+		return nil
+	}
 	r.cleanupOrphanRunners(ctx, rows, runners, truncated)
 
 	if r.prov != nil {
@@ -620,6 +626,9 @@ func (r *Reconciler) applyMatrix(ctx context.Context, rows []pool.RowSnapshot, r
 	seen := make(map[string]bool, len(rows))
 	assignedMissing := make(map[string]bool)
 	for _, row := range rows {
+		if row.RestartPretagQuarantine {
+			continue
+		}
 		gr, present := runners[row.Name]
 		if row.AdoptionProtected {
 			if !truncated && !present && r.reconcileMissingAdoption(ctx, row, now) {
@@ -1006,6 +1015,9 @@ func (r *Reconciler) sweepProxmoxOrphans(ctx context.Context, rows []pool.RowSna
 
 	now := r.now()
 	for _, pv := range pmoxVMs {
+		if pv.NameRangeOnly {
+			continue
+		} // do not destroy a guest based on its name
 		if _, ok := known[pv.VMID]; ok {
 			continue
 		}
