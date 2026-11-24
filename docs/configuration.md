@@ -110,9 +110,13 @@ independently deployed controllers.
 With `host_available` capacity and a configured start pace/limit, the
 controller samples node capacity immediately before a shared power POST.
 A submitted launch holds capacity until Proxmox confirms successful task
-completion, the guest is ready, and independent fresh host samples see the
-same boot, or until its destruction is confirmed. The hard host reserve
-still applies; this is not a reservation of future job memory. An ambiguous
+completion and two direct readings see the same running guest process,
+with a valid host-capacity sample taken after each guest observation, or
+until its destruction is confirmed. The reads are spaced by the configured
+start interval. Guest-agent and GitHub readiness control job assignment,
+not whether the measured host memory already includes that VM. The hard
+host reserve still applies; this is not a reservation of future job memory.
+An ambiguous
 launch stays charged rather than expiring automatically. Once its local
 worker has returned and two direct reads show stable identity, trustworthy
 host capacity and no unfinished matching task, it can stop occupying a
@@ -135,10 +139,10 @@ owns that session. A missing scale set can be created after shared proof;
 on a first guarded install, the same prior Proxmox proof requirements apply.
 Pristine, already-powered Windows runners can accept jobs without a new
 power operation. If the same inherited running process remains observable
-but its readiness cannot be confirmed, it stays unavailable for new work
-and separately retains its full configured footprint until confirmed
-cleanup; it does not consume a concurrent boot slot. No timer clears
-blocked restart proof or that footprint. If a matching old clone first
+but its readiness cannot be confirmed, it stays unavailable for new work.
+Its exact process is present in the paired direct host measurements, so
+a paced host does not also deduct its configured footprint or consume a
+concurrent boot slot. No timer clears blocked restart proof. If a matching old clone first
 appears after initial adoption, it is recorded without any power or delete
 request and the complete proof runs again. An expected-name, in-range,
 untagged guest can occupy an excluded ID after old tasks drain and two

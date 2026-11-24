@@ -2,26 +2,33 @@ package nodecap
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"math"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 )
 
 type inactiveStartView struct {
-	at     time.Time
-	status string
-	pid    int64
-	uptime int64
-	task   string
+	at, hostAt time.Time
+	status     string
+	pid        int64
+	uptime     int64
+	task       string
+	host       liveStatus
+	visible    bool
 }
 
 type inactiveStartTarget struct {
-	id                     uint64
-	vmid                   int
-	node, name, kind, upid string
-	attempt, returned      time.Time
+	id                           uint64
+	vmid                         int
+	node, name, kind, upid       string
+	attempt, returned, completed time.Time
+	probeAt                      time.Time
+	allowFallback                bool
 }
 
 type inactiveTask struct {
@@ -35,9 +42,9 @@ type inactiveTask struct {
 	Exit   string `json:"exitstatus"`
 }
 
-// recheckInactiveStarts can free the scarce power slot, never the RAM.
-// Keep the normal readiness receipt path separate so a definitively
-// successful, healthy boot can retire its entire hold as before.
+// recheckInactiveStarts settles known successful launches from direct guest and
+// host evidence, independently of guest-agent/GitHub readiness. The same
+// observations free only a power slot, not RAM, for an ambiguous attempt.
 func (a *Accountant) recheckInactiveStarts(ctx context.Context, node string, snap *snapshot) {
 	owner := a.opts.PacedTaskOwner
 	if _, _, ok := strings.Cut(owner, "!"); !ok {
@@ -46,47 +53,91 @@ func (a *Accountant) recheckInactiveStarts(ctx context.Context, node string, sna
 	now := a.now()
 	var pending []inactiveStartTarget
 	a.mu.Lock()
-	// Give a successful ready attempt its normal retirement on this
-	// same fresh sample before considering the conservative fallback.
 	a.sweepLocked(snap)
 	nodeView, known := snap.nodes[node]
-	if known && !nodeView.memMissing && !a.recoveringLocked() {
+	if known && !nodeView.memMissing && !a.recoveringLocked() && !a.stale(snap) {
+		var eligible []*reservation
 		for _, r := range a.res {
 			p := &r.pacedProof
 			if r.node != node || !r.paced || !r.started || r.inherited || r.generation.IsZero() ||
-				p.returned.IsZero() || !p.workerDone || now.Sub(p.returned) < a.opts.PacedStartInterval ||
-				(!p.ready.IsZero() && now.Sub(p.ready) < 2*max(a.opts.PacedStartInterval, 15*time.Second)) ||
+				p.returned.IsZero() || p.submitName == "" ||
+				(!p.completed && (!p.workerDone || now.Sub(p.returned) < a.opts.PacedStartInterval)) ||
 				(!p.probeAt.IsZero() && now.Sub(p.probeAt) < 5*time.Second) {
 				continue
 			}
+			eligible = append(eligible, r)
+		}
+		slices.SortFunc(eligible, func(x, y *reservation) int { return x.pacedProof.probeAt.Compare(y.pacedProof.probeAt) })
+		for _, r := range eligible[:min(len(eligible), a.opts.PacedStartLimit)] {
+			p := &r.pacedProof
 			p.probeAt = now
 			pending = append(pending, inactiveStartTarget{id: r.id, vmid: r.vmid, node: r.node, name: p.submitName, kind: p.submitKind,
-				upid: p.upid, attempt: r.startedAt, returned: p.returned})
-			if len(pending) >= a.opts.PacedStartLimit {
-				break
-			}
+				upid: p.upid, attempt: r.startedAt, returned: p.returned, completed: p.completedAt, probeAt: now,
+				allowFallback: p.workerDone && !p.slotSettled && now.Sub(p.returned) >= a.opts.PacedStartInterval})
 		}
 	}
 	a.mu.Unlock()
 	for _, t := range pending {
 		view, ok := a.observeInactiveStart(ctx, t, owner)
+		visiblySettled := !t.completed.IsZero() && ok
+		if !ok && !t.completed.IsZero() && t.allowFallback {
+			// A valid receipt is not sufficient if direct power identity has
+			// changed. Use the conservative idle fence for the slot only.
+			fallback := t
+			fallback.completed = time.Time{}
+			view, ok = a.observeInactiveStart(ctx, fallback, owner)
+		}
+		if ctx.Err() != nil {
+			return
+		}
 		a.mu.Lock()
 		r := a.res[t.id]
-		if r != nil && r.paced && !r.released && r.startedAt.Equal(t.attempt) &&
-			r.pacedProof.returned.Equal(t.returned) && r.pacedProof.upid == t.upid && (r.pacedProof.ready.IsZero() || a.now().Sub(r.pacedProof.ready) >= 2*max(a.opts.PacedStartInterval, 15*time.Second)) {
+		if r != nil && r.paced && !r.released && !a.recoveringLocked() && r.startedAt.Equal(t.attempt) &&
+			r.pacedProof.returned.Equal(t.returned) && r.pacedProof.upid == t.upid && r.pacedProof.completedAt.Equal(t.completed) &&
+			r.pacedProof.probeAt.Equal(t.probeAt) {
 			prev := r.pacedProof.rechecked
 			switch {
 			case !ok:
 				r.pacedProof.rechecked = inactiveStartView{}
-			case prev.at.IsZero() || prev.task != view.task || prev.status != view.status || prev.pid != view.pid:
+			case prev.at.IsZero() || prev.task != view.task || prev.status != view.status || prev.pid != view.pid || prev.visible != visiblySettled:
+				view.visible = visiblySettled
 				r.pacedProof.rechecked = view
-			case view.at.Sub(prev.at) >= max(a.opts.PacedStartInterval, 15*time.Second) &&
+			case view.hostAt.After(prev.hostAt) && view.at.Sub(prev.at) >= a.opts.PacedStartInterval &&
 				(view.status == "stopped" || (view.uptime > prev.uptime &&
 					time.Duration(view.uptime-prev.uptime)*time.Second >= view.at.Sub(prev.at)-5*time.Second &&
 					time.Duration(view.uptime-prev.uptime)*time.Second <= view.at.Sub(prev.at)+5*time.Second)):
-				r.paced, r.inherited = false, true
-				a.log.Warn("nodecap: quiet exact incomplete start no longer occupies a boot slot; retaining memory",
-					"node", r.node, "vmid", r.vmid, "generation", r.generation, "claim", r.id, "task", view.task, "memory_bytes", r.shape.MemoryBytes)
+				if visiblySettled {
+					// The current decision must use the direct capacity sample
+					// taken after the observed guest, not a pre-observation cache.
+					totals := snap.nodes[node]
+					available, valid := view.host.Memory.AvailableBytes()
+					if valid && !view.hostAt.Before(totals.memReadAt) && a.now().Sub(view.hostAt) <= a.opts.Refresh && !a.stale(snap) {
+						totals.memAvailable, totals.memReadAt, totals.memMissing = available, view.hostAt, false
+						totals.cpuMissing = view.host.CPU == nil
+						if cpu := view.host.CPU; cpu != nil {
+							totals.cpuUsage = *cpu
+							totals.cpuMissing = math.IsNaN(*cpu) || math.IsInf(*cpu, 0) || *cpu < 0 || *cpu > 1
+						}
+						snap.nodes[node] = totals
+						a.recordPacedHostObservationLocked(node, view.hostAt)
+						// Older concurrent snapshots cannot admit a paced POST.
+						r.released = true
+						delete(a.res, r.id)
+						a.log.Debug("nodecap: retired launch hold after direct host visibility",
+							"node", r.node, "vmid", r.vmid, "generation", r.generation, "claim", r.id, "upid", view.task,
+							"pid", view.pid, "uptime_seconds", view.uptime, "host_sample", view.hostAt, "memory_bytes", r.shape.MemoryBytes)
+					}
+				} else if !r.pacedProof.slotSettled {
+					if t.completed.IsZero() {
+						r.paced, r.inherited = false, true
+					} else {
+						// Keep checking a completed launch even after a slot-only
+						// fallback, so a later authoritative observation can retire it.
+						r.pacedProof.slotSettled = true
+					}
+					a.log.Warn("nodecap: quiet exact incomplete start no longer occupies a boot slot; retaining memory",
+						"node", r.node, "vmid", r.vmid, "generation", r.generation, "claim", r.id, "task", view.task, "memory_bytes", r.shape.MemoryBytes)
+				}
 			}
 		}
 		a.mu.Unlock()
@@ -131,7 +182,8 @@ func (a *Accountant) observeInactiveStart(ctx context.Context, t inactiveStartTa
 		}
 		return true
 	}
-	if !idle() {
+	confirmed := !t.completed.IsZero()
+	if !confirmed && !idle() {
 		return inactiveStartView{}, false
 	}
 	upid := t.upid
@@ -144,6 +196,9 @@ func (a *Accountant) observeInactiveStart(ctx context.Context, t inactiveStartTa
 			// An explicit disagreement is not the same as no receipt.
 			return inactiveStartView{}, false
 		}
+	}
+	if confirmed && upid == "" {
+		return inactiveStartView{}, false
 	}
 	if upid == "" {
 		// A lost response may be recovered only from one unambiguous
@@ -209,25 +264,37 @@ func (a *Accountant) observeInactiveStart(ctx context.Context, t inactiveStartTa
 		return inactiveStartView{}, false
 	}
 	var guest struct {
-		ID     int    `json:"vmid"`
-		Name   string `json:"name"`
-		Status string `json:"status"`
-		Lock   string `json:"lock"`
-		PID    int64  `json:"pid"`
-		Uptime int64  `json:"uptime"`
+		ID     json.RawMessage `json:"vmid"`
+		Name   string          `json:"name"`
+		Status string          `json:"status"`
+		Lock   string          `json:"lock"`
+		PID    int64           `json:"pid"`
+		Uptime int64           `json:"uptime"`
 		HA     struct {
 			Managed *int `json:"managed"`
 		} `json:"ha"`
 	}
 	path := fmt.Sprintf("%s/%s/%d/status/current", base, t.kind, t.vmid)
-	if err := a.cli.Get(ctx, path, &guest); err != nil || guest.ID != t.vmid || guest.Name != t.name || guest.HA.Managed == nil || *guest.HA.Managed != 0 ||
+	guestAt := a.now()
+	id := strconv.Itoa(t.vmid)
+	if err := a.cli.Get(ctx, path, &guest); err != nil || (string(guest.ID) != id && string(guest.ID) != strconv.Quote(id)) || guest.Name != t.name || guest.HA.Managed == nil || *guest.HA.Managed != 0 ||
 		guest.Lock != "" || !(guest.Status == "stopped" && guest.PID == 0 || guest.Status == "running" && guest.PID > 0 && guest.Uptime > 0) {
 		return inactiveStartView{}, false
 	}
+	if confirmed {
+		// This is direct process uptime, not pvestatd's lagged cluster
+		// inventory. Tolerate only integral-second rounding and GET latency.
+		bootAt := guestAt.Add(-time.Duration(guest.Uptime) * time.Second)
+		if task.Exit != "OK" || guest.Status != "running" || bootAt.Before(t.attempt.Add(-2*time.Second)) ||
+			bootAt.After(t.completed.Add(2*time.Second)) {
+			return inactiveStartView{}, false
+		}
+	}
 	host, err := a.nodeLiveStatus(ctx, t.node)
+	hostAt := a.now()
 	_, hasMemory := host.Memory.AvailableBytes()
-	if err != nil || !hasMemory || !idle() {
+	if err != nil || !hasMemory || !hostAt.After(t.attempt) || (confirmed && !hostAt.After(t.completed)) || (!confirmed && !idle()) {
 		return inactiveStartView{}, false
 	}
-	return inactiveStartView{a.now(), guest.Status, guest.PID, guest.Uptime, upid}, true
+	return inactiveStartView{at: guestAt, hostAt: hostAt, status: guest.Status, pid: guest.PID, uptime: guest.Uptime, task: upid, host: host}, true
 }
