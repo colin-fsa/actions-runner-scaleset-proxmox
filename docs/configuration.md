@@ -103,12 +103,30 @@ starts on the same node; its default is `0s` (unlimited). The old
 operating systems; do not set both names. A conservative initial setting is
 `boots_per_node: 2` and `boot_start_interval: 15s`. The existing per-profile
 runner limit, including a configured Windows ceiling of 25, remains separate.
-Slots are held through guest readiness or failure; saturation defers pool
-refill. The budget is local to one elected controller, not a lock between
+Without paced host-capacity admission, slots are held through guest readiness
+or failure; saturation defers pool refill. The budget is local to one elected controller, not a lock between
 independently deployed controllers.
 
 With `host_available` capacity and a configured start pace/limit, the
 controller samples node capacity immediately before a shared power POST.
+When idle eviction is disabled, already-provisioned warm promotions take priority
+at that boundary and bypass the cold power timer. Their burst is bounded by the
+same host-wide outstanding-start limit and atomic memory/CPU charges as cold
+starts. Cloning and guest readiness do not occupy those host start slots.
+New clone POSTs have their own per-node clock using `boot_start_interval`;
+cold power POSTs and LXC JIT restarts retain the configured power spacing.
+At `15s`, each clock retains a 15-second floor; warm promotion POSTs are the
+explicit exception. Clone task waits do not hold the submission lock. A waiting
+cold timer cannot block a warm promotion, and cold requests get a turn after
+one host-sized priority burst. A running LXC JIT restart still checks actual host
+floors without buying a second guest allocation; a stopped LXC needs fresh
+start admission. Defaults and configurations without positive pace and limit,
+or with idle eviction enabled, keep their previous behavior.
+
+Online runners remain immediately eligible for jobs. Controller deferrals and
+GitHub's choice of which online runner receives a job are separate; this policy
+does not enforce GitHub assignment order.
+
 A submitted launch holds capacity until Proxmox confirms successful task
 completion and two direct readings see the same running guest process,
 with a valid host-capacity sample taken after each guest observation, or

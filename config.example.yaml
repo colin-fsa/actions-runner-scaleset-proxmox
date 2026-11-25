@@ -219,8 +219,10 @@ pool:
   # Shared by Linux and Windows; 0 disables each control.
   # When both are set, host_available admission (without idle eviction) takes
   # launch holds after pacing. Each node also limits unresolved boots to
-  # boots_per_node. A completed task plus a ready guest and two fresh matching
-  # observations retire its boot hold; incomplete evidence keeps the old TTL.
+  # boots_per_node. Warm promotions bypass cold pacing; cold clone POSTs
+  # have a separate clock at boot_start_interval. Cloning/readiness do not
+  # consume host slots in this mode. A completed task plus two fresh exact
+  # process/host observations retire the hold; ambiguous starts do not expire.
   # This is a startup budget, not a reservation for future job growth.
   boots_per_node: 0
   boot_start_interval: 0s

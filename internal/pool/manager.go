@@ -2555,7 +2555,10 @@ func (m *manager) promoteN(ctx context.Context, profile string, n int) {
 		releaseWindowsBoot := func() {}
 		{
 			var acquired bool
-			releaseWindowsBoot, acquired = m.cfg.WindowsBootBudget.tryAcquire(w.Node)
+			acquired = true
+			if m.pacedStartAdmitter() == nil {
+				releaseWindowsBoot, acquired = m.cfg.WindowsBootBudget.tryAcquire(w.Node)
+			}
 			if !acquired {
 				m.log.Debug("promote: host boot budget unavailable", "vmid", w.VMID, "node", w.Node)
 				m.bootSem.Release(1)
@@ -2742,8 +2745,23 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 	// explicitly below, after the snapshot lands.
 	cloneStartsVM := false
 
+	var cloneSubmission provisioner.StartSubmission
+	if m.pacedStartAdmitter() != nil {
+		cloneSubmission = func(ctx context.Context, submit func(context.Context) error) error {
+			return m.cfg.WindowsBootBudget.dispatch(ctx, prep.node, false, true, func(mark func()) error {
+				row, err := m.store.Get(prep.vmid)
+				if err != nil || row.State != store.StateProvisioning || !row.CreatedAt.Equal(prep.createdAt) ||
+					!row.StartWorkerDeadline.Equal(prep.deadline) || row.Node != prep.node || row.Name != prep.name || row.Profile != prep.profileName {
+					return errStartCapacityDeferred
+				}
+				mark()
+				return submit(ctx)
+			})
+		}
+	}
 	cloneStart := time.Now()
 	pv, err := m.prov.Clone(prep.ctx, provisioner.CloneOptions{
+		Submission:    cloneSubmission,
 		NewVMID:       prep.vmid,
 		Node:          prep.node,
 		Name:          prep.name,
@@ -2919,7 +2937,7 @@ func (m *manager) prepareClone(profile string, kind store.PoolKind, poweredOn bo
 	}
 
 	releaseWindowsBoot := func() {}
-	if poweredOn {
+	if poweredOn && m.pacedStartAdmitter() == nil {
 		var ok bool
 		releaseWindowsBoot, ok = m.cfg.WindowsBootBudget.tryAcquire(node)
 		if !ok {

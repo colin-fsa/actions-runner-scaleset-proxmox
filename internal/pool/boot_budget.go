@@ -3,6 +3,7 @@ package pool
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/semaphore"
@@ -20,9 +21,12 @@ type WindowsBootBudget struct {
 }
 
 type bootNode struct {
-	slots *semaphore.Weighted
-	pace  sync.Mutex
-	last  time.Time
+	slots       *semaphore.Weighted
+	pace        sync.Mutex
+	last        time.Time
+	lastClone   time.Time
+	warmWaiting atomic.Int64
+	warmBurst   int64
 }
 
 func NewWindowsBootBudget(limit int) *WindowsBootBudget {
@@ -153,7 +157,18 @@ func (b *WindowsBootBudget) paceAdmission(ctx context.Context, node string, admi
 	})
 }
 
+// paceAction retains spacing for cold power requests and JIT restarts.
 func (b *WindowsBootBudget) paceAction(ctx context.Context, node string, action func(markSubmitted func()) error) error {
+	return b.dispatch(ctx, node, false, false, action)
+}
+
+// warmAction bypasses cold pacing, but shares the POST boundary and the
+// accountant's atomic outstanding-start limit. No readiness slot is held.
+func (b *WindowsBootBudget) warmAction(ctx context.Context, node string, action func(func()) error) error {
+	return b.dispatch(ctx, node, true, false, action)
+}
+
+func (b *WindowsBootBudget) dispatch(ctx context.Context, node string, warm, clone bool, action func(func()) error) error {
 	if b == nil || b.interval <= 0 {
 		if err := ctx.Err(); err != nil || action == nil {
 			return err
@@ -161,28 +176,66 @@ func (b *WindowsBootBudget) paceAction(ctx context.Context, node string, action 
 		return action(func() {})
 	}
 	n := b.node(node)
-	n.pace.Lock()
-	defer n.pace.Unlock()
-	if delay := time.Until(n.last.Add(b.interval)); delay > 0 {
-		timer := time.NewTimer(delay)
-		defer timer.Stop()
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-timer.C:
-		}
+	if warm {
+		n.warmWaiting.Add(1)
+		defer n.warmWaiting.Add(-1)
 	}
-	if err := ctx.Err(); err != nil {
+	for {
+		n.pace.Lock()
+		last := &n.last
+		if clone {
+			last = &n.lastClone
+		}
+		delay := time.Until(last.Add(b.interval))
+		// Sleep outside the POST lock: a cold timer must not block a warm
+		// promotion. Bound priority to one host-sized burst so cold work wins
+		// a turn even with contemporaneous warm requests.
+		if !warm && (delay > 0 || (n.warmWaiting.Load() > 0 && n.warmBurst < b.limit)) {
+			n.pace.Unlock()
+			if delay <= 0 {
+				delay = time.Millisecond
+			}
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+			continue
+		}
+		err := func() error {
+			defer n.pace.Unlock()
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			// Recheck the leader fence after waiting, including for clone POSTs.
+			b.mu.Lock()
+			blocked := b.verificationPending || time.Now().Before(b.readyAt)
+			b.mu.Unlock()
+			if blocked {
+				return errStartCapacityDeferred
+			}
+			// A refused warm admission also used its priority turn; a busy
+			// ledger must not let a stream of refusals starve cold requests.
+			if warm {
+				n.warmBurst = min(b.limit, n.warmBurst+1)
+			}
+			submitted := false
+			var err error
+			if action == nil {
+				submitted = true
+			} else {
+				err = action(func() { submitted = true })
+			}
+			if submitted {
+				if !warm {
+					*last = time.Now()
+					n.warmBurst = 0
+				}
+			}
+			return err
+		}()
 		return err
 	}
-	if action == nil {
-		n.last = time.Now()
-		return nil
-	}
-	submitted := false
-	err := action(func() { submitted = true })
-	if submitted {
-		n.last = time.Now()
-	}
-	return err
 }

@@ -51,7 +51,11 @@ func (m *manager) startBootWorker(ctx context.Context, vm *provisioner.VM, row *
 	powerCtx := ctx
 	issued := false
 	gate := func(ctx context.Context, submit func(context.Context) error) error {
-		return m.cfg.WindowsBootBudget.paceAction(ctx, row.Node, func(mark func()) error {
+		dispatch := m.cfg.WindowsBootBudget.paceAction
+		if promotion {
+			dispatch = m.cfg.WindowsBootBudget.warmAction
+		}
+		return dispatch(ctx, row.Node, func(mark func()) error {
 			if profile == nil || !m.currentBootWorker(row) {
 				return errStartCapacityDeferred
 			}
