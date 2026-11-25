@@ -14,13 +14,17 @@ import (
 
 type pacedAdmitterStub struct {
 	*fakeAdmitter
-	allow bool
-	calls int
+	allow   bool
+	calls   int
+	onCheck func()
 }
 
 func (*pacedAdmitterStub) SupportsPacedStart() bool { return true }
 func (a *pacedAdmitterStub) ReserveExistingForPacedStart(_ context.Context, node string, shape nodecap.Shape, vmid int, _ time.Time, _ bool) (nodecap.Reservation, bool, error) {
 	a.calls++
+	if a.onCheck != nil {
+		defer a.onCheck()
+	}
 	if !a.allow {
 		return nil, false, nil
 	}
@@ -44,6 +48,12 @@ func TestPacedColdStartCommitsOnlyAfterStoppedClone(t *testing.T) {
 			Capacity: adm, WindowsBootBudget: NewHostBootBudget(2, time.Millisecond, 0),
 		})
 		t.Cleanup(m.Close)
+		if !allow {
+			// Cold capacity refusals now retain their queued worker. Cancel
+			// after its first check to prove the undelivered clone parks Warm
+			// without a boot failure or leaked admission/clone slot.
+			adm.onCheck = m.workerCancel
+		}
 		m.runClone("p", store.PoolKindHot, true, nil, func() {})
 		require.Equal(t, 1, adm.calls)
 		require.Zero(t, adm.reserveCalls)

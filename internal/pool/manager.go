@@ -2745,8 +2745,16 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 	// explicitly below, after the snapshot lands.
 	cloneStartsVM := false
 
+	releaseClone := func() {}
 	var cloneSubmission provisioner.StartSubmission
 	if m.pacedStartAdmitter() != nil {
+		var err error
+		releaseClone, err = m.cfg.WindowsBootBudget.acquireClone(prep.ctx, prep.node)
+		if err != nil {
+			m.handleCloneFailure(prep, err, "clone")
+			return
+		}
+		defer releaseClone() // panic/error safety; released before readiness below
 		cloneSubmission = func(ctx context.Context, submit func(context.Context) error) error {
 			return m.cfg.WindowsBootBudget.dispatch(ctx, prep.node, false, true, func(mark func()) error {
 				row, err := m.store.Get(prep.vmid)
@@ -2779,6 +2787,7 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 		NICs:          prep.ps.settings.NICs,
 		IPConfig:      prep.ipConfig,
 	})
+	releaseClone()
 	if err != nil {
 		m.handleCloneFailure(prep, err, "clone")
 		return

@@ -113,12 +113,20 @@ When idle eviction is disabled, already-provisioned warm promotions take priorit
 at that boundary and bypass the cold power timer. Their burst is bounded by the
 same host-wide outstanding-start limit and atomic memory/CPU charges as cold
 starts. Cloning and guest readiness do not occupy those host start slots.
-New clone POSTs have their own per-node clock using `boot_start_interval`;
+Clone/configuration tasks have a separate host-wide concurrency bound of
+`boots_per_node`, shared across scale sets and released before readiness.
+This bound never occupies the warm submission gate. New clone POSTs also
+have their own per-node clock using `boot_start_interval`;
 cold power POSTs and LXC JIT restarts retain the configured power spacing.
 At `15s`, each clock retains a 15-second floor; warm promotion POSTs are the
 explicit exception. Clone task waits do not hold the submission lock. A waiting
-cold timer cannot block a warm promotion, and cold requests get a turn after
-one host-sized priority burst. A running LXC JIT restart still checks actual host
+cold timer cannot block a warm promotion. After one host-sized priority burst,
+warm requests explicitly yield to a registered cold request whose POST clock
+is due, even if another warm caller acquires the lock first. A refused cold
+admission consumes that turn too. A stopped cold worker stays registered and
+retries fresh capacity outside the lock until its existing deadline/cancellation,
+so pressure cannot silently reclassify it as a warm contender. Cancellation
+removes the waiter and parks an unsubmitted guest without a boot failure. A running LXC JIT restart still checks actual host
 floors without buying a second guest allocation; a stopped LXC needs fresh
 start admission. Defaults and configurations without positive pace and limit,
 or with idle eviction enabled, keep their previous behavior.

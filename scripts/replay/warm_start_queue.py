@@ -38,24 +38,20 @@ def replay(priority):
                     and (not r["clone"] or r["name"] in clones
                          and r["power_at"] <= now)]
         if priority:
-            eligible.sort(key=lambda r: (r["clone"] and not r.get("promoted"), r["arrival"], r["name"]))
+            eligible.sort(key=lambda r: (r["clone"], r["arrival"], r["name"]))
         for r in eligible:
             if not priority and now < next_power:
                 continue
             if priority and len(slots) >= LIMIT:
-                # A cold start refused before POST returns to Warm and is
-                # promoted on a subsequent pass; assume immediate ticks.
-                if r["clone"]:
-                    r["promoted"] = True
                 continue
             if not priority and not r["clone"] and len(slots) >= LIMIT:
                 continue
-            if priority and r["clone"] and not r.get("promoted") and now < next_power:
+            if priority and r["clone"] and now < next_power:
                 continue
             starts[r["name"]] = now
             if priority:
                 slots.append(now + ACCOUNTED)
-                if r["clone"] and not r.get("promoted"):
+                if r["clone"]:
                     next_power = now + INTERVAL
             else:
                 if r["clone"]:

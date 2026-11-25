@@ -16,6 +16,7 @@ type pacedStartAdmitter interface {
 }
 
 var errStartCapacityDeferred = errors.New("fresh node sample did not admit the start")
+var errColdStartCapacityBusy = errors.New("cold start waiting for fresh capacity")
 
 func (m *manager) pacedStartAdmitter() pacedStartAdmitter {
 	a, ok := m.cfg.Capacity.(pacedStartAdmitter)
@@ -67,6 +68,9 @@ func (m *manager) startBootWorker(ctx context.Context, vm *provisioner.VM, row *
 					m.recordCapacityDeferral(profile, row.Node, store.PoolKindHot)
 				}
 				m.log.Debug("start: fresh capacity deferred", "vmid", row.VMID, "node", row.Node, "err", err)
+				if !promotion {
+					return errColdStartCapacityBusy
+				}
 				return errStartCapacityDeferred
 			}
 			claim := claimFor(r)

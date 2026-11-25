@@ -21,7 +21,13 @@ With the existing positive host start limit, positive start interval,
   An ambiguous POST response still advances its clock.
 - Already-provisioned warm promotions bypass that clock and get priority over
   waiting cold submissions. A cold timer sleeps outside the submission lock.
-  Priority yields after one host-sized burst of attempts, including refusals.
+  Priority explicitly yields after one host-sized burst of attempts, including
+  refusals, to a registered cold waiter whose POST clock is due. A warm caller
+  acquiring the mutex first cannot bypass this turn. Cold refusals also consume
+  their turn; canceled waiters are removed. Future cold timers never block warm.
+- Clone/configuration tasks have a separate per-host semaphore using the same
+  positive `boots_per_node` limit, shared across all managers/scale sets and
+  released before readiness. Task waits do not hold the submission lock.
 - Cloning and readiness no longer consume host start slots in this mode.
   The existing shared accountant bounds outstanding starts and atomically
   charges fresh memory/CPU before the power POST. Per-manager worker limits,
@@ -41,7 +47,8 @@ is outside this controller's scheduling policy.
 ## Observed local checks versus supplied deployment facts
 
 The shared two-slot limit and 15-second power spacing were supplied as live
-facts. This work did not query production or run a production experiment.
+facts. No production workload experiment or deployment was performed. The
+follow-up made only read-only infrastructure observations (see below).
 
 Local tests exercise the real Go dispatch gate and accountant with fake HTTP
 servers. Thirty-two simultaneous warm admission requests admit exactly two
@@ -65,14 +72,15 @@ execution checks above. It assumes two cold arrivals at t=0 and four existing
 warm arrivals at t=1, 30-second clone/configuration work, 60-second readiness,
 18 seconds to reliable accounting, two outstanding starts, and 15-second
 spacing. It assumes sufficient actual memory/CPU and immediate reconcile ticks.
-A cold power refusal returns its stopped clone to Warm for a later promotion.
+A cold power refusal retains its stopped worker in the cold queue until admission,
+cancellation or the existing deadline.
 The baseline deliberately begins with both cold clones owning the old slots.
 
 | Modeled event (seconds) | Base policy | Proposed policy |
 | --- | --- | --- |
 | Cold clone submissions | 0, 0 | 0, 15 |
 | Four existing warm power submissions | 90, 105, 150, 165 | 1, 1, 19, 19 |
-| Cold runner power submissions | 30, 45 | 37, 45 |
+| Cold runner power submissions | 30, 45 | 37, 52 |
 | Maximum occupied start slots/charges | 2 | 2 |
 
 This illustrates the tradeoff: warm service advances and cold work still
@@ -137,3 +145,75 @@ The named Colin fork was verified as **public** via GitHub. Colin explicitly
 authorized pushing this branch and opening the draft PR there; upstream
 publication remains prohibited.
 No upstream push, deployment, rollout or merge is authorized by this change.
+
+
+## Independent review follow-up
+
+The review of `1b8d5b68` identified that the old `warmBurst` condition only made
+cold requests eligible; it did not stop another warm caller taking the lock.
+The follow-up adds the explicit due-cold turn and a separate shared clone-task
+bound. It also keeps a refused, already-provisioned cold worker registered in
+that queue, retrying fresh admission outside the lock every 100 ms until its
+existing deadline/cancellation. Reclassifying it as Warm on every refusal lost
+its cold turn and repeated mixed runs reproduced cross-profile starvation.
+No power/start charge or clone-task slot is held while waiting; its ordinary
+per-manager worker slot remains bounded. Cancellation before submission parks
+the stopped guest Warm without counting a boot failure. Warm-promotion refusals
+still return Warm immediately. Recovery fencing and identity changes still end
+the wait immediately. It keeps warm priority, existing accounting, the cold
+clocks and defaults.
+
+`TestMixedBacklogBoundsPressureAndMakesColdProgress` integrates two real pool
+managers (Linux and Windows), the shared gate and the real node accountant.
+It submits four cold clones with overlapping task barriers and continually adds
+warm runners while all readiness probes remain blocked. It uses real successful
+receipts, exact running-process identity and repeated fresh host observations;
+it does not release claims by calling `Release` or manufacturing a ready guest.
+The existing five-second probe throttle remains intact. It proves:
+
+- Clone/configure tasks stay at two across both scale sets, independently of
+  readiness; actual clone POST gaps respect the configured clock.
+- Warm promotion progresses while two clone tasks overlap and the original cold
+  Linux/Windows guests remain powered on in readiness after accounting settles.
+- Both additional cold clones eventually power on while new warm demand continues.
+- Outstanding start charges stay at two; every running guest is charged its full
+  shape in fake actual host RAM. Tightening fresh host availability to exactly
+  the reserve prevents any further power POST despite the remaining warm backlog.
+
+`TestExhaustedWarmBurstGivesDueColdAnExplicitTurn` holds the shared POST mutex
+until a real cold waiter's timer is due, queues 16 new warm contenders, and
+requires the cold callback first. Removing the explicit yield makes that test
+fail (`expected cold`, `actual warm`). Cancellation, per-node isolation,
+idempotent clone-slot release and clone failure release are covered separately.
+
+These tests control arrivals and task/readiness barriers; goroutine scheduling
+can change which equally eligible warm worker wins a charge. They establish the
+stated bounds and eventual progress, not exact production latency or future
+job-memory reservations. The older Python model remains illustrative and does
+not model every semaphore, readiness-worker or scheduling interleaving here.
+
+### Live GitOps observation (read-only)
+
+The supported guest-inspection tool confirmed CT105 (`portainer-lxc`) is running.
+The connected Portainer tools exposed an inactive older `actions-autoscaler`
+stack and endpoints `local` / `windows-host`. Those observations do not establish
+CT105's active controller GitOps configuration. No CT105 shell alias is configured
+locally, and no supported guest filesystem/GitOps probe was available. Therefore
+whether the live CT105 controller tracks a moving fork ref remains **unverified**.
+Do not treat a merge as deployment-safe until that ref and polling/build behavior
+are read from the active CT105 service. No ref, timer, stack or service was changed.
+
+Final exact-head checks and same-command results on the untouched base archive
+are reported in PR #19. Inherited failures remain explicitly separated from the
+new mixed-backlog and fairness checks.
+
+The follow-up mixed/fairness/cancellation/failure group passed three consecutive
+race runs (56.348 seconds aggregate). Mixed runs sustained 98–130 warm arrivals,
+powered 8–10 guests while every readiness worker stayed blocked, and observed
+maximums of two clone tasks, two outstanding starts and 56–76 GiB of full guest
+shapes on the modeled 128 GiB host. Both queued cold runners progressed. Raising
+foreign host pressure to leave exactly the 4 GiB reserve blocked further warm
+POSTs. Removing the clone-task bound makes the integrated test fail with four
+concurrent clones instead of two; removing the explicit cold turn makes the
+lock-contention test fail with warm before cold. Those are local controlled
+checks, not production workload measurements.

@@ -180,3 +180,83 @@ func TestDelayedCloneCannotSubmitForReplacedGeneration(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, replacement, current, "stale clone failure must not clean up the replacement")
 }
+
+// Queue a real cold waiter, let its timer expire under a held POST lock,
+// then force it to contend with a new warm burst at that same lock.
+func TestExhaustedWarmBurstGivesDueColdAnExplicitTurn(t *testing.T) {
+	const interval = 40 * time.Millisecond
+	b := NewHostBootBudget(2, interval, 0)
+	for range 2 {
+		require.NoError(t, b.warmAction(t.Context(), "pve1", nil))
+	}
+	n := b.node("pve1")
+	n.pace.Lock()
+	n.last = time.Now()
+	n.pace.Unlock()
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	order := make(chan string, 17)
+	done := make(chan error, 17)
+	go func() {
+		done <- b.paceAction(ctx, "pve1", func(mark func()) error { mark(); order <- "cold"; return nil })
+	}()
+	require.Eventually(t, func() bool { n.pace.Lock(); defer n.pace.Unlock(); return len(n.coldWaiting) == 1 }, time.Second, time.Millisecond)
+	n.pace.Lock()
+	for range 16 {
+		go func() {
+			done <- b.warmAction(ctx, "pve1", func(mark func()) error { mark(); order <- "warm"; return nil })
+		}()
+	}
+	require.Eventually(t, func() bool { return n.warmWaiting.Load() == 16 }, time.Second, time.Millisecond)
+	time.Sleep(interval) // cold clock becomes eligible while its POST lock is held
+	n.pace.Unlock()
+	require.Equal(t, "cold", <-order, "no warm barging after the priority burst is exhausted")
+	for range 17 {
+		require.NoError(t, <-done)
+	}
+}
+
+func TestCancelledColdTurnDoesNotStrandWarm(t *testing.T) {
+	b := NewHostBootBudget(2, time.Hour, 0)
+	require.NoError(t, b.paceAction(t.Context(), "pve1", nil))
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- b.paceAction(ctx, "pve1", nil) }()
+	n := b.node("pve1")
+	require.Eventually(t, func() bool { n.pace.Lock(); defer n.pace.Unlock(); return len(n.coldWaiting) == 1 }, time.Second, time.Millisecond)
+	for range 4 {
+		require.NoError(t, b.warmAction(t.Context(), "pve1", nil))
+	}
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+	require.NoError(t, b.warmAction(t.Context(), "pve1", nil))
+	n.pace.Lock()
+	defer n.pace.Unlock()
+	require.Empty(t, n.coldWaiting)
+}
+
+func TestHostCloneBoundReleasesAfterFailureAndCancellation(t *testing.T) {
+	b := NewHostBootBudget(1, time.Nanosecond, 0)
+	first, err := b.acquireClone(t.Context(), "pve1")
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err = b.acquireClone(ctx, "pve1")
+	require.ErrorIs(t, err, context.Canceled)
+	other, err := b.acquireClone(t.Context(), "pve2")
+	require.NoError(t, err)
+	other()
+	first()
+	first()
+	st := newTestStore(t)
+	adm := &pacedAdmitterStub{fakeAdmitter: newFakeAdmitter(map[string]uint64{"pve1": 32 * gib}), allow: true}
+	m := newTestManager(t, st, &fakeProv{cloneErr: context.DeadlineExceeded}, Config{Capacity: adm, WindowsBootBudget: b, LinkedClones: true})
+	t.Cleanup(m.Close)
+	m.runClone("", store.PoolKindWarm, false, nil, func() {})
+	m.wg.Wait()
+	ctx, cancel = context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	release, err := b.acquireClone(ctx, "pve1")
+	require.NoError(t, err, "failed clone must hand back the host clone slot")
+	release()
+}

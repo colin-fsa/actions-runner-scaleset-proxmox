@@ -2,6 +2,7 @@ package pool
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,8 +21,12 @@ type WindowsBootBudget struct {
 	nodes               map[string]*bootNode
 }
 
+type coldWaiter struct{ clone bool }
+
 type bootNode struct {
 	slots       *semaphore.Weighted
+	cloneSlots  *semaphore.Weighted
+	coldWaiting map[*coldWaiter]struct{}
 	pace        sync.Mutex
 	last        time.Time
 	lastClone   time.Time
@@ -40,10 +45,39 @@ func (b *WindowsBootBudget) node(node string) *bootNode {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.nodes[node] == nil {
-		b.nodes[node] = &bootNode{slots: semaphore.NewWeighted(b.limit)}
+		b.nodes[node] = &bootNode{slots: semaphore.NewWeighted(b.limit), cloneSlots: semaphore.NewWeighted(b.limit), coldWaiting: make(map[*coldWaiter]struct{})}
 	}
 	return b.nodes[node]
 }
+
+// acquireClone bounds clone/configure tasks across all managers on the host.
+// It never consumes power admission or holds the submission lock/readiness.
+func (b *WindowsBootBudget) acquireClone(ctx context.Context, node string) (func(), error) {
+	if b == nil || !b.UsesPacedAdmission() {
+		return func() {}, nil
+	}
+	slots := b.node(node).cloneSlots
+	if err := slots.Acquire(ctx, 1); err != nil {
+		return nil, err
+	}
+	return sync.OnceFunc(func() { slots.Release(1) }), nil
+}
+
+// Caller holds pace. Cold timers do not earn a turn until their POST is due.
+func (n *bootNode) coldDue(interval time.Duration) bool {
+	now := time.Now()
+	for waiter := range n.coldWaiting {
+		last := n.last
+		if waiter.clone {
+			last = n.lastClone
+		}
+		if !now.Before(last.Add(interval)) {
+			return true
+		}
+	}
+	return false
+}
+
 func (b *WindowsBootBudget) acquire(ctx context.Context, node string) (func(), error) {
 	if b == nil || b.limit <= 0 {
 		return func() {}, nil
@@ -179,6 +213,13 @@ func (b *WindowsBootBudget) dispatch(ctx context.Context, node string, warm, clo
 	if warm {
 		n.warmWaiting.Add(1)
 		defer n.warmWaiting.Add(-1)
+	} else {
+		// Register an exact waiter, not a count that includes sleeping timers.
+		waiter := &coldWaiter{clone: clone}
+		n.pace.Lock()
+		n.coldWaiting[waiter] = struct{}{}
+		n.pace.Unlock()
+		defer func() { n.pace.Lock(); delete(n.coldWaiting, waiter); n.pace.Unlock() }()
 	}
 	for {
 		n.pace.Lock()
@@ -190,9 +231,10 @@ func (b *WindowsBootBudget) dispatch(ctx context.Context, node string, warm, clo
 		// Sleep outside the POST lock: a cold timer must not block a warm
 		// promotion. Bound priority to one host-sized burst so cold work wins
 		// a turn even with contemporaneous warm requests.
-		if !warm && (delay > 0 || (n.warmWaiting.Load() > 0 && n.warmBurst < b.limit)) {
+		coldTurn := warm && n.warmBurst >= b.limit && n.coldDue(b.interval)
+		if coldTurn || (!warm && (delay > 0 || (n.warmWaiting.Load() > 0 && n.warmBurst < b.limit))) {
 			n.pace.Unlock()
-			if delay <= 0 {
+			if warm || delay <= 0 {
 				delay = time.Millisecond
 			}
 			timer := time.NewTimer(delay)
@@ -220,6 +262,8 @@ func (b *WindowsBootBudget) dispatch(ctx context.Context, node string, warm, clo
 			// ledger must not let a stream of refusals starve cold requests.
 			if warm {
 				n.warmBurst = min(b.limit, n.warmBurst+1)
+			} else {
+				n.warmBurst = 0
 			}
 			submitted := false
 			var err error
@@ -228,14 +272,25 @@ func (b *WindowsBootBudget) dispatch(ctx context.Context, node string, warm, clo
 			} else {
 				err = action(func() { submitted = true })
 			}
-			if submitted {
-				if !warm {
-					*last = time.Now()
-					n.warmBurst = 0
-				}
+			if submitted && !warm {
+				*last = time.Now()
 			}
 			return err
 		}()
+		if errors.Is(err, errColdStartCapacityBusy) {
+			// Preserve this stopped cold worker's place across full-ledger
+			// refusals. Waiting never holds pace or a memory/start charge.
+			timer := time.NewTimer(100 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				// No POST or claim exists. Park the stopped clone without
+				// counting ordinary admission pressure as a failed boot.
+				return errors.Join(errStartCapacityDeferred, ctx.Err())
+			case <-timer.C:
+			}
+			continue
+		}
 		return err
 	}
 }
