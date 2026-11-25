@@ -2897,10 +2897,12 @@ func (m *manager) prepareClone(profile string, kind store.PoolKind, poweredOn bo
 	var node string
 	var admitted bool
 	claim := capacityClaim{release: func() {}}
-	if poweredOn && m.pacedStartAdmitter() != nil {
-		// Preflight without creating a reservation for a stopped clone.
+	if m.pacedStartAdmitter() != nil && (poweredOn || (kind == store.PoolKindWarm && m.cfg.LinkedClones)) {
+		// A linked warm clone stays powered off and does not spend guest RAM.
+		// Hot clones still preflight; both paths use fresh paced admission
+		// immediately before any power-on request.
 		node, admitted = m.selectNode(ctx, ps, kind)
-		if admitted {
+		if admitted && poweredOn {
 			fits, err := m.cfg.Capacity.Fits(ctx, shapeOf(ps.settings), []string{node})
 			admitted = err == nil && fits[node]
 			if !admitted {
