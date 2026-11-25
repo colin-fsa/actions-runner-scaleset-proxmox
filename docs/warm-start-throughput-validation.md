@@ -133,6 +133,7 @@ Toolchain: existing local Go 1.26.3 with race detector (macOS).
 
 No CI run was triggered. The existing workflow targets `main`, so a PR to
 this integration branch does not automatically supply normal PR CI.
-The named Colin fork was verified as **public** via GitHub; publication is
-held pending explicit authorization for that destination or a private fork.
+The named Colin fork was verified as **public** via GitHub. Colin explicitly
+authorized pushing this branch and opening the draft PR there; upstream
+publication remains prohibited.
 No upstream push, deployment, rollout or merge is authorized by this change.
