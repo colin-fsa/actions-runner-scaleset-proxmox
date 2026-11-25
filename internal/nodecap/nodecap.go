@@ -754,9 +754,19 @@ func (a *Accountant) ReservePacedRestart(ctx context.Context, node string, vmid 
 }
 
 func (a *Accountant) reserveExistingFrom(snap *snapshot, node string, shape Shape, vmid int, generation time.Time, promotion, paced bool) (Reservation, bool, error) {
+	return a.reserveExistingDetailed(snap, node, shape, vmid, generation, promotion, paced, false)
+}
+
+func (a *Accountant) reserveExistingDetailed(snap *snapshot, node string, shape Shape, vmid int, generation time.Time, promotion, paced, detailed bool) (Reservation, bool, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.sweepLocked(snap)
+	if detailed {
+		observed := snap.nodes[node].memReadAt
+		if observed.IsZero() || observed.After(a.now()) || a.now().Sub(observed) > min(a.opts.Refresh, time.Second) || observed.Before(a.lastPacedHostObservation[node]) {
+			return nil, false, ErrPacedStartStale
+		}
+	}
 	if paced {
 		if snap.nodes[node].memReadAt.Before(a.lastPacedHostObservation[node]) {
 			return nil, false, nil
@@ -769,6 +779,9 @@ func (a *Accountant) reserveExistingFrom(snap *snapshot, node string, shape Shap
 		}
 		if outstanding >= a.opts.PacedStartLimit {
 			a.logAdmissionDenial(snap, node, "unsettled_start_limit", shape, 0, 0, a.stateLocked(snap, node))
+			if detailed {
+				return nil, false, ErrPacedStartSlots
+			}
 			return nil, false, nil
 		}
 	}

@@ -21,17 +21,22 @@ type WindowsBootBudget struct {
 	nodes               map[string]*bootNode
 }
 
-type coldWaiter struct{ clone bool }
+type coldWaiter struct {
+	clone bool
+	ready bool
+}
 
 type bootNode struct {
-	slots       *semaphore.Weighted
-	cloneSlots  *semaphore.Weighted
-	coldWaiting map[*coldWaiter]struct{}
-	pace        sync.Mutex
-	last        time.Time
-	lastClone   time.Time
-	warmWaiting atomic.Int64
-	warmBurst   int64
+	slots                *semaphore.Weighted
+	cloneSlots           *semaphore.Weighted
+	coldWaiting          map[*coldWaiter]struct{}
+	pace                 sync.Mutex
+	probeMu              sync.Mutex
+	coldProbe, warmProbe startProbe
+	last                 time.Time
+	lastClone            time.Time
+	warmWaiting          atomic.Int64
+	warmBurst            int64
 }
 
 func NewWindowsBootBudget(limit int) *WindowsBootBudget {
@@ -67,6 +72,9 @@ func (b *WindowsBootBudget) acquireClone(ctx context.Context, node string) (func
 func (n *bootNode) coldDue(interval time.Duration) bool {
 	now := time.Now()
 	for waiter := range n.coldWaiting {
+		if !waiter.ready {
+			continue
+		}
 		last := n.last
 		if waiter.clone {
 			last = n.lastClone
@@ -203,26 +211,84 @@ func (b *WindowsBootBudget) warmAction(ctx context.Context, node string, action 
 }
 
 func (b *WindowsBootBudget) dispatch(ctx context.Context, node string, warm, clone bool, action func(func()) error) error {
+	return b.dispatchPrepared(ctx, node, warm, clone, nil, action)
+}
+
+func (b *WindowsBootBudget) dispatchPrepared(ctx context.Context, node string, warm, clone bool, prepare func(context.Context) error, action func(func()) error) error {
 	if b == nil || b.interval <= 0 {
 		if err := ctx.Err(); err != nil || action == nil {
 			return err
 		}
 		return action(func() {})
 	}
+	cancelled := func() error {
+		if prepare != nil {
+			return errors.Join(errStartCapacityDeferred, ctx.Err())
+		}
+		return ctx.Err()
+	}
 	n := b.node(node)
-	if warm {
-		n.warmWaiting.Add(1)
-		defer n.warmWaiting.Add(-1)
-	} else {
-		// Register an exact waiter, not a count that includes sleeping timers.
-		waiter := &coldWaiter{clone: clone}
+	countedWarm := false
+	var waiter *coldWaiter
+	if !warm {
+		waiter = &coldWaiter{clone: clone, ready: prepare == nil}
 		n.pace.Lock()
 		n.coldWaiting[waiter] = struct{}{}
 		n.pace.Unlock()
 		defer func() { n.pace.Lock(); delete(n.coldWaiting, waiter); n.pace.Unlock() }()
 	}
+	defer func() {
+		if countedWarm {
+			n.warmWaiting.Add(-1)
+		}
+	}()
+	prepared := prepare == nil
 	for {
+		if !prepared {
+			// Cold clocks still pace actual submissions. Do not fetch a sample
+			// fifteen seconds before it could be used.
+			n.pace.Lock()
+			delay := time.Until(n.last.Add(b.interval))
+			if warm {
+				delay = 0
+			}
+			n.pace.Unlock()
+			if delay > 0 {
+				timer := time.NewTimer(delay)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return cancelled()
+				case <-timer.C:
+				}
+			}
+			err := prepare(ctx)
+			if err != nil {
+				var retry *startRetry
+				if !warm && errors.As(err, &retry) {
+					timer := time.NewTimer(max(time.Until(retry.at), time.Millisecond))
+					select {
+					case <-ctx.Done():
+						timer.Stop()
+						return errors.Join(errStartCapacityDeferred, ctx.Err())
+					case <-timer.C:
+					}
+					continue
+				}
+				// Preparation never issued a POST or bought a charge.
+				return errors.Join(errStartCapacityDeferred, err)
+			}
+			prepared = true
+		}
+		if warm && !countedWarm {
+			n.warmWaiting.Add(1)
+			countedWarm = true
+		}
 		n.pace.Lock()
+		if waiter != nil {
+			waiter.ready = true
+		}
+
 		last := &n.last
 		if clone {
 			last = &n.lastClone
@@ -241,15 +307,15 @@ func (b *WindowsBootBudget) dispatch(ctx context.Context, node string, warm, clo
 			select {
 			case <-ctx.Done():
 				timer.Stop()
-				return ctx.Err()
+				return cancelled()
 			case <-timer.C:
 			}
 			continue
 		}
 		err := func() error {
 			defer n.pace.Unlock()
-			if err := ctx.Err(); err != nil {
-				return err
+			if ctx.Err() != nil {
+				return cancelled()
 			}
 			// Recheck the leader fence after waiting, including for clone POSTs.
 			b.mu.Lock()
@@ -277,15 +343,19 @@ func (b *WindowsBootBudget) dispatch(ctx context.Context, node string, warm, clo
 			}
 			return err
 		}()
-		if errors.Is(err, errColdStartCapacityBusy) {
-			// Preserve this stopped cold worker's place across full-ledger
-			// refusals. Waiting never holds pace or a memory/start charge.
-			timer := time.NewTimer(100 * time.Millisecond)
+		var retry *startRetry
+		if errors.As(err, &retry) && prepare != nil {
+			if warm {
+				return errors.Join(errStartCapacityDeferred, err)
+			}
+			n.pace.Lock()
+			waiter.ready = false
+			n.pace.Unlock()
+			prepared = false
+			timer := time.NewTimer(max(time.Until(retry.at), time.Millisecond))
 			select {
 			case <-ctx.Done():
 				timer.Stop()
-				// No POST or claim exists. Park the stopped clone without
-				// counting ordinary admission pressure as a failed boot.
 				return errors.Join(errStartCapacityDeferred, ctx.Err())
 			case <-timer.C:
 			}

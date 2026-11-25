@@ -19,6 +19,15 @@ type pacedAdmitterStub struct {
 	onCheck func()
 }
 
+type stubStartSample struct{ a *pacedAdmitterStub }
+
+func (s stubStartSample) Reserve(ctx context.Context, node string, shape nodecap.Shape, vmid int, gen time.Time, promotion bool) (nodecap.Reservation, bool, error) {
+	return s.a.ReserveExistingForPacedStart(ctx, node, shape, vmid, gen, promotion)
+}
+func (a *pacedAdmitterStub) SamplePacedStart(context.Context, string) (nodecap.PacedStartSample, error) {
+	return stubStartSample{a}, nil
+}
+
 func (*pacedAdmitterStub) SupportsPacedStart() bool { return true }
 func (a *pacedAdmitterStub) ReserveExistingForPacedStart(_ context.Context, node string, shape nodecap.Shape, vmid int, _ time.Time, _ bool) (nodecap.Reservation, bool, error) {
 	a.calls++

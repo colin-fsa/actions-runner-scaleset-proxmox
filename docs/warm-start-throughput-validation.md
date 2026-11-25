@@ -153,7 +153,7 @@ The review of `1b8d5b68` identified that the old `warmBurst` condition only made
 cold requests eligible; it did not stop another warm caller taking the lock.
 The follow-up adds the explicit due-cold turn and a separate shared clone-task
 bound. It also keeps a refused, already-provisioned cold worker registered in
-that queue, retrying fresh admission outside the lock every 100 ms until its
+that queue, retrying fresh admission outside the lock on a bounded/coalesced node cadence until its
 existing deadline/cancellation. Reclassifying it as Warm on every refusal lost
 its cold turn and repeated mixed runs reproduced cross-profile starvation.
 No power/start charge or clone-task slot is held while waiting; its ordinary
@@ -192,16 +192,14 @@ stated bounds and eventual progress, not exact production latency or future
 job-memory reservations. The older Python model remains illustrative and does
 not model every semaphore, readiness-worker or scheduling interleaving here.
 
-### Live GitOps observation (read-only)
+### Live GitOps build-ref finding
 
-The supported guest-inspection tool confirmed CT105 (`portainer-lxc`) is running.
-The connected Portainer tools exposed an inactive older `actions-autoscaler`
-stack and endpoints `local` / `windows-host`. Those observations do not establish
-CT105's active controller GitOps configuration. No CT105 shell alias is configured
-locally, and no supported guest filesystem/GitOps probe was available. Therefore
-whether the live CT105 controller tracks a moving fork ref remains **unverified**.
-Do not treat a merge as deployment-safe until that ref and polling/build behavior
-are read from the active CT105 service. No ref, timer, stack or service was changed.
+The independent reviewer verified CT105's active compose path builds this fork's
+moving `integration/windows-host-memory` ref on rebuild. This supersedes the
+previous incomplete MCP-only observation. It is reviewer-supplied verification;
+this coding session did not independently re-read that compose path. A merge
+changes what the next rebuild can build. No merge, rebuild, deployment, ref or
+polling change was performed or authorized here.
 
 Final exact-head checks and same-command results on the untouched base archive
 are reported in PR #19. Inherited failures remain explicitly separated from the
@@ -217,3 +215,40 @@ POSTs. Removing the clone-task bound makes the integrated test fail with four
 concurrent clones instead of two; removing the explicit cold turn makes the
 lock-contention test fail with warm before cold. Those are local controlled
 checks, not production workload measurements.
+
+
+## Probe-pressure review follow-up
+
+The follow-up to `99cecf1b` replaces the per-worker 100 ms retry and admission
+GETs under the common POST lock. Pool boot admission now uses a direct,
+bounded prepared sample outside that mutex, followed by a pure atomic ledger
+check and reservation at the POST boundary. Prepared samples expire within one
+second (or the configured shorter refresh), and an intervening authoritative
+host observation that retired a charge invalidates older samples. Neither
+preparation nor cooldown buys or retains a start/memory charge.
+
+Cold workers share one in-flight read per node across scale sets. Warm workers
+have an independent coalesced lane, so a slow cold GET cannot own the common
+POST mutex or make warm requests wait for that cold read. Only a prepared cold
+worker is eligible for its fair turn. Slot/pressure refusals have a one-second
+node/lane retry cadence; direct read failures use 1/2/4/5-second backoff. Slot
+saturation is reported separately from read failures and does not increment
+the outage backoff. A newer denial cooldown cannot be erased by an older read
+finishing later. Shared reads have a one-second timeout independent of caller
+cancellation; canceling one worker promptly removes its queue entry without
+canceling the probe needed by its peers.
+
+Regression tests use actual pool workers and HTTP accountant calls. Twenty-four
+pressured cold workers produced four cluster reads / eleven total PVE GETs over
+about 2.2 seconds while a smaller warm runner successfully started. Twenty-four
+workers receiving HTTP read errors produced two GETs in the same window. A
+controlled cold GET stays held while an independent fresh warm read and POST
+complete. Additional tests cover full unsettled slots and subsequent exact
+cleanup, atomic admission from a shared sample, expiry/superseded evidence,
+identity replacement during I/O, probe-owner cancellation, and late read versus
+newer cooldown races. These are controlled local results, not production API
+load measurements. Legacy/JIT accounting and recovery eligibility are unchanged.
+
+The separate supplied destroy/storage observation is captured with an
+ownership-safe diagnosis outline in `docs/teardown-vmid-reuse-followup.md`.
+No teardown behavior was changed.

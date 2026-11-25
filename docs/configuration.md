@@ -124,9 +124,22 @@ cold timer cannot block a warm promotion. After one host-sized priority burst,
 warm requests explicitly yield to a registered cold request whose POST clock
 is due, even if another warm caller acquires the lock first. A refused cold
 admission consumes that turn too. A stopped cold worker stays registered and
-retries fresh capacity outside the lock until its existing deadline/cancellation,
+retries outside the lock on a coalesced per-node cadence until its existing
+deadline/cancellation,
 so pressure cannot silently reclassify it as a warm contender. Cancellation
-removes the waiter and parks an unsubmitted guest without a boot failure. A running LXC JIT restart still checks actual host
+removes the waiter and parks an unsubmitted guest without a boot failure.
+Pool boot admission fetches and rechecks Proxmox outside the POST mutex. Cold
+workers share one node probe; warm workers have an independent coalesced probe
+so one slow cold read cannot serialize warm requests behind it. Slot/pressure
+refusals use a one-second retry cadence; read failures back off for 1, 2, 4 and
+at most 5 seconds per node/lane. Each probe is bounded to one second. Only a
+prepared, ready cold request owns a due cold turn; I/O/backoff never does.
+A prepared sample creates no charge. At the POST boundary, the accountant
+rejects samples older than the smaller of the refresh interval and one second,
+or older than a host observation that retired a charge, then atomically checks
+the current ledger. Coalesced callers cannot spend the same capacity twice.
+Cancellation returns promptly without aborting peers' bounded read. No stale
+cache fallback authorizes a POST. A running LXC JIT restart still checks actual host
 floors without buying a second guest allocation; a stopped LXC needs fresh
 start admission. Defaults and configurations without positive pace and limit,
 or with idle eviction enabled, keep their previous behavior.

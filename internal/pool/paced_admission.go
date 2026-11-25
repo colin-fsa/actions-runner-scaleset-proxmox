@@ -12,11 +12,10 @@ import (
 
 type pacedStartAdmitter interface {
 	SupportsPacedStart() bool
-	ReserveExistingForPacedStart(context.Context, string, nodecap.Shape, int, time.Time, bool) (nodecap.Reservation, bool, error)
+	SamplePacedStart(context.Context, string) (nodecap.PacedStartSample, error)
 }
 
 var errStartCapacityDeferred = errors.New("fresh node sample did not admit the start")
-var errColdStartCapacityBusy = errors.New("cold start waiting for fresh capacity")
 
 func (m *manager) pacedStartAdmitter() pacedStartAdmitter {
 	a, ok := m.cfg.Capacity.(pacedStartAdmitter)
@@ -52,15 +51,34 @@ func (m *manager) startBootWorker(ctx context.Context, vm *provisioner.VM, row *
 	powerCtx := ctx
 	issued := false
 	gate := func(ctx context.Context, submit func(context.Context) error) error {
-		dispatch := m.cfg.WindowsBootBudget.paceAction
-		if promotion {
-			dispatch = m.cfg.WindowsBootBudget.warmAction
-		}
-		return dispatch(ctx, row.Node, func(mark func()) error {
+		var sample nodecap.PacedStartSample
+		prepare := func(ctx context.Context) error {
 			if profile == nil || !m.currentBootWorker(row) {
 				return errStartCapacityDeferred
 			}
-			r, ok, err := a.ReserveExistingForPacedStart(ctx, row.Node, shapeOf(profile.settings), row.VMID, row.CreatedAt, promotion)
+			var err error
+			sample, err = m.cfg.WindowsBootBudget.sampleStart(ctx, row.Node, promotion, a.SamplePacedStart)
+			if err != nil && ctx.Err() == nil {
+				if promotion {
+					m.recordPromotionDeferral(profile, row.Node)
+				} else {
+					m.recordCapacityDeferral(profile, row.Node, store.PoolKindHot)
+				}
+				m.log.Debug("start: probe deferred", "vmid", row.VMID, "node", row.Node, "err", err)
+			}
+			return err
+		}
+		return m.cfg.WindowsBootBudget.dispatchPrepared(ctx, row.Node, promotion, false, prepare, func(mark func()) error {
+			if profile == nil || !m.currentBootWorker(row) {
+				return errStartCapacityDeferred
+			}
+			r, ok, err := sample.Reserve(ctx, row.Node, shapeOf(profile.settings), row.VMID, row.CreatedAt, promotion)
+			if ctx.Err() != nil {
+				if r != nil {
+					r.Release()
+				}
+				return errors.Join(errStartCapacityDeferred, ctx.Err())
+			}
 			if err != nil || !ok {
 				if promotion {
 					m.recordPromotionDeferral(profile, row.Node)
@@ -68,10 +86,7 @@ func (m *manager) startBootWorker(ctx context.Context, vm *provisioner.VM, row *
 					m.recordCapacityDeferral(profile, row.Node, store.PoolKindHot)
 				}
 				m.log.Debug("start: fresh capacity deferred", "vmid", row.VMID, "node", row.Node, "err", err)
-				if !promotion {
-					return errColdStartCapacityBusy
-				}
-				return errStartCapacityDeferred
+				return m.cfg.WindowsBootBudget.deferStart(row.Node, promotion, err)
 			}
 			claim := claimFor(r)
 			if ctx.Err() != nil || !m.currentBootWorker(row) || !claim.beginStart() {
