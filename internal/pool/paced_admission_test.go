@@ -62,6 +62,45 @@ func TestPacedColdStartCommitsOnlyAfterStoppedClone(t *testing.T) {
 	}
 }
 
+func TestPacedLinkedWarmCloneDoesNotHoldLaunchCapacity(t *testing.T) {
+	st := newTestStore(t)
+	adm := &pacedAdmitterStub{fakeAdmitter: newFakeAdmitter(map[string]uint64{"pve1": gib})}
+	prov := &fakeProv{}
+	prov.onClone = func(opts provisioner.CloneOptions) {
+		require.True(t, opts.Linked)
+		require.False(t, opts.PoweredOn)
+		require.Equal(t, uint64(gib), adm.snapshotFree("pve1"))
+		require.Zero(t, adm.calls)
+	}
+	m := newTestManager(t, st, prov, Config{
+		Profiles: []ProfileSettings{{Name: "p", MemoryMB: 4096, MaxConcurrentRunners: 10}},
+		Capacity: adm, LinkedClones: true, WindowsBootBudget: NewHostBootBudget(2, time.Millisecond, 0),
+	})
+	t.Cleanup(m.Close)
+
+	m.runClone("p", store.PoolKindWarm, false, nil, func() {})
+	rows, err := st.List()
+	require.NoError(t, err)
+	require.Len(t, rows, 1, "a stopped linked clone needs no guest memory headroom")
+	require.Equal(t, store.StateWarm, rows[0].State)
+	require.Zero(t, adm.reserveCalls)
+	require.Empty(t, prov.starts)
+
+	// Reproduce the row transition performed before a promotion worker starts.
+	deadline := time.Now().Add(time.Minute)
+	booting, err := st.Update(rows[0].VMID, func(row *store.VM) {
+		row.State = store.StateBooting
+		row.StartWorkerDeadline = deadline
+	})
+	require.NoError(t, err)
+	m.runBoot(context.Background(), booting, deadline, capacityClaim{release: func() {}})
+	require.Equal(t, 1, adm.calls, "power-on still consults the fresh paced gate")
+	require.Empty(t, prov.starts, "insufficient RAM must prevent the power-on")
+	warm, err := st.Get(booting.VMID)
+	require.NoError(t, err)
+	require.Equal(t, store.StateWarm, warm.State)
+}
+
 func TestReturnUndeliveredJITOnlyRequeuesExactUnclaimedAssignment(t *testing.T) {
 	st := newTestStore(t)
 	m := newTestManager(t, st, &fakeProv{}, Config{})
