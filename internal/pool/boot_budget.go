@@ -2,7 +2,9 @@ package pool
 
 import (
 	"context"
+	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/semaphore"
@@ -19,10 +21,22 @@ type WindowsBootBudget struct {
 	nodes               map[string]*bootNode
 }
 
+type coldWaiter struct {
+	clone bool
+	ready bool
+}
+
 type bootNode struct {
-	slots *semaphore.Weighted
-	pace  sync.Mutex
-	last  time.Time
+	slots                *semaphore.Weighted
+	cloneSlots           *semaphore.Weighted
+	coldWaiting          map[*coldWaiter]struct{}
+	pace                 sync.Mutex
+	probeMu              sync.Mutex
+	coldProbe, warmProbe startProbe
+	last                 time.Time
+	lastClone            time.Time
+	warmWaiting          atomic.Int64
+	warmBurst            int64
 }
 
 func NewWindowsBootBudget(limit int) *WindowsBootBudget {
@@ -36,10 +50,42 @@ func (b *WindowsBootBudget) node(node string) *bootNode {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.nodes[node] == nil {
-		b.nodes[node] = &bootNode{slots: semaphore.NewWeighted(b.limit)}
+		b.nodes[node] = &bootNode{slots: semaphore.NewWeighted(b.limit), cloneSlots: semaphore.NewWeighted(b.limit), coldWaiting: make(map[*coldWaiter]struct{})}
 	}
 	return b.nodes[node]
 }
+
+// acquireClone bounds clone/configure tasks across all managers on the host.
+// It never consumes power admission or holds the submission lock/readiness.
+func (b *WindowsBootBudget) acquireClone(ctx context.Context, node string) (func(), error) {
+	if b == nil || !b.UsesPacedAdmission() {
+		return func() {}, nil
+	}
+	slots := b.node(node).cloneSlots
+	if err := slots.Acquire(ctx, 1); err != nil {
+		return nil, err
+	}
+	return sync.OnceFunc(func() { slots.Release(1) }), nil
+}
+
+// Caller holds pace. Cold timers do not earn a turn until their POST is due.
+func (n *bootNode) coldDue(interval time.Duration) bool {
+	now := time.Now()
+	for waiter := range n.coldWaiting {
+		if !waiter.ready {
+			continue
+		}
+		last := n.last
+		if waiter.clone {
+			last = n.lastClone
+		}
+		if !now.Before(last.Add(interval)) {
+			return true
+		}
+	}
+	return false
+}
+
 func (b *WindowsBootBudget) acquire(ctx context.Context, node string) (func(), error) {
 	if b == nil || b.limit <= 0 {
 		return func() {}, nil
@@ -153,36 +199,168 @@ func (b *WindowsBootBudget) paceAdmission(ctx context.Context, node string, admi
 	})
 }
 
+// paceAction retains spacing for cold power requests and JIT restarts.
 func (b *WindowsBootBudget) paceAction(ctx context.Context, node string, action func(markSubmitted func()) error) error {
+	return b.dispatch(ctx, node, false, false, action)
+}
+
+// warmAction bypasses cold pacing, but shares the POST boundary and the
+// accountant's atomic outstanding-start limit. No readiness slot is held.
+func (b *WindowsBootBudget) warmAction(ctx context.Context, node string, action func(func()) error) error {
+	return b.dispatch(ctx, node, true, false, action)
+}
+
+func (b *WindowsBootBudget) dispatch(ctx context.Context, node string, warm, clone bool, action func(func()) error) error {
+	return b.dispatchPrepared(ctx, node, warm, clone, nil, action)
+}
+
+func (b *WindowsBootBudget) dispatchPrepared(ctx context.Context, node string, warm, clone bool, prepare func(context.Context) error, action func(func()) error) error {
 	if b == nil || b.interval <= 0 {
 		if err := ctx.Err(); err != nil || action == nil {
 			return err
 		}
 		return action(func() {})
 	}
-	n := b.node(node)
-	n.pace.Lock()
-	defer n.pace.Unlock()
-	if delay := time.Until(n.last.Add(b.interval)); delay > 0 {
-		timer := time.NewTimer(delay)
-		defer timer.Stop()
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-timer.C:
+	cancelled := func() error {
+		if prepare != nil {
+			return errors.Join(errStartCapacityDeferred, ctx.Err())
 		}
+		return ctx.Err()
 	}
-	if err := ctx.Err(); err != nil {
+	n := b.node(node)
+	countedWarm := false
+	var waiter *coldWaiter
+	if !warm {
+		waiter = &coldWaiter{clone: clone, ready: prepare == nil}
+		n.pace.Lock()
+		n.coldWaiting[waiter] = struct{}{}
+		n.pace.Unlock()
+		defer func() { n.pace.Lock(); delete(n.coldWaiting, waiter); n.pace.Unlock() }()
+	}
+	defer func() {
+		if countedWarm {
+			n.warmWaiting.Add(-1)
+		}
+	}()
+	prepared := prepare == nil
+	for {
+		if !prepared {
+			// Cold clocks still pace actual submissions. Do not fetch a sample
+			// fifteen seconds before it could be used.
+			n.pace.Lock()
+			delay := time.Until(n.last.Add(b.interval))
+			if warm {
+				delay = 0
+			}
+			n.pace.Unlock()
+			if delay > 0 {
+				timer := time.NewTimer(delay)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return cancelled()
+				case <-timer.C:
+				}
+			}
+			err := prepare(ctx)
+			if err != nil {
+				var retry *startRetry
+				if !warm && errors.As(err, &retry) {
+					timer := time.NewTimer(max(time.Until(retry.at), time.Millisecond))
+					select {
+					case <-ctx.Done():
+						timer.Stop()
+						return errors.Join(errStartCapacityDeferred, ctx.Err())
+					case <-timer.C:
+					}
+					continue
+				}
+				// Preparation never issued a POST or bought a charge.
+				return errors.Join(errStartCapacityDeferred, err)
+			}
+			prepared = true
+		}
+		if warm && !countedWarm {
+			n.warmWaiting.Add(1)
+			countedWarm = true
+		}
+		n.pace.Lock()
+		if waiter != nil {
+			waiter.ready = true
+		}
+
+		last := &n.last
+		if clone {
+			last = &n.lastClone
+		}
+		delay := time.Until(last.Add(b.interval))
+		// Sleep outside the POST lock: a cold timer must not block a warm
+		// promotion. Bound priority to one host-sized burst so cold work wins
+		// a turn even with contemporaneous warm requests.
+		coldTurn := warm && n.warmBurst >= b.limit && n.coldDue(b.interval)
+		if coldTurn || (!warm && (delay > 0 || (n.warmWaiting.Load() > 0 && n.warmBurst < b.limit))) {
+			n.pace.Unlock()
+			if warm || delay <= 0 {
+				delay = time.Millisecond
+			}
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return cancelled()
+			case <-timer.C:
+			}
+			continue
+		}
+		err := func() error {
+			defer n.pace.Unlock()
+			if ctx.Err() != nil {
+				return cancelled()
+			}
+			// Recheck the leader fence after waiting, including for clone POSTs.
+			b.mu.Lock()
+			blocked := b.verificationPending || time.Now().Before(b.readyAt)
+			b.mu.Unlock()
+			if blocked {
+				return errStartCapacityDeferred
+			}
+			// A refused warm admission also used its priority turn; a busy
+			// ledger must not let a stream of refusals starve cold requests.
+			if warm {
+				n.warmBurst = min(b.limit, n.warmBurst+1)
+			} else {
+				n.warmBurst = 0
+			}
+			submitted := false
+			var err error
+			if action == nil {
+				submitted = true
+			} else {
+				err = action(func() { submitted = true })
+			}
+			if submitted && !warm {
+				*last = time.Now()
+			}
+			return err
+		}()
+		var retry *startRetry
+		if errors.As(err, &retry) && prepare != nil {
+			if warm {
+				return errors.Join(errStartCapacityDeferred, err)
+			}
+			n.pace.Lock()
+			waiter.ready = false
+			n.pace.Unlock()
+			prepared = false
+			timer := time.NewTimer(max(time.Until(retry.at), time.Millisecond))
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return errors.Join(errStartCapacityDeferred, ctx.Err())
+			case <-timer.C:
+			}
+			continue
+		}
 		return err
 	}
-	if action == nil {
-		n.last = time.Now()
-		return nil
-	}
-	submitted := false
-	err := action(func() { submitted = true })
-	if submitted {
-		n.last = time.Now()
-	}
-	return err
 }

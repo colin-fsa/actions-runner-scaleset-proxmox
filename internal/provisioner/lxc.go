@@ -432,7 +432,21 @@ func (p *pmox) cloneLXCFromTemplate(ctx context.Context, opts CloneOptions, temp
 	params := buildLXCCloneParams(p.scaleSetName, opts, templateNodeName)
 	delay := lxcCloneRetryBase
 	for attempt := 1; ; attempt++ {
-		err := p.postLXCTask(ctx, &VM{VMID: templateVMID, Node: templateNodeName}, "/clone", params, int(cloneTaskTimeout/time.Second))
+		var task *proxmox.Task
+		submit := func(ctx context.Context) error {
+			var err error
+			task, err = p.submitLXCTask(ctx, &VM{VMID: templateVMID, Node: templateNodeName}, "/clone", params)
+			return err
+		}
+		var err error
+		if opts.Submission != nil {
+			err = opts.Submission(ctx, submit)
+		} else {
+			err = submit(ctx)
+		}
+		if err == nil {
+			err = awaitTask(ctx, task, int(cloneTaskTimeout/time.Second))
+		}
 		if err == nil {
 			return nil
 		}

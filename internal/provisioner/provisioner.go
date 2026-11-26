@@ -112,11 +112,13 @@ type VM struct {
 // is resized via the resize endpoint when the requested size exceeds
 // the template's current disk.
 type CloneOptions struct {
-	NewVMID   int
-	Node      string
-	Name      string
-	Linked    bool
-	PoweredOn bool
+	// Submission gates each actual clone POST, independently of task waits.
+	Submission StartSubmission
+	NewVMID    int
+	Node       string
+	Name       string
+	Linked     bool
+	PoweredOn  bool
 
 	// GuestType selects a QEMU VM ("qemu", the default when empty) or an
 	// LXC container ("lxc") clone. Empty falls back to the profile's
@@ -649,7 +651,18 @@ func (p *pmox) Clone(ctx context.Context, opts CloneOptions) (*VM, error) {
 		return nil, fmt.Errorf("get template vm: %w", err)
 	}
 
-	newID, task, err := templateVM.Clone(ctx, buildLibCloneOptions(opts, templateNodeName))
+	var newID int
+	var task *proxmox.Task
+	submit := func(ctx context.Context) error {
+		var err error
+		newID, task, err = templateVM.Clone(ctx, buildLibCloneOptions(opts, templateNodeName))
+		return err
+	}
+	if opts.Submission != nil {
+		err = opts.Submission(ctx, submit)
+	} else {
+		err = submit(ctx)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("issue clone: %w", err)
 	}
