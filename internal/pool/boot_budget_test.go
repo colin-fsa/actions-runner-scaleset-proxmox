@@ -130,6 +130,7 @@ func TestHostBudgetSpacingAndRecovery(t *testing.T) {
 	start := time.Now()
 	require.NoError(t, b.pace(context.Background(), "pve2"))
 	require.NoError(t, b.pace(context.Background(), "pve1"))
+	require.NoError(t, b.pace(context.Background(), "pve1"))
 	require.GreaterOrEqual(t, time.Since(start), 25*time.Millisecond)
 }
 

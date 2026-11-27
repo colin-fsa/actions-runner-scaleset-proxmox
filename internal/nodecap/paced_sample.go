@@ -7,6 +7,8 @@ import (
 )
 
 var (
+	// ErrPacedStartSlots is retained for compatibility with old callers.
+	// Actual-host paced admission no longer refuses on unresolved claims.
 	ErrPacedStartSlots    = errors.New("unsettled start slots full")
 	ErrPacedStartCapacity = errors.New("actual host capacity refused start")
 	ErrPacedStartRead     = errors.New("fresh Proxmox admission read failed")
@@ -16,6 +18,7 @@ var (
 // PacedStartSample is a direct observation, not a reservation or a promise
 // to start. Concurrent callers may share it; Reserve charges the ledger
 // atomically and rejects expired/superseded observations at the POST boundary.
+// Claims track ownership, not readiness slots or speculative RAM allocation.
 type PacedStartSample interface {
 	Reserve(context.Context, string, Shape, int, time.Time, bool) (Reservation, bool, error)
 }

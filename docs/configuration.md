@@ -95,32 +95,44 @@ per-scope URL derivation already targets the right endpoint.
 
 ### Shared host boot pacing
 
-`pool.boots_per_node` limits concurrent boots per Proxmox node across all
-profiles, operating systems, and scale sets in this controller. The default is
-`0` (unlimited). `pool.boot_start_interval` is the minimum interval between
-starts on the same node; its default is `0s` (unlimited). The old
-`windows_boots_per_node` setting is accepted as an alias but now covers all
-operating systems; do not set both names. A conservative initial setting is
-`boots_per_node: 2` and `boot_start_interval: 15s`. The existing per-profile
-runner limit, including a configured Windows ceiling of 25, remains separate.
-Without paced host-capacity admission, slots are held through guest readiness
-or failure; saturation defers pool refill. The budget is local to one elected controller, not a lock between
-independently deployed controllers.
+With paced `host_available` admission enabled, `pool.boots_per_node` is
+**submissions per rolling `pool.boot_start_interval` window**, per Proxmox
+node across profiles, operating systems and scale sets. For example, `2` and
+`15s` permit two cold clone POSTs in a rolling 15 seconds and, independently,
+two cold power POSTs in a rolling 15 seconds. These are separate operation
+clocks, not a single combined allowance. Clone/configuration task duration and
+guest readiness never retain a slot. Ambiguous submissions consume their
+window entry; refusal or cancellation before submission does not. This budget
+is local to one elected controller, not multiple independent controllers.
 
-With `host_available` capacity and a configured start pace/limit, the
-controller samples node capacity immediately before a shared power POST.
-When idle eviction is disabled, already-provisioned warm promotions take priority
-at that boundary and bypass the cold power timer. Their burst is bounded by the
-same host-wide outstanding-start limit and atomic memory/CPU charges as cold
-starts. Cloning and guest readiness do not occupy those host start slots.
-Clone/configuration tasks have a separate host-wide concurrency bound of
-`boots_per_node`, shared across scale sets and released before readiness.
-This bound never occupies the warm submission gate. New clone POSTs also
-have their own per-node clock using `boot_start_interval`;
-cold power POSTs and LXC JIT restarts retain the configured power spacing.
-At `15s`, each clock retains a 15-second floor; warm promotion POSTs are the
-explicit exception. Clone task waits do not hold the submission lock. A waiting
-cold timer cannot block a warm promotion. After one host-sized priority burst,
+Warm promotions retain their intentional cold-timer bypass. They share the
+serialized POST boundary and fresh host pressure/fencing checks, not an
+outstanding-boot semaphore. After one host-sized priority burst, warm requests
+yield to a due cold request. `windows_boots_per_node` remains a compatibility
+alias; do not set both names. Defaults are `0` and `0s`. Without both positive
+pacing settings, the legacy concurrent/readiness slot behavior is unchanged.
+Per-profile runner ceilings remain independent.
+
+Paced host admission uses a fresh `/nodes/{node}/status` memory reading:
+explicit `memory.available` when present, otherwise validated
+`memory.total - memory.used`. It does not use guest allocations, swap usage,
+or subtract pending/started claim RAM. The existing host reserve is a
+**physical floor**, not another allocation: with `reserve_fraction: 0.15`,
+starts stop at or below 15% available (85% used), unless a larger byte reserve
+is configured. Configured guest size is not subtracted again. Measured host
+CPU similarly replaces speculative launch CPU charges in host-usage mode.
+This policy can overshoot between samples or as already-running jobs grow;
+it is an admission threshold, not a hard resource cap or guaranteed reserve.
+
+This endpoint arithmetic is explicit; it does not prove which GUI widget
+uses the identical cache/ballooning definition. No future balloon reclaim is
+assumed. If the API and GUI disagree, compare their contemporaneous raw
+counters rather than describing pending reservations as actual host usage.
+Ownership/task claims and exact-generation retirement evidence remain tracked
+for diagnostics and recovery, but do not debit paced admission headroom.
+Allocated and nonpaced host modes retain their historical accounting.
+
+A waiting cold timer cannot block a warm promotion. After one host-sized priority burst,
 warm requests explicitly yield to a registered cold request whose POST clock
 is due, even if another warm caller acquires the lock first. A refused cold
 admission consumes that turn too. A stopped cold worker stays registered and
@@ -130,14 +142,15 @@ so pressure cannot silently reclassify it as a warm contender. Cancellation
 removes the waiter and parks an unsubmitted guest without a boot failure.
 Pool boot admission fetches and rechecks Proxmox outside the POST mutex. Cold
 workers share one node probe; warm workers have an independent coalesced probe
-so one slow cold read cannot serialize warm requests behind it. Slot/pressure
+so one slow cold read cannot serialize warm requests behind it. Pressure
 refusals use a one-second retry cadence; read failures back off for 1, 2, 4 and
 at most 5 seconds per node/lane. Each probe is bounded to one second. Only a
 prepared, ready cold request owns a due cold turn; I/O/backoff never does.
 A prepared sample creates no charge. At the POST boundary, the accountant
 rejects samples older than the smaller of the refresh interval and one second,
 or older than a host observation that retired a charge, then atomically checks
-the current ledger. Coalesced callers cannot spend the same capacity twice.
+actual host pressure and ownership. Cold coalesced callers remain bounded by
+the submission window, not by readiness or speculative configured memory.
 Cancellation returns promptly without aborting peers' bounded read. No stale
 cache fallback authorizes a POST. A running LXC JIT restart still checks actual host
 floors without buying a second guest allocation; a stopped LXC needs fresh
@@ -148,20 +161,13 @@ Online runners remain immediately eligible for jobs. Controller deferrals and
 GitHub's choice of which online runner receives a job are separate; this policy
 does not enforce GitHub assignment order.
 
-A submitted launch holds capacity until Proxmox confirms successful task
-completion and two direct readings see the same running guest process,
-with a valid host-capacity sample taken after each guest observation, or
-until its destruction is confirmed. The reads are spaced by the configured
-start interval. Guest-agent and GitHub readiness control job assignment,
-not whether the measured host memory already includes that VM. The hard
-host reserve still applies; this is not a reservation of future job memory.
-An ambiguous
-launch stays charged rather than expiring automatically. Once its local
-worker has returned and two direct reads show stable identity, trustworthy
-host capacity and no unfinished matching task, it can stop occupying a
-concurrent start slot without lifting its memory charge. A missing task
-requires positive visibility of the existing controller token's own task
-archive; empty results by themselves are not enough.
+A submitted launch retains its ownership claim until Proxmox confirms task
+success and two direct readings see the same running guest process with fresh
+host readings, or until destruction is confirmed. Ambiguous claims do not
+expire automatically. These proofs protect identity and restart recovery;
+in paced mode they do not withhold RAM or occupy a concurrency slot. Missing
+task recovery still requires positive visibility of the dedicated controller
+token's task archive, not merely an empty task response.
 
 On replacement, a paced standalone single-node deployment with a dedicated,
 unchanged Proxmox API token and destroy-mode recycling validates the

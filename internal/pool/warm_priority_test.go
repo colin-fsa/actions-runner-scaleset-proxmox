@@ -16,7 +16,8 @@ func TestWarmBypassesColdTimerAndColdStillProgresses(t *testing.T) {
 	b := NewHostBootBudget(2, interval, 0)
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
-	// Start a cold POST, then keep another cold request waiting on its clock.
+	// Fill the cold window, then keep another request waiting on its clock.
+	require.NoError(t, b.paceAction(ctx, "pve1", nil))
 	require.NoError(t, b.paceAction(ctx, "pve1", nil))
 	firstReturned := time.Now()
 	cold := make(chan time.Time, 1)
@@ -83,6 +84,7 @@ func TestClonePostClockIndependentOfWarmAndColdPower(t *testing.T) {
 	first := time.Now()
 	require.NoError(t, b.warmAction(t.Context(), "pve1", func(mark func()) error { mark(); return nil }))
 	require.NoError(t, b.paceAction(t.Context(), "pve1", nil))
+	require.NoError(t, b.dispatch(t.Context(), "pve1", false, true, nil))
 	require.NoError(t, b.dispatch(t.Context(), "pve1", false, true, nil))
 	require.GreaterOrEqual(t, time.Since(first), interval-time.Millisecond)
 }
@@ -191,7 +193,8 @@ func TestExhaustedWarmBurstGivesDueColdAnExplicitTurn(t *testing.T) {
 	}
 	n := b.node("pve1")
 	n.pace.Lock()
-	n.last = time.Now()
+	n.starts.submitted(time.Now())
+	n.starts.submitted(time.Now())
 	n.pace.Unlock()
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
@@ -218,6 +221,7 @@ func TestExhaustedWarmBurstGivesDueColdAnExplicitTurn(t *testing.T) {
 
 func TestCancelledColdTurnDoesNotStrandWarm(t *testing.T) {
 	b := NewHostBootBudget(2, time.Hour, 0)
+	require.NoError(t, b.paceAction(t.Context(), "pve1", nil))
 	require.NoError(t, b.paceAction(t.Context(), "pve1", nil))
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)

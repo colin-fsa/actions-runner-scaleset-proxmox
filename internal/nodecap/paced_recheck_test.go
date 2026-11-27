@@ -115,22 +115,22 @@ func exerciseInactiveReceiptRecovery(t *testing.T, ready bool) {
 		return ok
 	}
 	advance(20 * time.Second)
-	require.False(t, try(10003), "normal boot workers are still running")
+	require.True(t, try(10003), "workers do not block measured headroom")
 	for _, done := range receipts {
 		done()
 	}
 	setActive(true)
 	advance(5 * time.Second)
-	require.False(t, try(10003), "an exact active task blocks fallback")
+	require.True(t, try(10005), "an active task affects proof, not headroom")
 	setActive(false)
 	advance(5 * time.Second)
-	require.False(t, try(10003), "one stable sample cannot open a slot")
+	require.True(t, try(10006), "starts need no readiness slot")
 	advance(20 * time.Second)
-	require.True(t, try(10003))
-	require.True(t, try(10004), "both inactive starts no longer occupy launch slots")
+	require.True(t, try(10007))
+	require.True(t, try(10004), "inactive claims never occupy launch slots")
 	st, err := a.Snapshot(t.Context())
 	require.NoError(t, err)
-	require.Equal(t, uint64(16*gib), st["pve1"].AvailableBytes, "both incomplete submissions still hold full RAM")
+	require.Equal(t, uint64(56*gib), st["pve1"].AvailableBytes, "incomplete claims remain observational, not RAM debits")
 }
 
 func TestPacedTerminalBootUsesFreshDirectHostAndNoReadiness(t *testing.T) {
@@ -212,25 +212,30 @@ func TestPacedTerminalBootUsesFreshDirectHostAndNoReadiness(t *testing.T) {
 				return res[node]
 			}
 			advance(3 * time.Second)
-			require.Equal(t, uint64(46*gib), check().AvailableBytes, "unconfirmed task holds")
+			require.Equal(t, uint64(56*gib), check().AvailableBytes, "physical headroom ignores claim RAM")
+			require.False(t, r.(*reservation).released, "unconfirmed task holds retains ownership evidence")
 			ReportPacedTask(ctx, node, id, upid, true)
 			advance(5 * time.Second)
-			require.Equal(t, uint64(46*gib), check().AvailableBytes, "one exact sample still holds")
+			require.Equal(t, uint64(56*gib), check().AvailableBytes, "physical headroom ignores claim RAM")
+			require.False(t, r.(*reservation).released, "one exact sample still holds retains ownership evidence")
 			advance(16 * time.Second)
 			mu.Lock()
 			guestName = "reused-10001"
 			mu.Unlock()
-			require.Equal(t, uint64(46*gib), check().AvailableBytes, "same ID but wrong name is not proof")
+			require.Equal(t, uint64(56*gib), check().AvailableBytes, "physical headroom ignores claim RAM")
+			require.False(t, r.(*reservation).released, "same ID but wrong name is not proof retains ownership evidence")
 			advance(6 * time.Second)
 			mu.Lock()
 			guestName, exit = name, "failed"
 			mu.Unlock()
-			require.Equal(t, uint64(46*gib), check().AvailableBytes, "terminal failure is not success")
+			require.Equal(t, uint64(56*gib), check().AvailableBytes, "physical headroom ignores claim RAM")
+			require.False(t, r.(*reservation).released, "terminal failure is not success retains ownership evidence")
 			advance(6 * time.Second)
 			mu.Lock()
 			exit, status = "OK", "stopped"
 			mu.Unlock()
-			require.Equal(t, uint64(46*gib), check().AvailableBytes, "stopped guest is not accounted boot")
+			require.Equal(t, uint64(56*gib), check().AvailableBytes, "physical headroom ignores claim RAM")
+			require.False(t, r.(*reservation).released, "stopped guest is not accounted boot retains ownership evidence")
 			advance(6 * time.Second)
 			mu.Lock()
 			status, degraded = "running", true
@@ -240,12 +245,14 @@ func TestPacedTerminalBootUsesFreshDirectHostAndNoReadiness(t *testing.T) {
 			mu.Lock()
 			degraded = false
 			mu.Unlock()
-			require.Equal(t, uint64(46*gib), check().AvailableBytes, "first reliable post-failure sample")
+			require.Equal(t, uint64(56*gib), check().AvailableBytes, "physical headroom ignores claim RAM")
+			require.False(t, r.(*reservation).released, "first reliable post-failure sample retains ownership evidence")
 			advance(16 * time.Second)
 			mu.Lock()
 			pid++
 			mu.Unlock()
-			require.Equal(t, uint64(46*gib), check().AvailableBytes, "PID change restarts the quiet observation")
+			require.Equal(t, uint64(56*gib), check().AvailableBytes, "physical headroom ignores claim RAM")
+			require.False(t, r.(*reservation).released, "PID change restarts the quiet observation retains ownership evidence")
 			advance(16 * time.Second)
 			old, err := a.fetch(t.Context())
 			require.NoError(t, err)

@@ -2,7 +2,6 @@ package nodecap
 
 import (
 	"context"
-	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -10,7 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestPreparedPacedSampleIsFreshAtomicAndReportsSlotPressure(t *testing.T) {
+func TestPreparedPacedSampleIsFreshWithoutReadinessSlots(t *testing.T) {
 	rs := newResourceServer(t, []map[string]any{nodeRow("pve1", 64*gib, 32)})
 	rs.setNodeStatus("pve1", 60*gib, 64*gib)
 	a := newAccountant(t, rs, func(o *Options) {
@@ -29,9 +28,7 @@ func TestPreparedPacedSampleIsFreshAtomicAndReportsSlotPressure(t *testing.T) {
 	for i := range 32 {
 		wg.Go(func() {
 			r, ok, err := sample.Reserve(t.Context(), "pve1", Shape{MemoryBytes: 10 * gib}, 10001+i, gen, false)
-			if !ok && !errors.Is(err, ErrPacedStartSlots) {
-				t.Errorf("unexpected refusal: %v", err)
-			}
+			require.NoError(t, err)
 			if ok {
 				mu.Lock()
 				claims = append(claims, r)
@@ -40,7 +37,7 @@ func TestPreparedPacedSampleIsFreshAtomicAndReportsSlotPressure(t *testing.T) {
 		})
 	}
 	wg.Wait()
-	require.Len(t, claims, 2)
+	require.Len(t, claims, 32)
 	for _, r := range claims {
 		r.Release()
 	}
@@ -54,7 +51,7 @@ func TestPreparedPacedSampleIsFreshAtomicAndReportsSlotPressure(t *testing.T) {
 
 func TestPreparedSampleDistinguishesCapacityAndRejectsOldHostEvidence(t *testing.T) {
 	rs := newResourceServer(t, []map[string]any{nodeRow("pve1", 64*gib, 32)})
-	rs.setNodeStatus("pve1", 8*gib, 64*gib)
+	rs.setNodeStatus("pve1", 4*gib, 64*gib)
 	a := newAccountant(t, rs, func(o *Options) {
 		o.Refresh = time.Minute
 		o.MemoryMode = MemoryModeHostAvailable
