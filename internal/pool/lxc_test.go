@@ -92,3 +92,53 @@ func TestCloneCarriesProfileGuestType(t *testing.T) {
 	defer fp.mu.Unlock()
 	require.Equal(t, config.GuestTypeLXC, fp.clones[0].GuestType)
 }
+
+// A freshly demanded Linux container must be assignable before its first boot:
+// JIT is a startup env value, so a speculative boot would require a reboot.
+func TestLXCColdCloneDefersFirstBootUntilJIT(t *testing.T) {
+	for _, guestOS := range []string{"", "linux"} {
+		t.Run("os="+guestOS, func(t *testing.T) {
+			st := newTestStore(t)
+			fp := &fakeProv{waitErr: errors.New("must not poll an unbooted guest")}
+			m := newTestManager(t, st, fp, Config{Profiles: []ProfileSettings{{Name: "ct", GuestOS: guestOS, GuestType: config.GuestTypeLXC}}})
+			t.Cleanup(m.Close)
+			var vmid int
+			m.runClone("ct", store.PoolKindHot, true, &vmid, func() {})
+			row, err := st.Get(vmid)
+			require.NoError(t, err)
+			require.Equal(t, store.StateHot, row.State)
+			require.Equal(t, store.PoolKindHot, row.PoolKind)
+			require.True(t, row.StartWorkerDeadline.IsZero(), "finished clone cannot retain a boot worker")
+			fp.mu.Lock()
+			require.Len(t, fp.clones, 1)
+			require.False(t, fp.clones[0].PoweredOn)
+			require.Empty(t, fp.starts, "pool must not boot before scaler generates JIT")
+			fp.mu.Unlock()
+			vm, err := m.AcquireForProfile(t.Context(), 42, "ct", 0)
+			require.NoError(t, err)
+			require.Equal(t, vmid, vm.VMID)
+			row, err = st.Get(vmid)
+			require.NoError(t, err)
+			require.True(t, row.JITPending, "power poller must ignore the stopped guest until handoff finishes")
+		})
+	}
+}
+
+func TestQEMUColdCloneStillBootsBeforeAssignment(t *testing.T) {
+	for _, guestOS := range []string{"linux", "windows"} {
+		t.Run(guestOS, func(t *testing.T) {
+			st := newTestStore(t)
+			fp := &fakeProv{}
+			m := newTestManager(t, st, fp, Config{Profiles: []ProfileSettings{{Name: "vm", GuestOS: guestOS, GuestType: config.GuestTypeQEMU}}})
+			t.Cleanup(m.Close)
+			var vmid int
+			m.runClone("vm", store.PoolKindHot, true, &vmid, func() {})
+			row, err := st.Get(vmid)
+			require.NoError(t, err)
+			require.Equal(t, store.StateHot, row.State)
+			fp.mu.Lock()
+			defer fp.mu.Unlock()
+			require.Equal(t, []int{vmid}, fp.starts)
+		})
+	}
+}

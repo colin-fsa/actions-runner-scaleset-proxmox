@@ -451,6 +451,15 @@ func TestLXC_InjectJITConfigStartsStoppedContainer(t *testing.T) {
 	require.Len(t, f.find(http.MethodPost, "/nodes/pve1/lxc/10061/status/start"), 1)
 	require.Empty(t, f.find(http.MethodPost, "/nodes/pve1/lxc/10061/status/reboot"))
 	require.True(t, f.cts[10061].Running)
+	staged := false
+	for _, r := range f.requests() {
+		if r.Method == http.MethodPut && r.Path == "/nodes/pve1/lxc/10061/config" {
+			staged = strings.Contains(fmt.Sprint(r.Body["env"]), "ACTIONS_RUNNER_JIT_CONFIG=")
+		}
+		if r.Method == http.MethodPost && r.Path == "/nodes/pve1/lxc/10061/status/start" {
+			require.True(t, staged, "JIT startup env must be staged before the first power request")
+		}
+	}
 }
 
 type lxcStartClaim struct {
