@@ -8,12 +8,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestConcurrentWarmBurstSharesAtomicStartAndMemoryLimits(t *testing.T) {
+func TestConcurrentWarmBurstUsesActualHostNotPendingClaims(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		available uint64
 		want      int
-	}{{"start_limit", 60 * gib, 2}, {"memory_limit", 14 * gib, 1}} {
+	}{{"ample_host", 60 * gib, 32}, {"above_host_floor", 14 * gib, 32}} {
 		t.Run(tc.name, func(t *testing.T) {
 			rs := newResourceServer(t, []map[string]any{nodeRow("pve1", 64*gib, 32)})
 			rs.setNodeStatus("pve1", tc.available, 64*gib)
@@ -45,7 +45,7 @@ func TestConcurrentWarmBurstSharesAtomicStartAndMemoryLimits(t *testing.T) {
 			}
 			close(start)
 			wg.Wait()
-			require.Len(t, claims, tc.want, "every profile shares the same outstanding-start and memory ledger")
+			require.Len(t, claims, tc.want, "warm promotions use fresh host pressure; cold POST pacing lives in pool")
 			for _, r := range claims {
 				r.Release()
 			}

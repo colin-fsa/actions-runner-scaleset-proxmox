@@ -2510,6 +2510,16 @@ func (m *manager) clearStartWorker(vmid int, createdAt, deadline time.Time) {
 	}
 }
 
+// jitBootDeferred identifies containers whose startup environment is their JIT
+// delivery channel. They are prepared while stopped; InjectJITConfig owns the
+// first power-on and its capacity/firewall/readiness checks. Hot means eligible
+// for JIT delivery here, not necessarily already powered on. Already-running
+// inherited containers keep the existing reboot delivery path.
+func (m *manager) jitBootDeferred(profile string) bool {
+	ps := m.profileOf(profile)
+	return ps != nil && ps.settings.GuestType == config.GuestTypeLXC && ps.settings.GuestOS != "windows"
+}
+
 // promoteN moves up to n Warm VMs in the given profile to Booting
 // and kicks Start+WaitReady in the background for each. Oldest-Warm-
 // first so warm VMs near max-age recycle get used before the
@@ -2522,6 +2532,7 @@ func (m *manager) clearStartWorker(vmid int, createdAt, deadline time.Time) {
 // row Warm and is retried next tick; it also counts as deferred hot
 // demand, which suppresses warm refill and arms idle eviction exactly as
 // a refused hot clone would.
+
 func (m *manager) promoteN(ctx context.Context, profile string, n int) {
 	var warms []*store.VM
 	var err error
@@ -2730,7 +2741,8 @@ type clonePrep struct {
 // selection, VMID + row insert, IPAM lease) lives in prepareClone;
 // the rollback paths share handleCloneFailure.
 func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, vmidRef *int, rowInserted func()) {
-	prep := m.prepareClone(profile, kind, poweredOn, vmidRef, rowInserted)
+	deferJITBoot := poweredOn && m.jitBootDeferred(profile)
+	prep := m.prepareClone(profile, kind, poweredOn && !deferJITBoot, vmidRef, rowInserted)
 	if prep == nil {
 		return
 	}
@@ -2834,6 +2846,10 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 	target := store.StateWarm
 	if prep.poweredOn {
 		target = store.StateBooting
+	} else if deferJITBoot {
+		// The clone is configured but deliberately stopped. Do not boot
+		// without its JIT only to reboot it immediately after assignment.
+		target = store.StateHot
 	}
 	transitioned, err := m.store.UpdateIf(prep.vmid, func(v *store.VM) bool {
 		return v.State == store.StateProvisioning && v.CreatedAt.Equal(prep.createdAt) && v.StartWorkerDeadline.Equal(prep.deadline)

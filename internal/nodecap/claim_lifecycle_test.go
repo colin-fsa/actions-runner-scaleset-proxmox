@@ -137,7 +137,7 @@ func TestPacedStartRejectsCachedCapacityWhenFreshSourceFails(t *testing.T) {
 	require.Empty(t, a.res)
 }
 
-func TestPacedBootLimitRejectsClusterVisibilityWithoutDirectProof(t *testing.T) {
+func TestPacedClaimsRetainOwnershipWithoutBlockingHostAdmission(t *testing.T) {
 	rs := newResourceServer(t, []map[string]any{nodeRow("pve1", 157*gib, 88)})
 	rs.setNodeStatus("pve1", 68*gib, 157*gib)
 	a := newAccountant(t, rs, func(o *Options) {
@@ -161,7 +161,7 @@ func TestPacedBootLimitRejectsClusterVisibilityWithoutDirectProof(t *testing.T) 
 	require.True(t, one.(*reservation).BeginStart())
 	require.True(t, two.(*reservation).BeginStart())
 	_, ok = doReserve(10003)
-	require.False(t, ok, "two unresolved starts, not 44 GiB of wave claims")
+	require.True(t, ok, "unresolved starts are observational, not a readiness semaphore")
 	receipt := WithPacedTaskReceipt(ctx, one)
 	ReportPacedTask(receipt, "pve1", 10001, "first-upid", false)
 	ReportPacedTask(receipt, "pve1", 10001, "wrong-upid", true)
@@ -174,15 +174,15 @@ func TestPacedBootLimitRejectsClusterVisibilityWithoutDirectProof(t *testing.T) 
 	row := guestRow(10001, "pve1", shape.MemoryBytes, 4)
 	row["name"], row["uptime"] = "runner-10001", 7
 	rs.setRows([]map[string]any{nodeRow("pve1", 157*gib, 88), row})
-	_, ok = doReserve(10003)
-	require.False(t, ok, "one valid independent sample alone cannot retire the hold")
+	_, ok = doReserve(10004)
+	require.True(t, ok, "host headroom permits a start while ownership evidence remains")
 	now = now.Add(15 * time.Second)
-	_, ok = doReserve(10003)
-	require.False(t, ok, "fresh host RAM with stale guest uptime cannot retire the hold")
+	_, ok = doReserve(10005)
+	require.True(t, ok, "stale guest uptime does not veto fresh physical headroom")
 	row["uptime"] = 22
 	rs.setRows([]map[string]any{nodeRow("pve1", 157*gib, 88), row})
-	_, ok = doReserve(10003)
-	require.False(t, ok, "cluster uptime and a receipt do not replace exact direct boot visibility")
+	_, ok = doReserve(10006)
+	require.True(t, ok, "claims retain exact lifecycle evidence independently of headroom")
 	require.False(t, one.(*reservation).released)
 	require.False(t, two.(*reservation).released, "neighbor's unresolved task/guest is uncredited")
 }
@@ -305,15 +305,15 @@ func TestRestartHoldIsExactAndDoesNotCountAsPendingPower(t *testing.T) {
 	}
 	state, err := a.Snapshot(t.Context())
 	require.NoError(t, err)
-	require.Equal(t, uint64(3*gib), state["pve1"].AvailableBytes)
+	require.Equal(t, uint64(27*gib), state["pve1"].AvailableBytes)
 	a.ForgetRestartHold("pve1", 10001, gen.Add(time.Nanosecond))
 	state, err = a.Snapshot(t.Context())
 	require.NoError(t, err)
-	require.Equal(t, uint64(3*gib), state["pve1"].AvailableBytes, "replacement identity cannot release charge")
+	require.Equal(t, uint64(27*gib), state["pve1"].AvailableBytes, "replacement identity cannot release charge")
 	a.ForgetRestartHold("pve1", 10001, gen)
 	state, err = a.Snapshot(t.Context())
 	require.NoError(t, err)
-	require.Equal(t, uint64(7*gib), state["pve1"].AvailableBytes)
+	require.Equal(t, uint64(27*gib), state["pve1"].AvailableBytes)
 }
 
 func TestRestartObservedHostSkipsExtraDebitOnlyInPacedHostMode(t *testing.T) {

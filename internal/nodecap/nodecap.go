@@ -3,7 +3,7 @@
 // hands out reservations so concurrent clone dispatches cannot spend the
 // same megabyte twice.
 //
-// The hard constraint is ALLOCATED memory, not used memory. A booted-but-
+// The default-mode hard constraint is ALLOCATED memory, not used memory. A booted-but-
 // idle 16 GiB VM reports a low RSS while owning its full allocation, so
 // admission must count what is promised to the guests on a node, never
 // what they happen to be touching. (The least_loaded node selector's
@@ -27,6 +27,10 @@
 // process, so they describe what a guest is entitled to rather than what
 // it is touching — which is exactly the "promised" number admission
 // needs for the guests that count.
+//
+// Explicit paced host_available mode is different: it admits against fresh
+// physical host memory/CPU floors without speculative future-growth debits.
+// Its claims preserve identity/recovery evidence, not capacity promises.
 //
 // All exported methods are safe for concurrent use.
 package nodecap
@@ -60,10 +64,12 @@ type Shape struct {
 // and every outstanding reservation, so a caller can compare a Shape
 // against it directly.
 type NodeState struct {
-	TotalBytes     uint64
-	ReserveBytes   uint64 // host headroom withheld from admission
-	CommittedBytes uint64 // guest allocations + outstanding reservations
-	AvailableBytes uint64
+	// ActualPressureMode admits paced starts using physical host floors only.
+	ActualPressureMode bool
+	TotalBytes         uint64
+	ReserveBytes       uint64 // host headroom withheld from admission
+	CommittedBytes     uint64 // guest allocations + outstanding reservations
+	AvailableBytes     uint64
 
 	// MemoryPressured reports, in host_available mode, that the node is
 	// withholding admission because it has no usable free-RAM reading:
@@ -102,6 +108,9 @@ type NodeState struct {
 // for a job is close to idle and the measured reading takes over once it
 // is running.
 func (st NodeState) LaunchVCPUs(shape Shape) int {
+	if st.ActualPressureMode && st.CPUUsageMode {
+		return 0
+	}
 	if !st.CPUUsageMode {
 		return shape.VCPUs
 	}
@@ -150,6 +159,8 @@ type Reservation interface {
 
 // Options configures an Accountant.
 type Options struct {
+	// Positive values opt into actual-host admission. Pool enforces this
+	// submission count per rolling interval; neither is a readiness limit.
 	PacedStartLimit    int
 	PacedStartInterval time.Duration
 	// PacedTaskOwner is the existing dedicated PVE API token ID; no secret.
@@ -736,7 +747,7 @@ func (a *Accountant) ReservePacedRestart(ctx context.Context, node string, vmid 
 	a.sweepLocked(snap)
 	totals, known := snap.nodes[node]
 	if !known || totals.memMissing || a.stale(snap) || a.recoveringLocked() ||
-		totals.memReadAt.Before(a.lastPacedHostObservation[node]) || totals.memAvailable < a.reserveFor(totals.memBytes) {
+		totals.memReadAt.Before(a.lastPacedHostObservation[node]) || totals.memAvailable <= a.reserveFor(totals.memBytes) {
 		return nil, false, nil
 	}
 	// This is not a new CPU allocation. Check actual host CPU where
@@ -771,19 +782,9 @@ func (a *Accountant) reserveExistingDetailed(snap *snapshot, node string, shape 
 		if snap.nodes[node].memReadAt.Before(a.lastPacedHostObservation[node]) {
 			return nil, false, nil
 		}
-		outstanding := 0
-		for _, r := range a.res {
-			if r.paced && !r.pacedProof.slotSettled && r.node == node && !(r.vmid == vmid && !generation.IsZero() && r.generation.Equal(generation)) {
-				outstanding++
-			}
-		}
-		if outstanding >= a.opts.PacedStartLimit {
-			a.logAdmissionDenial(snap, node, "unsettled_start_limit", shape, 0, 0, a.stateLocked(snap, node))
-			if detailed {
-				return nil, false, ErrPacedStartSlots
-			}
-			return nil, false, nil
-		}
+		// Pacing is charged at the actual POST boundary in pool, not by
+		// unresolved task/readiness proofs. Keep those claims for ownership
+		// and diagnostics, but never make readiness a launch semaphore.
 	}
 
 	if a.isHostMode() && vmid > 0 && !generation.IsZero() {
@@ -803,7 +804,7 @@ func (a *Accountant) reserveExistingDetailed(snap *snapshot, node string, shape 
 			reserve := a.reserveFor(totals.memBytes)
 			holds, _ := a.holdsAndCreditsLocked(snap, node)
 			if !known || totals.memMissing || a.stale(snap) || a.recoveringLocked() ||
-				totals.memAvailable < reserve || holds > totals.memAvailable-reserve {
+				totals.memAvailable <= reserve || (!a.SupportsPacedStart() && holds > totals.memAvailable-reserve) {
 				return nil, false, nil
 			}
 			state := a.stateLocked(snap, node)
@@ -908,7 +909,16 @@ func (a *Accountant) fitsWithCreditLocked(snap *snapshot, node string, shape Sha
 	// free RAM covers its request scaled by the overcommit factor (1.0 by
 	// default = full RAM); the allocated mode gates on the full request.
 	need := shape.MemoryBytes
-	if a.isHostMode() {
+	if a.SupportsPacedStart() {
+		// Paced host mode deliberately admits against actual measured
+		// pressure, not a promise of the guest's future configured growth.
+		// At the floor (normally 15% available) stop all new starts.
+		if st.MemoryPressured || totals.memAvailable <= a.reserveFor(totals.memBytes) {
+			a.logAdmissionDenial(snap, node, "host_memory_floor", shape, 0, 0, st)
+			return false
+		}
+		need = 0
+	} else if a.isHostMode() {
 		need = uint64(float64(shape.MemoryBytes) * a.memOvercommit())
 	}
 	if need > avail {
@@ -923,7 +933,11 @@ func (a *Accountant) fitsWithCreditLocked(snap *snapshot, node string, shape Sha
 		return false
 	}
 	if a.cpuGated() {
-		if st.CommittedVCPU-vcpuCredit+st.LaunchVCPUs(shape) > a.vcpuLimit(totals.vcpus) {
+		launch := st.LaunchVCPUs(shape)
+		if a.SupportsPacedStart() && a.cpuUsageMode() {
+			launch = 0 // measured usage only; no speculative launch CPU holds
+		}
+		if st.CommittedVCPU-vcpuCredit+launch > a.vcpuLimit(totals.vcpus) {
 			reason := "cpu"
 			if a.cpuUsageMode() && (totals.cpuMissing || a.stale(snap)) {
 				reason = "missing_or_stale_cpu_sample"
@@ -969,6 +983,9 @@ func (a *Accountant) stateLocked(snap *snapshot, node string) NodeState {
 			}
 		}
 	}
+	if a.SupportsPacedStart() && a.cpuUsageMode() {
+		deltaVCPU = 0
+	}
 	committedVCPU += deltaVCPU
 	if committedVCPU < 0 {
 		committedVCPU = 0
@@ -983,13 +1000,14 @@ func (a *Accountant) stateLocked(snap *snapshot, node string) NodeState {
 		// silently oversubscribe the box.
 		if totals.memMissing || a.stale(snap) || totals.memReadAt.Before(a.lastPacedHostObservation[node]) {
 			return NodeState{
-				TotalBytes:      totals.memBytes,
-				ReserveBytes:    reserve,
-				CPUGated:        a.cpuGated(),
-				CommittedVCPU:   committedVCPU,
-				CPUUsageMode:    a.cpuUsageMode(),
-				LaunchVCPU:      a.opts.CPULaunchVCPUs,
-				MemoryPressured: true,
+				ActualPressureMode: a.SupportsPacedStart(),
+				TotalBytes:         totals.memBytes,
+				ReserveBytes:       reserve,
+				CPUGated:           a.cpuGated(),
+				CommittedVCPU:      committedVCPU,
+				CPUUsageMode:       a.cpuUsageMode(),
+				LaunchVCPU:         a.opts.CPULaunchVCPUs,
+				MemoryPressured:    true,
 			}
 		}
 		// The node's available RAM already reflects every running guest (they are
@@ -997,6 +1015,12 @@ func (a *Accountant) stateLocked(snap *snapshot, node string) NodeState {
 		// it would count them twice. Only in-flight reservations, whose RAM a
 		// fresh measurement has not absorbed yet, are withheld on top.
 		holds, credit := a.holdsAndCreditsLocked(snap, node)
+		if a.SupportsPacedStart() {
+			// Claims still exist for exact-generation ownership/teardown and
+			// observational telemetry. Neither their configured RAM nor a
+			// prospective freeing credit changes physical host headroom.
+			holds, credit = 0, 0
+		}
 		committed = saturatingSub(totals.memBytes, totals.memAvailable)
 		usable := saturatingSub(totals.memAvailable, reserve)
 		if usable > holds {
@@ -1035,14 +1059,15 @@ func (a *Accountant) stateLocked(snap *snapshot, node string) NodeState {
 	}
 
 	st := NodeState{
-		TotalBytes:     totals.memBytes,
-		ReserveBytes:   reserve,
-		CommittedBytes: committed,
-		AvailableBytes: available,
-		CPUGated:       a.cpuGated(),
-		CommittedVCPU:  committedVCPU,
-		CPUUsageMode:   a.cpuUsageMode(),
-		LaunchVCPU:     a.opts.CPULaunchVCPUs,
+		ActualPressureMode: a.SupportsPacedStart(),
+		TotalBytes:         totals.memBytes,
+		ReserveBytes:       reserve,
+		CommittedBytes:     committed,
+		AvailableBytes:     available,
+		CPUGated:           a.cpuGated(),
+		CommittedVCPU:      committedVCPU,
+		CPUUsageMode:       a.cpuUsageMode(),
+		LaunchVCPU:         a.opts.CPULaunchVCPUs,
 	}
 	if st.CPUGated {
 		st.LimitVCPU = a.vcpuLimit(totals.vcpus)

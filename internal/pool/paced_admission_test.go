@@ -153,7 +153,7 @@ func TestReturnUndeliveredJITOnlyRequeuesExactUnclaimedAssignment(t *testing.T) 
 	require.False(t, m.ReturnUndeliveredJIT(vm, 99), "old assignment cannot be reused")
 }
 
-func TestPacedHTTPSubmissionsCannotOverlapOrBunch(t *testing.T) {
+func TestPacedHTTPSubmissionsCannotOverlapEvenWithinBurst(t *testing.T) {
 	const spacing = 20 * time.Millisecond
 	b := NewHostBootBudget(2, spacing, 0)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -186,7 +186,11 @@ func TestPacedHTTPSubmissionsCannotOverlapOrBunch(t *testing.T) {
 	case <-time.After(2 * spacing):
 	}
 	close(finishFirst)
-	require.GreaterOrEqual(t, (<-secondSubmit).Sub(<-firstResponse), spacing)
-	require.ErrorIs(t, <-done, context.DeadlineExceeded)
-	require.NoError(t, <-done)
+	require.GreaterOrEqual(t, (<-secondSubmit).Sub(<-firstResponse), time.Duration(0), "second burst entry still waits for prior POST to return")
+	one, two := <-done, <-done
+	if one == nil {
+		one, two = two, one
+	}
+	require.ErrorIs(t, one, context.DeadlineExceeded)
+	require.NoError(t, two)
 }

@@ -217,18 +217,16 @@ nodes:
 
 pool:
   # Shared by Linux and Windows; 0 disables each control.
-  # When both are set, host_available admission (without idle eviction) takes
-  # launch holds after pacing. Each node also limits unresolved boots to
-  # boots_per_node. Warm promotions bypass cold pacing; cold clone POSTs
-  # have a separate clock at boot_start_interval. Cloning/readiness do not
-  # consume host start slots in this mode. Clone/configure tasks have a
-  # separate boots_per_node bound, released before readiness. After one warm
-  # burst, a prepared due cold waiter gets a turn at the submission lock.
-  # Proxmox admission reads are coalesced outside that lock; pressure retries
-  # use a 1s node cadence and read errors back off up to 5s.
-  # A completed task plus two fresh exact
-  # process/host observations retire the hold; ambiguous starts do not expire.
-  # This is a startup budget, not a reservation for future job growth.
+  # With paced host_available admission, this is submissions per rolling
+  # boot_start_interval, not unresolved boots. 2 + 15s means two cold clone
+  # POSTs AND independently two cold power POSTs per rolling 15 seconds.
+  # Warm promotions bypass cold pacing; clone task/readiness duration holds
+  # no slot. Refused/cancelled-before-POST work spends no window entry.
+  # Fresh host available RAM/CPU determine admission, without subtracting
+  # pending/started configured RAM. reserve_fraction 0.15 stops at 85% used.
+  # Ownership claims and exact task/process evidence remain observational.
+  # Read errors/stale samples/recovery fencing still fail closed.
+  # Outside paced host admission, legacy concurrent boot limits still apply.
   boots_per_node: 0
   boot_start_interval: 0s
   hot_size: 2                     # always-booted idle runners (default; profiles can override)

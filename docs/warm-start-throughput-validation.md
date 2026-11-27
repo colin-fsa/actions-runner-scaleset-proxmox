@@ -1,3 +1,7 @@
+> Historical validation of the previous readiness-slot policy. The current
+> policy supersedes its two-outstanding-start/full-shape hold conclusions;
+> see [Shared host boot pacing](configuration.md#shared-host-boot-pacing).
+
 # Warm runner startup throughput validation
 
 Base: `integration/windows-host-memory` at

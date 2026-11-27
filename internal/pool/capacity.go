@@ -627,6 +627,9 @@ func (m *manager) evictForDemand(ctx context.Context, ps *profileState) bool {
 // CPU binds when either CPU mode is on, with the launch counted the way
 // the accountant counts it (see nodecap.NodeState.FitsCPU).
 func fitsNode(st nodecap.NodeState, shape nodecap.Shape) bool {
+	if st.ActualPressureMode {
+		return !st.MemoryPressured && st.AvailableBytes > 0 && st.FitsCPU(shape)
+	}
 	if st.AvailableBytes < shape.MemoryBytes {
 		return false
 	}

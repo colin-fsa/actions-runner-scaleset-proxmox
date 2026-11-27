@@ -60,7 +60,7 @@ func waitProbeWorkers(t *testing.T, wg *sync.WaitGroup) {
 
 func TestColdPressureCoalescesProxmoxReadsAndWarmStillStarts(t *testing.T) {
 	h := probeHost()
-	h.pressure = 120 * gib // 4 GiB above reserve: Windows fits, Linux does not.
+	h.pressure = 124 * gib // at the actual host floor: all starts must wait.
 	var reads, total atomic.Int32
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		total.Add(1)
@@ -88,10 +88,15 @@ func TestColdPressureCoalescesProxmoxReadsAndWarmStillStarts(t *testing.T) {
 		defer n.probeMu.Unlock()
 		return n.coldProbe.retry != nil
 	}, time.Second, time.Millisecond)
-	require.NoError(t, runProbeWorker(ctx, m, h, 15000, "windows"), "cold pressure must not suppress a smaller warm shape")
 	time.Sleep(2200 * time.Millisecond)
 	cancel()
 	waitProbeWorkers(t, &wg)
+	h.mu.Lock()
+	h.pressure = 120 * gib
+	h.mu.Unlock()
+	warmCtx, warmCancel := context.WithTimeout(t.Context(), time.Second)
+	defer warmCancel()
+	require.NoError(t, runProbeWorker(warmCtx, m, h, 15000, "windows"), "an independent warm probe sees recovered actual headroom")
 	require.LessOrEqual(t, reads.Load(), int32(6), "node/cohort bounds, not 10 direct reads/second per cold worker")
 	require.LessOrEqual(t, total.Load(), int32(20), "includes host and exact task/process rechecks")
 	h.mu.Lock()
@@ -175,7 +180,7 @@ func TestSlowColdReadDoesNotOwnWarmPostLockOrWarmReadLane(t *testing.T) {
 	require.Equal(t, int32(2), reads.Load(), "one coalesced cold read and independent fresh warm read")
 }
 
-func TestUnsettledSlotsUseBoundedRechecksRatherThanReadErrorBackoff(t *testing.T) {
+func TestUnsettledOwnershipClaimsDoNotBlockMeasuredHeadroom(t *testing.T) {
 	h := probeHost()
 	var reads atomic.Int32
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -199,7 +204,7 @@ func TestUnsettledSlotsUseBoundedRechecksRatherThanReadErrorBackoff(t *testing.T
 	ctx, cancel := context.WithTimeout(t.Context(), 4*time.Second)
 	defer cancel()
 	var wg sync.WaitGroup
-	for i := range 24 {
+	for i := range 4 {
 		wg.Go(func() {
 			err := runProbeWorker(ctx, m, h, 10000+i, "linux")
 			if err != nil && !errors.Is(err, errStartCapacityDeferred) {
@@ -213,15 +218,14 @@ func TestUnsettledSlotsUseBoundedRechecksRatherThanReadErrorBackoff(t *testing.T
 	retry := n.coldProbe.retry
 	failures := n.coldProbe.readFailures
 	n.probeMu.Unlock()
-	require.NotNil(t, retry)
-	require.ErrorIs(t, retry, nodecap.ErrPacedStartSlots)
+	require.Nil(t, retry, "unresolved ownership claims are not capacity pressure")
 	require.Zero(t, failures, "slot saturation is not an API outage")
-	require.LessOrEqual(t, reads.Load()-initialReads, int32(4), "24 workers share the node's settlement cadence")
+	require.LessOrEqual(t, reads.Load()-initialReads, int32(8), "workers share bounded fresh probes")
 	// Exercise exact cleanup to remove the simulated outstanding starts.
 	for i := range 2 {
 		acct.ReservationsBeforeDestroy("pve1", 20000+i)()
 	}
-	require.Eventually(t, func() bool { h.mu.Lock(); defer h.mu.Unlock(); return len(h.posted) == 2 }, 1500*time.Millisecond, 10*time.Millisecond, "cold queue must resume on the next bounded fresh probe after exact cleanup")
+	require.Eventually(t, func() bool { h.mu.Lock(); defer h.mu.Unlock(); return len(h.posted) == 4 }, 1500*time.Millisecond, 10*time.Millisecond, "cold work must not wait for unrelated ownership cleanup")
 	cancel()
 	waitProbeWorkers(t, &wg)
 }

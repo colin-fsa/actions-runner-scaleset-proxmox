@@ -28,13 +28,12 @@ type coldWaiter struct {
 
 type bootNode struct {
 	slots                *semaphore.Weighted
-	cloneSlots           *semaphore.Weighted
 	coldWaiting          map[*coldWaiter]struct{}
 	pace                 sync.Mutex
 	probeMu              sync.Mutex
 	coldProbe, warmProbe startProbe
-	last                 time.Time
-	lastClone            time.Time
+	starts               submissionWindow
+	clones               submissionWindow
 	warmWaiting          atomic.Int64
 	warmBurst            int64
 }
@@ -50,36 +49,52 @@ func (b *WindowsBootBudget) node(node string) *bootNode {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.nodes[node] == nil {
-		b.nodes[node] = &bootNode{slots: semaphore.NewWeighted(b.limit), cloneSlots: semaphore.NewWeighted(b.limit), coldWaiting: make(map[*coldWaiter]struct{})}
+		b.nodes[node] = &bootNode{slots: semaphore.NewWeighted(b.limit), coldWaiting: make(map[*coldWaiter]struct{})}
 	}
 	return b.nodes[node]
 }
 
-// acquireClone bounds clone/configure tasks across all managers on the host.
-// It never consumes power admission or holds the submission lock/readiness.
+// acquireClone is retained for caller compatibility. In paced mode the actual
+// clone POST consumes a rolling-window entry, not a semaphore held through
+// configuration/readiness. Cancellation before submission consumes nothing.
 func (b *WindowsBootBudget) acquireClone(ctx context.Context, node string) (func(), error) {
-	if b == nil || !b.UsesPacedAdmission() {
-		return func() {}, nil
-	}
-	slots := b.node(node).cloneSlots
-	if err := slots.Acquire(ctx, 1); err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return sync.OnceFunc(func() { slots.Release(1) }), nil
+	return func() {}, nil
 }
 
+// submissionWindow counts submissions, even ambiguous HTTP outcomes, rather
+// than their task completion. Caller holds bootNode.pace.
+type submissionWindow struct{ times []time.Time }
+
+func (w *submissionWindow) delay(now time.Time, limit int64, interval time.Duration) time.Duration {
+	cut := now.Add(-interval)
+	i := 0
+	for i < len(w.times) && !w.times[i].After(cut) {
+		i++
+	}
+	w.times = w.times[i:]
+	if limit <= 0 || int64(len(w.times)) < limit {
+		return 0
+	}
+	return max(w.times[0].Add(interval).Sub(now), 0)
+}
+
+func (w *submissionWindow) submitted(now time.Time) { w.times = append(w.times, now) }
+
 // Caller holds pace. Cold timers do not earn a turn until their POST is due.
-func (n *bootNode) coldDue(interval time.Duration) bool {
+func (n *bootNode) coldDue(limit int64, interval time.Duration) bool {
 	now := time.Now()
 	for waiter := range n.coldWaiting {
 		if !waiter.ready {
 			continue
 		}
-		last := n.last
+		window := &n.starts
 		if waiter.clone {
-			last = n.lastClone
+			window = &n.clones
 		}
-		if !now.Before(last.Add(interval)) {
+		if window.delay(now, limit, interval) == 0 {
 			return true
 		}
 	}
@@ -87,7 +102,10 @@ func (n *bootNode) coldDue(interval time.Duration) bool {
 }
 
 func (b *WindowsBootBudget) acquire(ctx context.Context, node string) (func(), error) {
-	if b == nil || b.limit <= 0 {
+	if b == nil || b.limit <= 0 || b.UsesPacedAdmission() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		return func() {}, nil
 	}
 	s := b.node(node).slots
@@ -106,7 +124,7 @@ func (b *WindowsBootBudget) tryAcquire(node string) (func(), bool) {
 	if blocked {
 		return nil, false
 	}
-	if b.limit <= 0 {
+	if b.limit <= 0 || b.UsesPacedAdmission() {
 		return func() {}, true
 	}
 	s := b.node(node).slots
@@ -205,7 +223,7 @@ func (b *WindowsBootBudget) paceAction(ctx context.Context, node string, action 
 }
 
 // warmAction bypasses cold pacing, but shares the POST boundary and the
-// accountant's atomic outstanding-start limit. No readiness slot is held.
+// accountant's fresh actual-host pressure check. No readiness slot is held.
 func (b *WindowsBootBudget) warmAction(ctx context.Context, node string, action func(func()) error) error {
 	return b.dispatch(ctx, node, true, false, action)
 }
@@ -248,7 +266,11 @@ func (b *WindowsBootBudget) dispatchPrepared(ctx context.Context, node string, w
 			// Cold clocks still pace actual submissions. Do not fetch a sample
 			// fifteen seconds before it could be used.
 			n.pace.Lock()
-			delay := time.Until(n.last.Add(b.interval))
+			window := &n.starts
+			if clone {
+				window = &n.clones
+			}
+			delay := window.delay(time.Now(), b.limit, b.interval)
 			if warm {
 				delay = 0
 			}
@@ -289,15 +311,15 @@ func (b *WindowsBootBudget) dispatchPrepared(ctx context.Context, node string, w
 			waiter.ready = true
 		}
 
-		last := &n.last
+		window := &n.starts
 		if clone {
-			last = &n.lastClone
+			window = &n.clones
 		}
-		delay := time.Until(last.Add(b.interval))
+		delay := window.delay(time.Now(), b.limit, b.interval)
 		// Sleep outside the POST lock: a cold timer must not block a warm
 		// promotion. Bound priority to one host-sized burst so cold work wins
 		// a turn even with contemporaneous warm requests.
-		coldTurn := warm && n.warmBurst >= b.limit && n.coldDue(b.interval)
+		coldTurn := warm && n.warmBurst >= b.limit && n.coldDue(b.limit, b.interval)
 		if coldTurn || (!warm && (delay > 0 || (n.warmWaiting.Load() > 0 && n.warmBurst < b.limit))) {
 			n.pace.Unlock()
 			if warm || delay <= 0 {
@@ -339,7 +361,7 @@ func (b *WindowsBootBudget) dispatchPrepared(ctx context.Context, node string, w
 				err = action(func() { submitted = true })
 			}
 			if submitted && !warm {
-				*last = time.Now()
+				window.submitted(time.Now())
 			}
 			return err
 		}()
